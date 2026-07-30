@@ -20,15 +20,20 @@ type Editor struct {
 	rowOffset int
 	colOffset int
 
-	dirty    bool
-	message  string
-	saveAs   bool
-	msgInput kero.TextInput
+	dirty   bool
+	message string
 
-	finding     bool
-	findInput   kero.TextInput
-	findResults [][2]int // [[row, col], ...]
-	currentFind int
+	// prompt for saving
+	saveAs    bool
+	saveInput kero.TextInput
+
+	// find mode opens a find line at the message area
+	finding   bool
+	findInput kero.TextInput
+
+	// command mode opens a command line at the message area
+	cmdMode  bool
+	cmdInput kero.TextInput
 }
 
 func (e *Editor) Init(ctx *kero.Context) error {
@@ -57,67 +62,70 @@ func (e *Editor) Init(ctx *kero.Context) error {
 	return nil
 }
 
+func isKeyCombo(k kero.KeyEvent, s string) bool {
+	s = strings.ToLower(s)
+	parts := strings.Split(s, "-")
+	if len(parts) < 2 {
+		return false
+	}
+	if parts[0] == "ctrl" {
+		return k.Key == kero.KeyRune && k.Mod&kero.ModCtrl != 0 && k.Rune == []rune(parts[1])[0]
+	}
+	// todo: support other modifier
+	return false
+}
+
 func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 	key, ok := ev.(kero.KeyEvent)
 	if !ok {
 		return nil
 	}
+	defer e.ensureCursorVisible(ctx)
 
 	if e.saveAs {
 		return e.updateSaveAs(key)
 	}
-
-	defer e.ensureCursorVisible(ctx)
-
 	if e.finding {
 		return e.updateFind(key)
+	}
+	if e.cmdMode {
+		return e.updateCommand(key)
 	}
 
 	switch key.Key {
 	case kero.KeyRune:
-		if key.Mod&kero.ModCtrl != 0 {
-			switch key.Rune {
-			case 'q':
-				ctx.Quit()
-			case 's':
-				return e.save()
-			case 'f':
-				e.startFind()
-			case 'n':
-				query := e.findInput.Value
-				if strings.TrimSpace(query) == "" {
-					return nil
-				}
-				e.findResults = e.searchQuery(query)
-				if len(e.findResults) == 0 {
-					return nil
-				}
-				for i := range e.findResults {
-					if e.findResults[i][0] > e.row || (e.findResults[i][0] == e.row && e.findResults[i][1] > e.col) {
-						e.currentFind = i
-						e.gotoFindResult(e.currentFind)
-						return nil
-					}
-				}
-				e.gotoFindResult(0)
-			case 'p':
-				query := e.findInput.Value
-				if strings.TrimSpace(query) == "" {
-					return nil
-				}
-				e.findResults = e.searchQuery(query)
-				if len(e.findResults) == 0 {
-					return nil
-				}
-				for i := len(e.findResults) - 1; i >= 0; i-- {
-					if e.findResults[i][0] < e.row || (e.findResults[i][0] == e.row && e.findResults[i][1] < e.col) {
-						e.currentFind = i
-						e.gotoFindResult(e.currentFind)
-						return nil
-					}
-				}
-				e.gotoFindResult(len(e.findResults) - 1)
+		// Open command line on Ctrl+\
+		if isKeyCombo(key, "ctrl-\\") {
+			e.startCommand()
+			return nil
+		}
+		if isKeyCombo(key, "ctrl-q") {
+			last := ctx.LastKeyEvent
+			quitAgain := isKeyCombo(last, "ctrl-q")
+			if e.dirty && !quitAgain {
+				e.message = "warn: unsaved changes - press Ctrl-S to save or Ctrl-Q again to quit"
+				return nil
 			}
+			ctx.Quit()
+			return nil
+		}
+		if isKeyCombo(key, "ctrl-s") {
+			return e.save()
+		}
+		if isKeyCombo(key, "ctrl-f") {
+			e.startFind()
+		}
+		// find next
+		if isKeyCombo(key, "ctrl-n") {
+			e.findNext()
+			return nil
+		}
+		// find previous
+		if isKeyCombo(key, "ctrl-p") {
+			e.findPrev()
+			return nil
+		}
+		if key.Mod != 0 {
 			break
 		}
 		e.insertRune(key.Rune)
@@ -158,11 +166,6 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 			e.finding = false
 			break
 		}
-		if e.dirty {
-			e.message = "unsaved changes - press Ctrl-Q to quit or Ctrl-S to save"
-			break
-		}
-		ctx.Quit()
 	}
 
 	return nil
@@ -170,11 +173,11 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 
 func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 	statusStyle := kero.NewStyle().Reverse()
-	lineNoStyle := kero.NewStyle().Foreground(kero.ColorBlack).Dim()
+	lineNoStyle := kero.NewStyle().Foreground(kero.ColorBlue).Dim()
 	textStyle := kero.NewStyle()
 	cursorStyle := textStyle.Reverse()
 	messageStyle := kero.NewStyle()
-	if strings.HasPrefix(e.message, "error:") {
+	if strings.HasPrefix(e.message, "error:") || strings.HasPrefix(e.message, "warn:") {
 		messageStyle = kero.NewStyle().Foreground(kero.ColorRed)
 	}
 
@@ -235,6 +238,10 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 
 	messageY := ctx.Height - 1
 	if messageY >= 0 {
+		if e.cmdMode {
+			e.drawCommand(f, messageY, ctx.Width)
+			return
+		}
 		if e.saveAs {
 			e.drawSaveAs(f, messageY, ctx.Width)
 			return
@@ -244,7 +251,7 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 			return
 		}
 		if e.message == "" {
-			e.message =  "Ctrl-F find | Ctrl-S save | Ctrl-Q force quit | Esc quit"
+			e.message = "Ctrl-F find | Ctrl-S save | Ctrl-Q quit"
 		}
 		f.Write(0, messageY, trimToWidth(" "+e.message, ctx.Width), messageStyle)
 	}
@@ -284,8 +291,8 @@ func (e *Editor) save() error {
 
 func (e *Editor) startSaveAs() {
 	e.saveAs = true
-	e.msgInput.Value = e.path
-	e.msgInput.Cursor = len([]rune(e.msgInput.Value))
+	e.saveInput.Value = e.path
+	e.saveInput.Cursor = len([]rune(e.saveInput.Value))
 	e.message = "enter a filename"
 }
 
@@ -299,12 +306,12 @@ func (e *Editor) updateSaveAs(key kero.KeyEvent) error {
 		return nil
 	}
 
-	e.msgInput.Update(key)
+	e.saveInput.Update(key)
 	return nil
 }
 
 func (e *Editor) finishSaveAs() error {
-	path := strings.TrimSpace(e.msgInput.Value)
+	path := strings.TrimSpace(e.saveInput.Value)
 	if path == "" {
 		e.message = "filename required"
 		return nil
@@ -329,33 +336,91 @@ func (e *Editor) drawSaveAs(f *kero.Frame, y int, width int) {
 	if inputX >= width {
 		return
 	}
-	e.msgInput.Draw(f, kero.Rect{X: inputX, Y: y, W: width - inputX, H: 1}, style)
+	e.saveInput.Draw(f, kero.Rect{X: inputX, Y: y, W: width - inputX, H: 1}, style)
+}
+
+// startCommand puts the editor into command-line mode (like vim's :)
+func (e *Editor) startCommand() {
+	e.cmdMode = true
+	e.cmdInput = kero.TextInput{}
+	e.cmdInput.Value = ""
+	e.cmdInput.Cursor = 0
+	e.message = ""
+}
+
+func (e *Editor) updateCommand(key kero.KeyEvent) error {
+	switch key.Key {
+	case kero.KeyEnter:
+		return e.finishCommand()
+	case kero.KeyEsc:
+		e.cmdMode = false
+		return nil
+	}
+
+	e.cmdInput.Update(key)
+	return nil
+}
+
+func (e *Editor) drawCommand(f *kero.Frame, y int, width int) {
+	style := kero.NewStyle().Foreground(kero.ColorCyan)
+	prompt := ">"
+	f.Write(0, y, trimToWidth(prompt, width), style)
+	inputX := len([]rune(prompt))
+	if inputX >= width {
+		return
+	}
+	e.cmdInput.Draw(f, kero.Rect{X: inputX, Y: y, W: width - inputX, H: 1}, style)
+}
+
+func (e *Editor) finishCommand() error {
+	cmd := strings.TrimSpace(e.cmdInput.Value)
+	e.cmdMode = false
+	if cmd == "" {
+		e.message = ""
+		return nil
+	}
+	parts := strings.Fields(cmd)
+	switch parts[0] {
+	case "goto":
+		// acts like Go To Definition, for example,
+		// "goto func myFunction"
+		// "goto type myType"
+		if len(parts) < 2 {
+			e.message = "usage: goto <query> [query2 ...]"
+			return nil
+		}
+		for row, line := range e.lines {
+			allMatch := true
+			for _, query := range parts[1:] {
+				if !strings.Contains(line, query) {
+					allMatch = false
+					break
+				}
+			}
+			if allMatch {
+				e.row = row
+				e.col = 0
+				return nil
+			}
+		}
+	default:
+		e.message = "unknown command: " + cmd
+	}
+	return nil
 }
 
 func (e *Editor) startFind() {
 	e.finding = true
-	e.findResults = nil
-	e.currentFind = -1
 	e.findInput = kero.TextInput{}
 }
 
 func (e *Editor) updateFind(ev kero.KeyEvent) error {
 	switch ev.Key {
 	case kero.KeyEnter:
-		query := e.findInput.Value
-		if strings.TrimSpace(query) == "" {
-			return nil
-		}
-		e.findResults = e.searchQuery(query)
-		if len(e.findResults) == 0 {
-			return nil
-		}
-		e.currentFind = (e.currentFind + 1) % len(e.findResults)
-		e.gotoFindResult(e.currentFind)
+		e.findNext()
 		return nil
 	case kero.KeyEsc:
 		e.finding = false
-		e.findResults = nil
 		// don't clear the query, let ctrl-n use it
 		return nil
 	}
@@ -375,19 +440,58 @@ func (e *Editor) drawFind(f *kero.Frame, y int, width int) {
 	e.findInput.Draw(f, kero.Rect{X: inputX, Y: y, W: width - inputX, H: 1}, normal)
 }
 
-func (e *Editor) gotoFindResult(index int) {
-	if index < 0 || index >= len(e.findResults) {
+func (e *Editor) findNext() {
+	query := e.findInput.Value
+	if strings.TrimSpace(query) == "" {
 		return
 	}
-	result := e.findResults[index]
-	e.row = result[0]
-	e.col = result[1]
-	if e.col < 0 {
-		e.col = 0
+	col := e.col
+	for row := e.row; ; {
+		line := e.lines[row]
+		if i := strings.Index(line[col:], query); i >= 0 {
+			e.row = row
+			e.col = col + i + len(query)
+			return
+		}
+		if row < len(e.lines)-1 {
+			row++
+		} else {
+			row = 0
+		}
+		if row == e.row {
+			// loop back
+			break
+		}
+		col = 0
 	}
 }
 
-func (e *Editor) searchQuery(query string) [][2]int {
+func (e *Editor) findPrev() {
+	query := e.findInput.Value
+	if strings.TrimSpace(query) == "" {
+		return
+	}
+	col := e.col
+	for row := e.row; ; {
+		line := e.lines[row]
+		if i := strings.Index(line[:col], query); i >= 0 {
+			e.row = row
+			e.col = i
+			return
+		}
+		if row > 0 {
+			row--
+		} else {
+			row = len(e.lines) - 1
+		}
+		if row == e.row {
+			break
+		}
+		col = max(0, len(e.lines[row])-1)
+	}
+}
+
+func (e *Editor) search(query string) [][2]int {
 	var matches [][2]int
 	if query == "" {
 		return matches
@@ -404,7 +508,7 @@ func (e *Editor) searchQuery(query string) [][2]int {
 				}
 			}
 			if match {
-				matches = append(matches, [2]int{row, i})
+				matches = append(matches, [2]int{row, i + len(query)})
 			}
 		}
 	}
@@ -505,7 +609,7 @@ func (e *Editor) moveRight() {
 
 func (e *Editor) moveUp() {
 	if e.row > 0 {
-		dstCol := len(padTab(string(e.currentLine()[:e.col]),4))
+		dstCol := len(padTab(string(e.currentLine()[:e.col]), 4))
 		e.row--
 		var width int
 		for i, char := range e.currentLine() {
@@ -514,7 +618,7 @@ func (e *Editor) moveUp() {
 				break
 			}
 			if char == '\t' {
-				width += 4-width%4
+				width += 4 - width%4
 			} else {
 				width++
 			}
@@ -525,7 +629,7 @@ func (e *Editor) moveUp() {
 
 func (e *Editor) moveDown() {
 	if e.row < len(e.lines)-1 {
-		dstCol := len(padTab(string(e.currentLine()[:e.col]),4))
+		dstCol := len(padTab(string(e.currentLine()[:e.col]), 4))
 		e.row++
 		var width int
 		for i, char := range e.currentLine() {
@@ -534,7 +638,7 @@ func (e *Editor) moveDown() {
 				break
 			}
 			if char == '\t' {
-				width += 4-width%4
+				width += 4 - width%4
 			} else {
 				width++
 			}
