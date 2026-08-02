@@ -2,9 +2,9 @@ package main
 
 import (
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"kero"
@@ -34,6 +34,10 @@ type Editor struct {
 	// command mode opens a command line at the message area
 	cmdMode  bool
 	cmdInput kero.TextInput
+
+	// last key event shall be app-level, don't hurry to make it into program context,
+	// because it is not a runtime state, but a user input state
+	lastKey kero.KeyEvent
 }
 
 func (e *Editor) Init(ctx *kero.Context) error {
@@ -62,25 +66,15 @@ func (e *Editor) Init(ctx *kero.Context) error {
 	return nil
 }
 
-func isKeyCombo(k kero.KeyEvent, s string) bool {
-	s = strings.ToLower(s)
-	parts := strings.Split(s, "-")
-	if len(parts) < 2 {
-		return false
-	}
-	if parts[0] == "ctrl" {
-		return k.Key == kero.KeyRune && k.Mod&kero.ModCtrl != 0 && k.Rune == []rune(parts[1])[0]
-	}
-	// todo: support other modifier
-	return false
-}
-
 func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 	key, ok := ev.(kero.KeyEvent)
 	if !ok {
 		return nil
 	}
-	defer e.ensureCursorVisible(ctx)
+	defer func() {
+		e.lastKey = key
+		e.ensureCursorVisible(ctx)
+	}()
 
 	if e.saveAs {
 		return e.updateSaveAs(key)
@@ -94,43 +88,57 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 
 	switch key.Key {
 	case kero.KeyRune:
-		// Open command line on Ctrl+\
-		if isKeyCombo(key, "ctrl-\\") {
+		switch key.String() {
+		case "ctrl+\\":
+			// Open command line on Ctrl+\
 			e.startCommand()
 			return nil
-		}
-		if isKeyCombo(key, "ctrl-q") {
-			last := ctx.LastKeyEvent
-			quitAgain := isKeyCombo(last, "ctrl-q")
+		case "ctrl+q":
+			quitAgain := e.lastKey.String() == "ctrl+q"
 			if e.dirty && !quitAgain {
 				e.message = "warn: unsaved changes - press Ctrl-S to save or Ctrl-Q again to quit"
 				return nil
 			}
 			ctx.Quit()
 			return nil
-		}
-		if isKeyCombo(key, "ctrl-s") {
+		case "ctrl+s":
 			return e.save()
-		}
-		if isKeyCombo(key, "ctrl-f") {
+		case "ctrl+f":
 			e.startFind()
-		}
-		// find next
-		if isKeyCombo(key, "ctrl-n") {
-			e.findNext()
 			return nil
-		}
-		// find previous
-		if isKeyCombo(key, "ctrl-p") {
-			e.findPrev()
-			return nil
+		case "ctrl+shift+k", "ctrl+K": // inside iTerm2 + remote SSH session, got ctrl+K
+			// delete current line
+			if len(e.lines) == 0 {
+				return nil
+			}
+			if len(e.lines) == 1 {
+				e.lines[0] = ""
+				return nil
+			}
+			if e.row == len(e.lines)-1 {
+				e.lines = e.lines[:len(e.lines)-1]
+				e.row, e.col = e.row-1, 0
+				return nil
+			}
+			e.lines = slices.Delete(e.lines, e.row, e.row+1)
+			e.col = 0
 		}
 		if key.Mod != 0 {
 			break
 		}
 		e.insertRune(key.Rune)
 	case kero.KeyEnter:
+		var n int
+		line := e.currentLine()
+		for _, b := range line {
+			if b != ' ' && b != '\t' {
+				break
+			}
+			n++
+		}
+		indent := line[:n]
 		e.insertNewline()
+		e.insertString(indent)
 	case kero.KeyTab:
 		e.insertRune('\t')
 	case kero.KeyBackspace:
@@ -146,6 +154,12 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 	case kero.KeyDown:
 		e.moveDown()
 	case kero.KeyHome:
+		for i, char := range e.lines[e.row] {
+			if char != ' ' && char != '\t' {
+				e.col = i
+				return nil
+			}
+		}
 		e.col = 0
 	case kero.KeyEnd:
 		e.col = len([]rune(e.currentLine()))
@@ -207,13 +221,15 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 			line = nil
 		}
 		limit := ctx.Width - lineNoW - 1
-		if limit < 0 {
-			limit = 0
-		}
+		limit = max(0, limit)
 		if len(line) > limit {
 			line = line[:limit]
 		}
-		f.Write(lineNoW+1, y, padTab(string(line), 4), textStyle)
+		style := textStyle
+		if lineIndex == e.row {
+			style = style.Underline()
+		}
+		f.Write(lineNoW+1, y, padTab(string(line), 4), style)
 	}
 
 	cursorX := lineNoW + 1 + e.col - e.colOffset
@@ -234,6 +250,10 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 			name+modified, len(e.lines), e.row+1, e.col+1)
 		f.Fill(kero.Rect{X: 0, Y: statusY, W: ctx.Width, H: 1}, ' ', statusStyle)
 		f.Write(0, statusY, trimToWidth(status, ctx.Width), statusStyle)
+		if e.lastKey.Key != kero.KeyUnknown {
+			ks := e.lastKey.String()
+			f.Write(ctx.Width-len(ks), statusY, ks, statusStyle)
+		}
 	}
 
 	messageY := ctx.Height - 1
@@ -382,22 +402,26 @@ func (e *Editor) finishCommand() error {
 	parts := strings.Fields(cmd)
 	switch parts[0] {
 	case "goto":
-		// acts like Go To Definition, for example,
-		// "goto func myFunction"
-		// "goto type myType"
+		// go to a line containing the query, case-insensitive
+		// can acts like Go To Definition, for example "goto func xxx" or "goto type xxx"
 		if len(parts) < 2 {
 			e.message = "usage: goto <query> [query2 ...]"
 			return nil
 		}
+		var queries []string
+		for _, q := range parts[1:] {
+			queries = append(queries, strings.ToLower(q))
+		}
 		for row, line := range e.lines {
-			allMatch := true
-			for _, query := range parts[1:] {
+			line = strings.ToLower(line)
+			match := true
+			for _, query := range queries {
 				if !strings.Contains(line, query) {
-					allMatch = false
+					match = false
 					break
 				}
 			}
-			if allMatch {
+			if match {
 				e.row = row
 				e.col = 0
 				return nil
@@ -417,7 +441,11 @@ func (e *Editor) startFind() {
 func (e *Editor) updateFind(ev kero.KeyEvent) error {
 	switch ev.Key {
 	case kero.KeyEnter:
-		e.findNext()
+		if ev.Mod&kero.ModShift != 0 {
+			e.findPrev()
+		} else {
+			e.findNext()
+		}
 		return nil
 	case kero.KeyEsc:
 		e.finding = false
@@ -430,7 +458,7 @@ func (e *Editor) updateFind(ev kero.KeyEvent) error {
 }
 
 func (e *Editor) drawFind(f *kero.Frame, y int, width int) {
-	normal := kero.NewStyle().Foreground(kero.ColorYellow)
+	normal := kero.NewStyle().Foreground(kero.ColorRed)
 	prompt := " Find: "
 	f.Write(0, y, trimToWidth(prompt, width), normal)
 	inputX := len([]rune(prompt))
@@ -445,10 +473,13 @@ func (e *Editor) findNext() {
 	if strings.TrimSpace(query) == "" {
 		return
 	}
+
+	row := e.row
 	col := e.col
-	for row := e.row; ; {
-		line := e.lines[row]
-		if i := strings.Index(line[col:], query); i >= 0 {
+	for {
+		line := e.lines[row][col:]
+		i := strings.Index(strings.ToLower(line), strings.ToLower(query))
+		if i >= 0 {
 			e.row = row
 			e.col = col + i + len(query)
 			return
@@ -471,10 +502,13 @@ func (e *Editor) findPrev() {
 	if strings.TrimSpace(query) == "" {
 		return
 	}
+
+	row := e.row
 	col := e.col
-	for row := e.row; ; {
-		line := e.lines[row]
-		if i := strings.Index(line[:col], query); i >= 0 {
+	for {
+		line := e.lines[row][:col]
+		i := strings.Index(strings.ToLower(line), strings.ToLower(query))
+		if i >= 0 {
 			e.row = row
 			e.col = i
 			return
@@ -489,30 +523,6 @@ func (e *Editor) findPrev() {
 		}
 		col = max(0, len(e.lines[row])-1)
 	}
-}
-
-func (e *Editor) search(query string) [][2]int {
-	var matches [][2]int
-	if query == "" {
-		return matches
-	}
-	qRunes := []rune(query)
-	for row, line := range e.lines {
-		lineRunes := []rune(line)
-		for i := 0; i+len(qRunes) <= len(lineRunes); i++ {
-			match := true
-			for j := 0; j < len(qRunes); j++ {
-				if lineRunes[i+j] != qRunes[j] {
-					match = false
-					break
-				}
-			}
-			if match {
-				matches = append(matches, [2]int{row, i + len(query)})
-			}
-		}
-	}
-	return matches
 }
 
 func (e *Editor) insertRune(r rune) {
@@ -677,26 +687,24 @@ func (e *Editor) ensureCursorVisible(ctx *kero.Context) {
 	if e.row < e.rowOffset {
 		e.rowOffset = e.row
 	}
-	if e.row >= e.rowOffset+editorH {
-		e.rowOffset = e.row - editorH + 1
+	// for easy reading, controls scrolling behavior and edge padding around the cursor.
+	margin := 5
+	if e.row >= e.rowOffset+editorH-margin {
+		e.rowOffset = e.row - editorH + margin
 	}
 	if e.rowOffset < 0 {
 		e.rowOffset = 0
 	}
 
 	textW := ctx.Width - lineNumberWidth(len(e.lines)) - 1
-	if textW < 1 {
-		textW = 1
-	}
+	textW = max(1, textW)
 	if e.col < e.colOffset {
 		e.colOffset = e.col
 	}
 	if e.col >= e.colOffset+textW {
 		e.colOffset = e.col - textW + 1
 	}
-	if e.colOffset < 0 {
-		e.colOffset = 0
-	}
+	e.colOffset = max(0, e.colOffset)
 }
 
 func editorHeight(ctx *kero.Context) int {
@@ -728,18 +736,21 @@ func trimToWidth(s string, width int) string {
 }
 
 func main() {
-	f, err := os.OpenFile("/tmp/keroedit.log", os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0644)
-	if err != nil {
-		panic(err)
-	}
-	defer f.Close()
-	log.SetOutput(f)
+	/*
+		f, err := os.OpenFile("/tmp/keroedit.log", os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0644)
+		if err != nil {
+			panic(err)
+		}
+		defer f.Close()
+		log.SetOutput(f)
+		log.SetFlags(log.LstdFlags | log.Lshortfile)
+	*/
 	app := &Editor{}
 	if len(os.Args) > 1 {
 		app.path = os.Args[1]
 	}
 
-	p := kero.New(app, kero.WithAltScreen(true))
+	p := kero.New(app, kero.WithAltScreen(true), kero.WithKitty(true))
 	if err := p.Run(); err != nil {
 		panic(err)
 	}
