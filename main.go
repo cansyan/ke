@@ -25,15 +25,15 @@ type Editor struct {
 
 	// prompt for saving
 	saveAs    bool
-	saveInput kero.TextInput
+	saveInput TextInput
 
 	// find mode opens a find line at the message area
 	finding   bool
-	findInput kero.TextInput
+	findInput TextInput
 
 	// command mode opens a command line at the message area
 	cmdMode  bool
-	cmdInput kero.TextInput
+	cmdInput TextInput
 
 	// selection state
 	selecting   bool
@@ -142,25 +142,6 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 				e.selEndCol = e.col
 			}
 			return nil
-			/* with line selection, just delete the selection
-			case "ctrl+shift+k", "ctrl+K":
-				// delete current line
-				// inside iTerm2 + remote SSH session, got ctrl+K
-				if len(e.lines) == 0 {
-					return nil
-				}
-				if len(e.lines) == 1 {
-					e.lines[0] = ""
-					return nil
-				}
-				if e.row == len(e.lines)-1 {
-					e.lines = e.lines[:len(e.lines)-1]
-					e.row, e.col = e.row-1, 0
-					return nil
-				}
-				e.lines = slices.Delete(e.lines, e.row, e.row+1)
-				e.col = 0
-			*/
 		}
 		if key.Mod != 0 {
 			break
@@ -170,7 +151,7 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 		var n int
 		line := e.currentLine()
 		for _, b := range line {
-			if b != ' ' && b != '\t' {
+			if !unicode.IsSpace(b) {
 				break
 			}
 			n++
@@ -206,7 +187,7 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 		}
 	case kero.KeyHome:
 		for i, char := range e.lines[e.row] {
-			if char != ' ' && char != '\t' {
+			if !unicode.IsSpace(char) {
 				e.col = i
 				return nil
 			}
@@ -287,7 +268,7 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 
 		// overlay selection if present
 		if e.selecting {
-			sr, sc, er, ec := e.normalizeSelect()
+			sr, sc, er, ec := e.adjustSelect()
 			if lineIndex >= sr && lineIndex <= er {
 				var selStartRune, selEndRune int
 				if sr == er {
@@ -383,8 +364,8 @@ func (e *Editor) clearSelect() {
 	e.selecting = false
 }
 
-func (e *Editor) normalizeSelect() (int, int, int, int) {
-	// return startRow, startCol, endRow, endCol where start <= end
+// adjustSelect returns the selection start and end positions in normalized order (start <= end).
+func (e *Editor) adjustSelect() (int, int, int, int) {
 	sr, sc, er, ec := e.selStartRow, e.selStartCol, e.selEndRow, e.selEndCol
 	if sr > er || (sr == er && sc > ec) {
 		sr, sc, er, ec = er, ec, sr, sc
@@ -418,9 +399,6 @@ func (e *Editor) startSelectWord() {
 	}
 	// position normalized
 	pos := e.col
-	if pos > len(line) {
-		pos = len(line)
-	}
 	if pos > 0 && pos == len(line) {
 		pos = pos - 1
 	}
@@ -462,23 +440,12 @@ func (e *Editor) startSelectWord() {
 	e.col = end
 }
 
-// selection helpers
 func (e *Editor) hasSelect() bool {
 	return e.selecting && !(e.selStartRow == e.selEndRow && e.selStartCol == e.selEndCol)
 }
 
-func (e *Editor) startSelectIfNeeded() {
-	if !e.selecting {
-		e.selecting = true
-		e.selStartRow = e.row
-		e.selStartCol = e.col
-		e.selEndRow = e.row
-		e.selEndCol = e.col
-	}
-}
-
-func (e *Editor) getSelectText() string {
-	sr, sc, er, ec := e.normalizeSelect()
+func (e *Editor) getSelect() string {
+	sr, sc, er, ec := e.adjustSelect()
 	if sr == er {
 		line := []rune(e.lines[sr])
 		return string(line[sc:ec])
@@ -500,14 +467,14 @@ func (e *Editor) copySelect() {
 		e.clipboard = e.lines[e.row]
 		return
 	}
-	e.clipboard = e.getSelectText()
+	e.clipboard = e.getSelect()
 }
 
 func (e *Editor) deleteSelect() {
 	if !e.hasSelect() {
 		return
 	}
-	sr, sc, er, ec := e.normalizeSelect()
+	sr, sc, er, ec := e.adjustSelect()
 	if sr == er {
 		line := []rune(e.lines[sr])
 		left := string(line[:sc])
@@ -684,7 +651,7 @@ func (e *Editor) drawSaveAs(f *kero.Frame, y int, width int) {
 // startCommand puts the editor into command-line mode (like vim's :)
 func (e *Editor) startCommand() {
 	e.cmdMode = true
-	e.cmdInput = kero.TextInput{}
+	e.cmdInput = TextInput{}
 	e.cmdInput.Value = ""
 	e.cmdInput.Cursor = 0
 	e.message = ""
@@ -746,6 +713,9 @@ func (e *Editor) finishCommand() error {
 			if match {
 				e.row = row
 				e.col = 0
+				if e.hasSelect() {
+					e.clearSelect()
+				}
 				return nil
 			}
 		}
@@ -757,7 +727,19 @@ func (e *Editor) finishCommand() error {
 
 func (e *Editor) startFind() {
 	e.finding = true
-	e.findInput = kero.TextInput{}
+	if e.hasSelect() {
+		e.findInput.Value = e.getSelect()
+		e.findInput.Cursor = len([]rune(e.findInput.Value))
+		e.findInput.SelStart = 0
+		e.findInput.SelEnd = e.findInput.Cursor
+		return
+	}
+	// if no selection, pre-fill with last query
+	if e.findInput.Value != "" {
+		e.findInput.Cursor = len([]rune(e.findInput.Value))
+		e.findInput.SelStart = 0
+		e.findInput.SelEnd = e.findInput.Cursor
+	}
 }
 
 func (e *Editor) updateFind(ev kero.KeyEvent) error {
@@ -779,7 +761,7 @@ func (e *Editor) updateFind(ev kero.KeyEvent) error {
 }
 
 func (e *Editor) drawFind(f *kero.Frame, y int, width int) {
-	normal := kero.NewStyle().Foreground(kero.ColorRed)
+	normal := kero.NewStyle()
 	prompt := " Find: "
 	f.Write(0, y, trimToWidth(prompt, width), normal)
 	inputX := len([]rune(prompt))
@@ -803,6 +785,9 @@ func (e *Editor) findNext() {
 		if i >= 0 {
 			e.row = row
 			e.col = col + i + len(query)
+			if e.hasSelect() {
+				e.clearSelect()
+			}
 			return
 		}
 		if row < len(e.lines)-1 {
@@ -832,6 +817,9 @@ func (e *Editor) findPrev() {
 		if i >= 0 {
 			e.row = row
 			e.col = i
+			if e.hasSelect() {
+				e.clearSelect()
+			}
 			return
 		}
 		if row > 0 {
