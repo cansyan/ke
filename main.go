@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"slices"
 	"strings"
+	"unicode"
 
 	"kero"
 )
@@ -35,8 +35,15 @@ type Editor struct {
 	cmdMode  bool
 	cmdInput kero.TextInput
 
-	// last key event shall be app-level, don't hurry to make it into program context,
-	// because it is not a runtime state, but a user input state
+	// selection state
+	selecting   bool
+	selStartRow int
+	selStartCol int
+	selEndRow   int
+	selEndCol   int
+	clipboard   string
+
+	// last key is a user input state, don't hurry to make it into program context
 	lastKey kero.KeyEvent
 }
 
@@ -89,14 +96,14 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 	switch key.Key {
 	case kero.KeyRune:
 		switch key.String() {
-		case "ctrl+\\":
-			// Open command line on Ctrl+\
+		case "ctrl+;":
+			// imitation of vim's shift+; (:)
 			e.startCommand()
 			return nil
 		case "ctrl+q":
 			quitAgain := e.lastKey.String() == "ctrl+q"
 			if e.dirty && !quitAgain {
-				e.message = "warn: unsaved changes - press Ctrl-S to save or Ctrl-Q again to quit"
+				e.message = "warn: unsaved changes, press ctrl+s to save or ctrl+q again to quit"
 				return nil
 			}
 			ctx.Quit()
@@ -106,22 +113,54 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 		case "ctrl+f":
 			e.startFind()
 			return nil
-		case "ctrl+shift+k", "ctrl+K": // inside iTerm2 + remote SSH session, got ctrl+K
-			// delete current line
-			if len(e.lines) == 0 {
-				return nil
+		case "ctrl+c":
+			e.copySelect()
+			return nil
+		case "ctrl+x":
+			e.cutSelect()
+			return nil
+		case "ctrl+v":
+			e.pasteClipboard()
+			return nil
+		case "ctrl+w":
+			// select the word under cursor
+			e.startSelectWord()
+			return nil
+		case "ctrl+l":
+			// select the line under cursor
+			e.startSelectLine()
+			return nil
+		case "ctrl+.":
+			// toggle selection anchor at cursor (start selection mode)
+			if e.selecting {
+				e.clearSelect()
+			} else {
+				e.selecting = true
+				e.selStartRow = e.row
+				e.selStartCol = e.col
+				e.selEndRow = e.row
+				e.selEndCol = e.col
 			}
-			if len(e.lines) == 1 {
-				e.lines[0] = ""
-				return nil
-			}
-			if e.row == len(e.lines)-1 {
-				e.lines = e.lines[:len(e.lines)-1]
-				e.row, e.col = e.row-1, 0
-				return nil
-			}
-			e.lines = slices.Delete(e.lines, e.row, e.row+1)
-			e.col = 0
+			return nil
+			/* with line selection, just delete the selection
+			case "ctrl+shift+k", "ctrl+K":
+				// delete current line
+				// inside iTerm2 + remote SSH session, got ctrl+K
+				if len(e.lines) == 0 {
+					return nil
+				}
+				if len(e.lines) == 1 {
+					e.lines[0] = ""
+					return nil
+				}
+				if e.row == len(e.lines)-1 {
+					e.lines = e.lines[:len(e.lines)-1]
+					e.row, e.col = e.row-1, 0
+					return nil
+				}
+				e.lines = slices.Delete(e.lines, e.row, e.row+1)
+				e.col = 0
+			*/
 		}
 		if key.Mod != 0 {
 			break
@@ -147,12 +186,24 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 		e.delete()
 	case kero.KeyLeft:
 		e.moveLeft()
+		if e.selecting {
+			e.selEndRow, e.selEndCol = e.row, e.col
+		}
 	case kero.KeyRight:
 		e.moveRight()
+		if e.selecting {
+			e.selEndRow, e.selEndCol = e.row, e.col
+		}
 	case kero.KeyUp:
 		e.moveUp()
+		if e.selecting {
+			e.selEndRow, e.selEndCol = e.row, e.col
+		}
 	case kero.KeyDown:
 		e.moveDown()
+		if e.selecting {
+			e.selEndRow, e.selEndCol = e.row, e.col
+		}
 	case kero.KeyHome:
 		for i, char := range e.lines[e.row] {
 			if char != ' ' && char != '\t' {
@@ -176,10 +227,7 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 		}
 		e.clampCol()
 	case kero.KeyEsc:
-		if e.finding {
-			e.finding = false
-			break
-		}
+		e.clearSelect()
 	}
 
 	return nil
@@ -190,6 +238,7 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 	lineNoStyle := kero.NewStyle().Foreground(kero.ColorBlue).Dim()
 	textStyle := kero.NewStyle()
 	cursorStyle := textStyle.Reverse()
+	selectStyle := kero.NewStyle().Foreground(kero.ColorBlack).Background(kero.ColorYellow)
 	messageStyle := kero.NewStyle()
 	if strings.HasPrefix(e.message, "error:") || strings.HasPrefix(e.message, "warn:") {
 		messageStyle = kero.NewStyle().Foreground(kero.ColorRed)
@@ -214,22 +263,72 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 		}
 
 		f.Write(0, y, fmt.Sprintf("%*d ", lineNoW, lineIndex+1), lineNoStyle)
-		line := []rune(e.lines[lineIndex])
-		if e.colOffset < len(line) {
-			line = line[e.colOffset:]
+
+		origLine := e.lines[lineIndex]
+		lineRunes := []rune(origLine)
+		var visRunes []rune
+		if e.colOffset < len(lineRunes) {
+			visRunes = lineRunes[e.colOffset:]
 		} else {
-			line = nil
+			visRunes = nil
 		}
 		limit := ctx.Width - lineNoW - 1
 		limit = max(0, limit)
-		if len(line) > limit {
-			line = line[:limit]
+		if len(visRunes) > limit {
+			visRunes = visRunes[:limit]
 		}
+
 		style := textStyle
 		if lineIndex == e.row {
 			style = style.Underline()
 		}
-		f.Write(lineNoW+1, y, padTab(string(line), 4), style)
+		padded := padTab(string(visRunes), 4)
+		f.Write(lineNoW+1, y, padded, style)
+
+		// overlay selection if present
+		if e.selecting {
+			sr, sc, er, ec := e.normalizeSelect()
+			if lineIndex >= sr && lineIndex <= er {
+				var selStartRune, selEndRune int
+				if sr == er {
+					selStartRune = sc
+					selEndRune = ec
+				} else if lineIndex == sr {
+					selStartRune = sc
+					selEndRune = len(lineRunes)
+				} else if lineIndex == er {
+					selStartRune = 0
+					selEndRune = ec
+				} else {
+					selStartRune = 0
+					selEndRune = len(lineRunes)
+				}
+
+				// compute display indices relative to visible padded
+				prefixPadded := padTab(string([]rune(origLine)[:min(len(lineRunes), e.colOffset)]), 4)
+				startDisplay := 0
+				if selStartRune > e.colOffset {
+					startDisplay = len(padTab(string([]rune(origLine)[:selStartRune]), 4)) - len(prefixPadded)
+				} else {
+					startDisplay = 0
+				}
+				endDisplay := len(padded)
+				if selEndRune <= len(lineRunes) {
+					endDisplay = len(padTab(string([]rune(origLine)[:min(len(lineRunes), selEndRune)]), 4)) - len(prefixPadded)
+					if endDisplay < 0 {
+						endDisplay = 0
+					}
+				}
+
+				startDisplay = max(0, min(startDisplay, len(padded)))
+				endDisplay = max(0, min(endDisplay, len(padded)))
+
+				for x := startDisplay; x < endDisplay; x++ {
+					ch := rune(padded[x])
+					f.Set(lineNoW+1+x, y, ch, selectStyle)
+				}
+			}
+		}
 	}
 
 	cursorX := lineNoW + 1 + e.col - e.colOffset
@@ -248,6 +347,9 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 	if statusY >= 0 {
 		status := fmt.Sprintf(" %s | %d lines | Ln %d, Col %d",
 			name+modified, len(e.lines), e.row+1, e.col+1)
+		if e.selecting {
+			status = status + " | Selecting"
+		}
 		f.Fill(kero.Rect{X: 0, Y: statusY, W: ctx.Width, H: 1}, ' ', statusStyle)
 		f.Write(0, statusY, trimToWidth(status, ctx.Width), statusStyle)
 		if e.lastKey.Key != kero.KeyUnknown {
@@ -271,10 +373,230 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 			return
 		}
 		if e.message == "" {
-			e.message = "Ctrl-F find | Ctrl-S save | Ctrl-Q quit"
+			e.message = "ctrl+f find | ctrl+s save | ctrl+q quit"
 		}
 		f.Write(0, messageY, trimToWidth(" "+e.message, ctx.Width), messageStyle)
 	}
+}
+
+func (e *Editor) clearSelect() {
+	e.selecting = false
+}
+
+func (e *Editor) normalizeSelect() (int, int, int, int) {
+	// return startRow, startCol, endRow, endCol where start <= end
+	sr, sc, er, ec := e.selStartRow, e.selStartCol, e.selEndRow, e.selEndCol
+	if sr > er || (sr == er && sc > ec) {
+		sr, sc, er, ec = er, ec, sr, sc
+	}
+	return sr, sc, er, ec
+}
+
+func (e *Editor) startSelectLine() {
+	e.selecting = true
+	e.selStartRow = e.row
+	e.selEndRow = e.row
+	e.selStartCol = 0
+	e.selEndCol = len([]rune(e.currentLine()))
+	// move cursor to end of selection
+	e.col = e.selEndCol
+}
+
+func isWordChar(r rune) bool {
+	return unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_'
+}
+
+func (e *Editor) startSelectWord() {
+	e.selecting = true
+	line := []rune(e.currentLine())
+	if len(line) == 0 {
+		e.selStartCol = 0
+		e.selEndCol = 0
+		e.selStartRow = e.row
+		e.selEndRow = e.row
+		return
+	}
+	// position normalized
+	pos := e.col
+	if pos > len(line) {
+		pos = len(line)
+	}
+	if pos > 0 && pos == len(line) {
+		pos = pos - 1
+	}
+	// if current rune is not a word char, advance to the next word char to the right
+	if pos < len(line) && !isWordChar(line[pos]) {
+		i := pos
+		for i < len(line) && !isWordChar(line[i]) {
+			i++
+		}
+		pos = min(i, len(line))
+		// if we didn't find a word to the right, try moving left
+		if pos >= len(line) {
+			j := e.col
+			for j > 0 && !isWordChar(line[j-1]) {
+				j--
+			}
+			pos = min(j, len(line))
+		}
+	}
+	// find word boundaries around pos
+	start := pos
+	for start > 0 && isWordChar(line[start-1]) {
+		start--
+	}
+	end := pos
+	for end < len(line) && isWordChar(line[end]) {
+		end++
+	}
+	if start == end {
+		// nothing selectable, keep empty selection at cursor
+		start = pos
+		end = pos
+	}
+	e.selStartRow = e.row
+	e.selEndRow = e.row
+	e.selStartCol = start
+	e.selEndCol = end
+	// put cursor at end
+	e.col = end
+}
+
+// selection helpers
+func (e *Editor) hasSelect() bool {
+	return e.selecting && !(e.selStartRow == e.selEndRow && e.selStartCol == e.selEndCol)
+}
+
+func (e *Editor) startSelectIfNeeded() {
+	if !e.selecting {
+		e.selecting = true
+		e.selStartRow = e.row
+		e.selStartCol = e.col
+		e.selEndRow = e.row
+		e.selEndCol = e.col
+	}
+}
+
+func (e *Editor) getSelectText() string {
+	sr, sc, er, ec := e.normalizeSelect()
+	if sr == er {
+		line := []rune(e.lines[sr])
+		return string(line[sc:ec])
+	}
+	var sb strings.Builder
+	sb.WriteString(string([]rune(e.lines[sr])[sc:]))
+	sb.WriteRune('\n')
+	for r := sr + 1; r < er; r++ {
+		sb.WriteString(e.lines[r])
+		sb.WriteRune('\n')
+	}
+	sb.WriteString(string([]rune(e.lines[er])[0:ec]))
+	return sb.String()
+}
+
+func (e *Editor) copySelect() {
+	if !e.hasSelect() {
+		// copy entire current line
+		e.clipboard = e.lines[e.row]
+		return
+	}
+	e.clipboard = e.getSelectText()
+}
+
+func (e *Editor) deleteSelect() {
+	if !e.hasSelect() {
+		return
+	}
+	sr, sc, er, ec := e.normalizeSelect()
+	if sr == er {
+		line := []rune(e.lines[sr])
+		left := string(line[:sc])
+		right := string(line[ec:])
+		e.lines[sr] = left + right
+		e.row = sr
+		e.col = sc
+		e.selecting = false
+		e.markDirty()
+		return
+	}
+	left := string([]rune(e.lines[sr])[:sc])
+	right := string([]rune(e.lines[er])[ec:])
+	e.lines[sr] = left + right
+	// remove middle lines
+	if er >= sr+1 {
+		e.lines = append(e.lines[:sr+1], e.lines[er+1:]...)
+	} else {
+		e.lines = append(e.lines[:sr+1], e.lines[er+1:]...)
+	}
+	e.row = sr
+	e.col = sc
+	e.selecting = false
+	e.markDirty()
+}
+
+func (e *Editor) cutSelect() {
+	if !e.hasSelect() {
+		// cut current line
+		e.clipboard = e.lines[e.row]
+		if len(e.lines) == 1 {
+			e.lines[0] = ""
+			e.row = 0
+			e.col = 0
+		} else {
+			// remove line
+			if e.row == len(e.lines)-1 {
+				e.lines = e.lines[:len(e.lines)-1]
+				e.row--
+				e.col = 0
+			} else {
+				e.lines = append(e.lines[:e.row], e.lines[e.row+1:]...)
+				e.col = 0
+			}
+		}
+		e.markDirty()
+		return
+	}
+	e.copySelect()
+	e.deleteSelect()
+}
+
+func (e *Editor) pasteClipboard() {
+	if e.clipboard == "" {
+		return
+	}
+	// if selection present, replace it
+	if e.hasSelect() {
+		e.deleteSelect()
+	}
+	clip := e.clipboard
+	if !strings.Contains(clip, "\n") {
+		// simple insert
+		line := []rune(e.currentLine())
+		left := string(line[:e.col])
+		right := string(line[e.col:])
+		e.lines[e.row] = left + clip + right
+		e.col += len([]rune(clip))
+		e.markDirty()
+		return
+	}
+	// multi-line paste
+	line := []rune(e.currentLine())
+	left := string(line[:e.col])
+	right := string(line[e.col:])
+	parts := strings.Split(clip, "\n")
+	e.lines[e.row] = left + parts[0]
+	insert := make([]string, 0, len(parts)-1)
+	for i := 1; i < len(parts); i++ {
+		insert = append(insert, parts[i])
+	}
+	// append right to the last inserted line
+	last := insert[len(insert)-1]
+	insert[len(insert)-1] = last + right
+	// splice into lines
+	e.lines = append(e.lines[:e.row+1], append(insert, e.lines[e.row+1:]...)...)
+	e.row = e.row + len(parts) - 1
+	e.col = len([]rune(parts[len(parts)-1]))
+	e.markDirty()
 }
 
 func padTab(s string, tabSize int) string {
@@ -449,7 +771,6 @@ func (e *Editor) updateFind(ev kero.KeyEvent) error {
 		return nil
 	case kero.KeyEsc:
 		e.finding = false
-		// don't clear the query, let ctrl-n use it
 		return nil
 	}
 
@@ -526,6 +847,9 @@ func (e *Editor) findPrev() {
 }
 
 func (e *Editor) insertRune(r rune) {
+	if e.hasSelect() {
+		e.deleteSelect()
+	}
 	line := []rune(e.currentLine())
 	line = append(line, 0)
 	copy(line[e.col+1:], line[e.col:])
@@ -556,6 +880,10 @@ func (e *Editor) insertNewline() {
 }
 
 func (e *Editor) backspace() {
+	if e.hasSelect() {
+		e.deleteSelect()
+		return
+	}
 	if e.col > 0 {
 		line := []rune(e.currentLine())
 		line = append(line[:e.col-1], line[e.col:]...)
@@ -578,6 +906,10 @@ func (e *Editor) backspace() {
 }
 
 func (e *Editor) delete() {
+	if e.hasSelect() {
+		e.deleteSelect()
+		return
+	}
 	line := []rune(e.currentLine())
 	if e.col < len(line) {
 		line = append(line[:e.col], line[e.col+1:]...)
