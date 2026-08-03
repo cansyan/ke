@@ -18,7 +18,7 @@ type Editor struct {
 	col   int
 
 	rowOffset int
-	colOffset int
+	colOffset int // visual display column offset (0-based horizontal scroll position)
 
 	dirty   bool
 	message string
@@ -186,6 +186,10 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 			e.selEndRow, e.selEndCol = e.row, e.col
 		}
 	case kero.KeyHome:
+		if e.lastKey.Key == kero.KeyHome {
+			e.col = 0
+			return nil
+		}
 		for i, char := range e.lines[e.row] {
 			if !unicode.IsSpace(char) {
 				e.col = i
@@ -246,30 +250,29 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 		f.Write(0, y, fmt.Sprintf("%*d ", lineNoW, lineIndex+1), lineNoStyle)
 
 		origLine := e.lines[lineIndex]
-		lineRunes := []rune(origLine)
-		var visRunes []rune
-		if e.colOffset < len(lineRunes) {
-			visRunes = lineRunes[e.colOffset:]
-		} else {
-			visRunes = nil
-		}
+		fullPadded := padTab(origLine, 4)
 		limit := ctx.Width - lineNoW - 1
 		limit = max(0, limit)
-		if len(visRunes) > limit {
-			visRunes = visRunes[:limit]
+
+		var visPadded string
+		if e.colOffset < len(fullPadded) {
+			visPadded = fullPadded[e.colOffset:]
+		}
+		if len(visPadded) > limit {
+			visPadded = visPadded[:limit]
 		}
 
 		style := textStyle
 		if lineIndex == e.row {
 			style = style.Underline()
 		}
-		padded := padTab(string(visRunes), 4)
-		f.Write(lineNoW+1, y, padded, style)
+		f.Write(lineNoW+1, y, visPadded, style)
 
 		// overlay selection if present
 		if e.selecting {
 			sr, sc, er, ec := e.adjustSelect()
 			if lineIndex >= sr && lineIndex <= er {
+				lineRunes := []rune(origLine)
 				var selStartRune, selEndRune int
 				if sr == er {
 					selStartRune = sc
@@ -285,49 +288,37 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 					selEndRune = len(lineRunes)
 				}
 
-				// compute display indices relative to visible padded
-				prefixPadded := padTab(string([]rune(origLine)[:min(len(lineRunes), e.colOffset)]), 4)
-				startDisplay := 0
-				if selStartRune > e.colOffset {
-					startDisplay = len(padTab(string([]rune(origLine)[:selStartRune]), 4)) - len(prefixPadded)
-				} else {
-					startDisplay = 0
-				}
-				endDisplay := len(padded)
-				if selEndRune <= len(lineRunes) {
-					endDisplay = len(padTab(string([]rune(origLine)[:min(len(lineRunes), selEndRune)]), 4)) - len(prefixPadded)
-					if endDisplay < 0 {
-						endDisplay = 0
-					}
-				}
+				startVisCol := runeIndexToDisplayColumn(origLine, selStartRune)
+				endVisCol := runeIndexToDisplayColumn(origLine, selEndRune)
 
-				startDisplay = max(0, min(startDisplay, len(padded)))
-				endDisplay = max(0, min(endDisplay, len(padded)))
+				startDisplay := max(0, min(startVisCol-e.colOffset, len(visPadded)))
+				endDisplay := max(0, min(endVisCol-e.colOffset, len(visPadded)))
 
 				for x := startDisplay; x < endDisplay; x++ {
-					ch := rune(padded[x])
+					ch := rune(visPadded[x])
 					f.Set(lineNoW+1+x, y, ch, selectStyle)
 				}
 			}
 		}
 	}
 
-	cursorX := lineNoW + 1 + e.col - e.colOffset
+	line := e.currentLine()
+	cursorDisplayCol := runeIndexToDisplayColumn(line, e.col)
+	cursorX := lineNoW + 1 + cursorDisplayCol - e.colOffset
 	cursorY := 0 + e.row - e.rowOffset
 	if cursorY >= 0 && cursorY < editorH && cursorX >= lineNoW+1 && cursorX < ctx.Width {
+		fullLinePadded := padTab(line, 4)
 		ch := ' '
-		line := []rune(e.currentLine())
-		if e.col < len(line) {
-			ch = line[e.col]
+		if cursorDisplayCol < len(fullLinePadded) {
+			ch = rune(fullLinePadded[cursorDisplayCol])
 		}
-		pad := len(padTab(string(line[:e.col]), 4)) - len(line[:e.col])
-		f.Set(cursorX+pad, cursorY, ch, cursorStyle)
+		f.Set(cursorX, cursorY, ch, cursorStyle)
 	}
 
 	statusY := ctx.Height - 1
 	if statusY >= 0 {
 		status := fmt.Sprintf(" %s | %d lines | Ln %d, Col %d",
-			name+modified, len(e.lines), e.row+1, e.col+1)
+			name+modified, len(e.lines), e.row+1, cursorDisplayCol+1)
 		if e.selecting {
 			status = status + " | Selecting"
 		}
@@ -939,40 +930,18 @@ func (e *Editor) moveRight() {
 
 func (e *Editor) moveUp() {
 	if e.row > 0 {
-		dstCol := len(padTab(string(e.currentLine()[:e.col]), 4))
+		dstCol := runeIndexToDisplayColumn(e.currentLine(), e.col)
 		e.row--
-		var width int
-		for i, char := range e.currentLine() {
-			if width >= dstCol {
-				e.col = i
-				break
-			}
-			if char == '\t' {
-				width += 4 - width%4
-			} else {
-				width++
-			}
-		}
+		e.col = displayColumnToRuneIndex(e.currentLine(), dstCol)
 		e.clampCol()
 	}
 }
 
 func (e *Editor) moveDown() {
 	if e.row < len(e.lines)-1 {
-		dstCol := len(padTab(string(e.currentLine()[:e.col]), 4))
+		dstCol := runeIndexToDisplayColumn(e.currentLine(), e.col)
 		e.row++
-		var width int
-		for i, char := range e.currentLine() {
-			if width >= dstCol {
-				e.col = i
-				break
-			}
-			if char == '\t' {
-				width += 4 - width%4
-			} else {
-				width++
-			}
-		}
+		e.col = displayColumnToRuneIndex(e.currentLine(), dstCol)
 		e.clampCol()
 	}
 }
@@ -1002,6 +971,46 @@ func (e *Editor) markDirty() {
 	e.message = ""
 }
 
+func runeIndexToDisplayColumn(s string, pos int) int {
+	runes := []rune(s)
+	if pos < 0 {
+		pos = 0
+	}
+	if pos > len(runes) {
+		pos = len(runes)
+	}
+
+	col := 0
+	for i := 0; i < pos; i++ {
+		if runes[i] == '\t' {
+			col += 4 - (col % 4)
+			continue
+		}
+		col++
+	}
+	return col
+}
+
+func displayColumnToRuneIndex(s string, targetCol int) int {
+	runes := []rune(s)
+	if targetCol <= 0 {
+		return 0
+	}
+
+	col := 0
+	for i, r := range runes {
+		advance := 1
+		if r == '\t' {
+			advance = 4 - (col % 4)
+		}
+		if col+advance > targetCol {
+			return i
+		}
+		col += advance
+	}
+	return len(runes)
+}
+
 func (e *Editor) ensureCursorVisible(ctx *kero.Context) {
 	editorH := editorHeight(ctx)
 	if e.row < e.rowOffset {
@@ -1018,13 +1027,16 @@ func (e *Editor) ensureCursorVisible(ctx *kero.Context) {
 
 	textW := ctx.Width - lineNumberWidth(len(e.lines)) - 1
 	textW = max(1, textW)
-	if e.col < e.colOffset {
-		e.colOffset = e.col
+	line := e.currentLine()
+	cursorDisplay := runeIndexToDisplayColumn(line, e.col)
+	if cursorDisplay < e.colOffset {
+		e.colOffset = cursorDisplay
+	} else if cursorDisplay >= e.colOffset+textW {
+		e.colOffset = cursorDisplay - textW + 1
 	}
-	if e.col >= e.colOffset+textW {
-		e.colOffset = e.col - textW + 1
+	if e.colOffset < 0 {
+		e.colOffset = 0
 	}
-	e.colOffset = max(0, e.colOffset)
 }
 
 func editorHeight(ctx *kero.Context) int {
