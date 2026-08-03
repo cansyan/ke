@@ -272,3 +272,64 @@ func TestStartSelectLine(t *testing.T) {
 		t.Errorf("selEnd = (%d, %d), want (2, %d)", ed.selEndRow, ed.selEndCol, len("third line"))
 	}
 }
+
+func TestWordUnderCursor(t *testing.T) {
+	ed := &Editor{
+		lines: []string{
+			"func (e *Editor) finishCommand() error {",
+		},
+		row: 0,
+		col: 20, // on 'f' in finishCommand
+	}
+	if got := ed.wordUnderCursor(); got != "finishCommand" {
+		t.Fatalf("wordUnderCursor() = %q, want %q", got, "finishCommand")
+	}
+}
+
+func TestCtrlKCtrlD_SmartGoto(t *testing.T) {
+	ed := &Editor{
+		lines: []string{
+			"package main",
+			"",
+			"type Editor struct {",
+			"}",
+			"",
+			"func (e *Editor) finishCommand() error {",
+			"    return nil",
+			"}",
+			"",
+			"func main() {",
+			"    e := &Editor{}",
+			"    e.finishCommand()",
+			"}",
+		},
+		row: 11, // line with e.finishCommand()
+		col: 7,  // on finishCommand
+	}
+
+	ctx := &kero.Context{Width: 80, Height: 24}
+
+	// Press Ctrl+K
+	ev1 := kero.KeyEvent{Key: kero.KeyRune, Rune: 'k', Mod: kero.ModCtrl}
+	if err := ed.Update(ctx, ev1); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if ed.message != "(ctrl+k) was pressed. Waiting for second key..." {
+		t.Errorf("unexpected message after ctrl+k: %q", ed.message)
+	}
+
+	// Press Ctrl+D
+	ev2 := kero.KeyEvent{Key: kero.KeyRune, Rune: 'd', Mod: kero.ModCtrl}
+	if err := ed.Update(ctx, ev2); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if ed.row != 5 {
+		t.Errorf("ed.row = %d, want 5 (line of func (e *Editor) finishCommand)", ed.row)
+	}
+	if ed.message != "goto: func finishCommand" {
+		t.Errorf("unexpected message after ctrl+k ctrl+d: %q", ed.message)
+	}
+}
+

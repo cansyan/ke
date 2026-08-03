@@ -104,9 +104,16 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 		return e.updateCommand(key)
 	}
 
+	if e.lastKey.String() == "ctrl+k" && (key.String() == "ctrl+d" || key.String() == "d") {
+		return e.smartGoto()
+	}
+
 	switch key.Key {
 	case kero.KeyRune:
 		switch key.String() {
+		case "ctrl+k":
+			e.message = "(ctrl+k) was pressed. Waiting for second key..."
+			return nil
 		case "ctrl+;":
 			// imitation of vim's shift+; (:)
 			e.startCommand()
@@ -784,6 +791,114 @@ func (e *Editor) drawCommand(f *kero.Frame, y int, width int) {
 	e.cmdInput.Draw(f, kero.Rect{X: inputX, Y: y, W: width - inputX, H: 1}, style)
 }
 
+func (e *Editor) gotoQueries(queries []string) bool {
+	if len(queries) == 0 {
+		return false
+	}
+	var lowerQueries []string
+	for _, q := range queries {
+		q = strings.TrimSpace(strings.ToLower(q))
+		if q != "" {
+			lowerQueries = append(lowerQueries, q)
+		}
+	}
+	if len(lowerQueries) == 0 {
+		return false
+	}
+	for row, line := range e.lines {
+		lineLower := strings.ToLower(line)
+		match := true
+		for _, query := range lowerQueries {
+			if !strings.Contains(lineLower, query) {
+				match = false
+				break
+			}
+		}
+		if match {
+			e.row = row
+			e.col = 0
+			if e.hasSelect() {
+				e.clearSelect()
+			}
+			return true
+		}
+	}
+	return false
+}
+
+func (e *Editor) wordUnderCursor() string {
+	line := []rune(e.currentLine())
+	if len(line) == 0 {
+		return ""
+	}
+	pos := e.col
+	if pos >= len(line) {
+		pos = len(line) - 1
+	}
+	if pos < 0 {
+		pos = 0
+	}
+	if !isWordChar(line[pos]) {
+		i := pos
+		for i < len(line) && !isWordChar(line[i]) {
+			i++
+		}
+		if i < len(line) {
+			pos = i
+		} else {
+			j := pos
+			for j > 0 && !isWordChar(line[j-1]) {
+				j--
+			}
+			if j > 0 && isWordChar(line[j-1]) {
+				pos = j - 1
+			}
+		}
+	}
+	if pos < 0 || pos >= len(line) || !isWordChar(line[pos]) {
+		return ""
+	}
+	start := pos
+	for start > 0 && isWordChar(line[start-1]) {
+		start--
+	}
+	end := pos
+	for end < len(line) && isWordChar(line[end]) {
+		end++
+	}
+	return string(line[start:end])
+}
+
+func (e *Editor) smartGoto() error {
+	var target string
+	if e.hasSelect() {
+		target = strings.TrimSpace(e.getSelect())
+	} else {
+		target = strings.TrimSpace(e.wordUnderCursor())
+	}
+
+	if target == "" {
+		e.message = "no word under cursor to goto"
+		return nil
+	}
+
+	defPrefixes := []string{"type", "func", "struct", "var", "const"}
+	for _, prefix := range defPrefixes {
+		if e.gotoQueries([]string{prefix, target}) {
+			e.message = "goto: " + prefix + " " + target
+			return nil
+		}
+	}
+
+	if e.gotoQueries([]string{target}) {
+		e.message = "goto: " + target
+		return nil
+	}
+
+	e.message = "no match found for: " + target
+	return nil
+}
+
 func (e *Editor) finishCommand() error {
 	cmd := strings.TrimSpace(e.cmdInput.Value)
 	e.cmdMode = false
@@ -800,28 +915,12 @@ func (e *Editor) finishCommand() error {
 			e.message = "usage: goto <query> [query2 ...]"
 			return nil
 		}
-		var queries []string
-		for _, q := range parts[1:] {
-			queries = append(queries, strings.ToLower(q))
+		if !e.gotoQueries(parts[1:]) {
+			e.message = "no match found for: " + strings.Join(parts[1:], " ")
+		} else {
+			e.message = ""
 		}
-		for row, line := range e.lines {
-			line = strings.ToLower(line)
-			match := true
-			for _, query := range queries {
-				if !strings.Contains(line, query) {
-					match = false
-					break
-				}
-			}
-			if match {
-				e.row = row
-				e.col = 0
-				if e.hasSelect() {
-					e.clearSelect()
-				}
-				return nil
-			}
-		}
+		return nil
 	default:
 		e.message = "unknown command: " + cmd
 	}

@@ -9,5 +9,6 @@ Key bindings:
 - Ctrl+X cut
 - Ctrl+V paste
 - Ctrl+; run command
+- Ctrl+K Ctrl+D goto definition (smart jump)
 - Ctrl+Enter insert line below
 - Esc cancel
