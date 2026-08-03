@@ -1,0 +1,13 @@
+Key bindings:
+- Ctrl+S save
+- Ctrl+Q quit
+- Ctrl+F find
+- Ctrl+. select
+	- Ctrl+W select word
+	- Ctrl+L select line
+- Ctrl+C copy
+- Ctrl+X cut
+- Ctrl+V paste
+- Ctrl+; run command
+- Ctrl+Enter insert line below
+- Esc cancel

@@ -83,6 +83,17 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 		e.ensureCursorVisible(ctx)
 	}()
 
+	// anytime can quit
+	if key.String() == "ctrl+q" {
+		quitAgain := e.lastKey.String() == "ctrl+q"
+		if e.dirty && !quitAgain {
+			e.message = "warn: unsaved changes, press ctrl+s to save or ctrl+q again to quit"
+			return nil
+		}
+		ctx.Quit()
+		return nil
+	}
+
 	if e.saveAs {
 		return e.updateSaveAs(key)
 	}
@@ -100,14 +111,6 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 			// imitation of vim's shift+; (:)
 			e.startCommand()
 			return nil
-		case "ctrl+q":
-			quitAgain := e.lastKey.String() == "ctrl+q"
-			if e.dirty && !quitAgain {
-				e.message = "warn: unsaved changes, press ctrl+s to save or ctrl+q again to quit"
-				return nil
-			}
-			ctx.Quit()
-			return nil
 		case "ctrl+s":
 			return e.save()
 		case "ctrl+f":
@@ -124,11 +127,11 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 			return nil
 		case "ctrl+w":
 			// select the word under cursor
-			e.startSelectWord()
+			e.selectWord()
 			return nil
 		case "ctrl+l":
 			// select the line under cursor
-			e.startSelectLine()
+			e.selectLine()
 			return nil
 		case "ctrl+.":
 			// toggle selection anchor at cursor (start selection mode)
@@ -157,9 +160,23 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 			n++
 		}
 		indent := line[:n]
+		if key.Mod&kero.ModCtrl != 0 {
+			e.col = len([]rune(line))
+		}
 		e.insertNewline()
 		e.insertString(indent)
 	case kero.KeyTab:
+		if key.Mod&kero.ModShift != 0 {
+			e.unindentSelectOrLine()
+			break
+		}
+		if e.hasSelect() {
+			sr, _, er, _ := e.adjustSelect()
+			if sr != er {
+				e.indentSelect()
+				break
+			}
+		}
 		e.insertRune('\t')
 	case kero.KeyBackspace:
 		e.backspace()
@@ -345,7 +362,7 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 			return
 		}
 		if e.message == "" {
-			e.message = "^S save | ^Q quit | ^F find | ^C copy | ^X Cut | ^V paste | ^. select | ^; command"
+			e.message = "^S save | ^Q quit | ^F find | ^. select| ^C copy | ^X Cut | ^V paste"
 		}
 		f.Write(0, messageY, trimToWidth(" "+e.message, ctx.Width), messageStyle)
 	}
@@ -364,13 +381,31 @@ func (e *Editor) adjustSelect() (int, int, int, int) {
 	return sr, sc, er, ec
 }
 
-func (e *Editor) startSelectLine() {
-	e.selecting = true
-	e.selStartRow = e.row
-	e.selEndRow = e.row
-	e.selStartCol = 0
-	e.selEndCol = len([]rune(e.currentLine()))
-	// move cursor to end of selection
+func (e *Editor) selectLine() {
+	if !e.selecting {
+		e.selecting = true
+		e.selStartRow = e.row
+		e.selStartCol = 0
+		if e.row < len(e.lines)-1 {
+			e.selEndRow = e.row + 1
+			e.selEndCol = 0
+		} else {
+			e.selEndRow = e.row
+			e.selEndCol = len([]rune(e.currentLine()))
+		}
+		e.row = e.selEndRow
+		e.col = e.selEndCol
+		return
+	}
+
+	// Already selecting: extend line selection to next line
+	if e.selEndRow < len(e.lines)-1 {
+		e.selEndRow++
+		e.selEndCol = 0
+	} else {
+		e.selEndCol = len([]rune(e.lines[e.selEndRow]))
+	}
+	e.row = e.selEndRow
 	e.col = e.selEndCol
 }
 
@@ -378,7 +413,7 @@ func isWordChar(r rune) bool {
 	return unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_'
 }
 
-func (e *Editor) startSelectWord() {
+func (e *Editor) selectWord() {
 	e.selecting = true
 	line := []rune(e.currentLine())
 	if len(line) == 0 {
@@ -459,6 +494,83 @@ func (e *Editor) copySelect() {
 		return
 	}
 	e.clipboard = e.getSelect()
+}
+
+func (e *Editor) indentSelect() {
+	if !e.hasSelect() {
+		return
+	}
+	sr, _, er, ec := e.adjustSelect()
+	if sr == er {
+		return
+	}
+	lastRow := er
+	if ec == 0 && er > sr {
+		lastRow = er - 1
+	}
+	for r := sr; r <= lastRow; r++ {
+		e.lines[r] = "\t" + e.lines[r]
+	}
+	if sr <= e.selStartRow && e.selStartRow <= lastRow {
+		e.selStartCol++
+	}
+	if sr <= e.selEndRow && e.selEndRow <= lastRow {
+		e.selEndCol++
+		e.col++
+	}
+	e.markDirty()
+}
+
+func unindentLine(s string) (string, int) {
+	if strings.HasPrefix(s, "\t") {
+		return s[1:], 1
+	}
+	spaces := 0
+	for spaces < 4 && spaces < len(s) && s[spaces] == ' ' {
+		spaces++
+	}
+	if spaces > 0 {
+		return s[spaces:], spaces
+	}
+	return s, 0
+}
+
+func (e *Editor) unindentSelectOrLine() {
+	if !e.hasSelect() {
+		newLine, removed := unindentLine(e.lines[e.row])
+		if removed > 0 {
+			e.lines[e.row] = newLine
+			e.col = max(0, e.col-removed)
+			e.markDirty()
+		}
+		return
+	}
+
+	sr, _, er, ec := e.adjustSelect()
+	lastRow := er
+	if ec == 0 && er > sr {
+		lastRow = er - 1
+	}
+	var startRemoved, endRemoved int
+	for r := sr; r <= lastRow; r++ {
+		newLine, removed := unindentLine(e.lines[r])
+		if r == e.selStartRow {
+			startRemoved = removed
+		}
+		if r == e.selEndRow {
+			endRemoved = removed
+		}
+		e.lines[r] = newLine
+	}
+
+	if e.selStartRow <= lastRow {
+		e.selStartCol = max(0, e.selStartCol-startRemoved)
+	}
+	if e.selEndRow <= lastRow {
+		e.selEndCol = max(0, e.selEndCol-endRemoved)
+		e.col = max(0, e.col-endRemoved)
+	}
+	e.markDirty()
 }
 
 func (e *Editor) deleteSelect() {
@@ -662,7 +774,7 @@ func (e *Editor) updateCommand(key kero.KeyEvent) error {
 }
 
 func (e *Editor) drawCommand(f *kero.Frame, y int, width int) {
-	style := kero.NewStyle().Foreground(kero.ColorCyan)
+	style := kero.NewStyle()
 	prompt := ">"
 	f.Write(0, y, trimToWidth(prompt, width), style)
 	inputX := len([]rune(prompt))
