@@ -324,7 +324,7 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 		f.Set(cursorX+pad, cursorY, ch, cursorStyle)
 	}
 
-	statusY := ctx.Height - 2
+	statusY := ctx.Height - 1
 	if statusY >= 0 {
 		status := fmt.Sprintf(" %s | %d lines | Ln %d, Col %d",
 			name+modified, len(e.lines), e.row+1, e.col+1)
@@ -339,7 +339,7 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 		}
 	}
 
-	messageY := ctx.Height - 1
+	messageY := ctx.Height - 2
 	if messageY >= 0 {
 		if e.cmdMode {
 			e.drawCommand(f, messageY, ctx.Width)
@@ -354,7 +354,7 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 			return
 		}
 		if e.message == "" {
-			e.message = "ctrl+f find | ctrl+s save | ctrl+q quit"
+			e.message = "^S save | ^Q quit | ^F find | ^C copy | ^X Cut | ^V paste | ^. select | ^; command"
 		}
 		f.Write(0, messageY, trimToWidth(" "+e.message, ctx.Width), messageStyle)
 	}
