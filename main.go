@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"unicode"
 
@@ -50,6 +51,7 @@ type Editor struct {
 func (e *Editor) Init(ctx *kero.Context) error {
 	if e.path == "" {
 		e.lines = []string{""}
+		e.row, e.col = 0, 0
 		e.message = "new buffer"
 		return nil
 	}
@@ -58,6 +60,7 @@ func (e *Editor) Init(ctx *kero.Context) error {
 	if err != nil {
 		if os.IsNotExist(err) {
 			e.lines = []string{""}
+			e.row, e.col = 0, 0
 			e.message = "new file"
 			return nil
 		}
@@ -70,6 +73,10 @@ func (e *Editor) Init(ctx *kero.Context) error {
 	if len(e.lines) == 0 {
 		e.lines = []string{""}
 	}
+
+	e.row = min(e.row, len(e.lines)-1)
+	e.clampCol()
+	e.ensureCursorVisible(ctx)
 	return nil
 }
 
@@ -104,18 +111,15 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 		return e.updateCommand(key)
 	}
 
-	if e.lastKey.String() == "ctrl+k" && (key.String() == "ctrl+d" || key.String() == "d") {
-		return e.smartGoto()
-	}
-
 	switch key.Key {
 	case kero.KeyRune:
 		switch key.String() {
-		case "ctrl+k":
-			e.message = "(ctrl+k) was pressed. Waiting for second key..."
+		case "ctrl+]":
+			// similar to vim key "ctrl+]"
+			e.smartGoto()
 			return nil
 		case "ctrl+;":
-			// imitation of vim's shift+; (:)
+			// similar to vim key ":"
 			e.startCommand()
 			return nil
 		case "ctrl+s":
@@ -1278,19 +1282,37 @@ func trimToWidth(s string, width int) string {
 	return string(runes[:width])
 }
 
-func main() {
-	/*
-		f, err := os.OpenFile("/tmp/keroedit.log", os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0644)
-		if err != nil {
-			panic(err)
+// parsePathArg parses an argument of the form "path", "path:row", or
+// "path:row:col". row and col are 1-based and converted to 0-based.
+func parsePathArg(arg string) (path string, row, col int) {
+	parts := strings.Split(arg, ":")
+	if len(parts) <= 1 {
+		return arg, 0, 0
+	}
+
+	path = parts[0]
+	if len(parts) > 1 {
+		var errRow error
+		row, errRow = strconv.Atoi(parts[1])
+		if errRow != nil || row < 1 {
+			return path, 0, 0
 		}
-		defer f.Close()
-		log.SetOutput(f)
-		log.SetFlags(log.LstdFlags | log.Lshortfile)
-	*/
+	}
+
+	if len(parts) > 2 {
+		var errCol error
+		col, errCol = strconv.Atoi(parts[2])
+		if errCol != nil || col < 1 {
+			return path, row - 1, 0
+		}
+	}
+	return path, row - 1, col - 1
+}
+
+func main() {
 	app := &Editor{}
 	if len(os.Args) > 1 {
-		app.path = os.Args[1]
+		app.path, app.row, app.col = parsePathArg(os.Args[1])
 	}
 
 	p := kero.New(app, kero.WithAltScreen(true), kero.WithKitty(true))

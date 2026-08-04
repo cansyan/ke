@@ -309,19 +309,9 @@ func TestCtrlKCtrlD_SmartGoto(t *testing.T) {
 
 	ctx := &kero.Context{Width: 80, Height: 24}
 
-	// Press Ctrl+K
-	ev1 := kero.KeyEvent{Key: kero.KeyRune, Rune: 'k', Mod: kero.ModCtrl}
-	if err := ed.Update(ctx, ev1); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	if ed.message != "(ctrl+k) was pressed. Waiting for second key..." {
-		t.Errorf("unexpected message after ctrl+k: %q", ed.message)
-	}
-
-	// Press Ctrl+D
-	ev2 := kero.KeyEvent{Key: kero.KeyRune, Rune: 'd', Mod: kero.ModCtrl}
-	if err := ed.Update(ctx, ev2); err != nil {
+	// Press Ctrl+]
+	ev := kero.KeyEvent{Key: kero.KeyRune, Rune: ']', Mod: kero.ModCtrl}
+	if err := ed.Update(ctx, ev); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -332,4 +322,3 @@ func TestCtrlKCtrlD_SmartGoto(t *testing.T) {
 		t.Errorf("unexpected message after ctrl+k ctrl+d: %q", ed.message)
 	}
 }
-
