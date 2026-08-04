@@ -32,9 +32,9 @@ type Editor struct {
 	finding   bool
 	findInput TextInput
 
-	// command mode opens a command line at the message area
-	cmdMode  bool
-	cmdInput TextInput
+	// goto mode opens a input line at the message area
+	gotoMode  bool
+	gotoInput TextInput
 
 	// selection state
 	selecting   bool
@@ -44,7 +44,6 @@ type Editor struct {
 	selEndCol   int
 	clipboard   string
 
-	// last key is a user input state, don't hurry to make it into program context
 	lastKey kero.KeyEvent
 }
 
@@ -107,8 +106,8 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 	if e.finding {
 		return e.updateFind(key)
 	}
-	if e.cmdMode {
-		return e.updateCommand(key)
+	if e.gotoMode {
+		return e.updateGoto(key)
 	}
 
 	switch key.Key {
@@ -118,9 +117,13 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 			// similar to vim key "ctrl+]"
 			e.smartGoto()
 			return nil
-		case "ctrl+;":
-			// similar to vim key ":"
-			e.startCommand()
+		case "ctrl+p":
+			// goto anything
+			e.startGoto("")
+			return nil
+		case "ctrl+r":
+			// goto any symbol/type/function (identical to ctrl+p with @ prefix)
+			e.startGoto("@")
 			return nil
 		case "ctrl+s":
 			return e.save()
@@ -182,7 +185,7 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 			break
 		}
 		if e.hasSelect() {
-			sr, _, er, _ := e.adjustSelect()
+			sr, _, er, _ := e.normalizedSelection()
 			if sr != er {
 				e.indentSelect()
 				break
@@ -298,7 +301,7 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 
 		// overlay selection if present
 		if e.selecting {
-			sr, sc, er, ec := e.adjustSelect()
+			sr, sc, er, ec := e.normalizedSelection()
 			if lineIndex >= sr && lineIndex <= er {
 				lineRunes := []rune(origLine)
 				var selStartRune, selEndRune int
@@ -360,8 +363,8 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 
 	messageY := ctx.Height - 2
 	if messageY >= 0 {
-		if e.cmdMode {
-			e.drawCommand(f, messageY, ctx.Width)
+		if e.gotoMode {
+			e.drawGoto(f, messageY, ctx.Width)
 			return
 		}
 		if e.saveAs {
@@ -373,7 +376,7 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 			return
 		}
 		if e.message == "" {
-			e.message = "^S save | ^Q quit | ^F find | ^. select| ^C copy | ^X Cut | ^V paste"
+			e.message = "^S save | ^Q quit | ^F find | ^. select| ^C copy | ^X Cut | ^V paste | ^P goto"
 		}
 		f.Write(0, messageY, trimToWidth(" "+e.message, ctx.Width), messageStyle)
 	}
@@ -383,8 +386,8 @@ func (e *Editor) clearSelect() {
 	e.selecting = false
 }
 
-// adjustSelect returns the selection start and end positions in normalized order (start <= end).
-func (e *Editor) adjustSelect() (int, int, int, int) {
+// normalizedSelection returns the selection start and end positions in normalized order (start <= end).
+func (e *Editor) normalizedSelection() (startRow, startCol, endRow, endCol int) {
 	sr, sc, er, ec := e.selStartRow, e.selStartCol, e.selEndRow, e.selEndCol
 	if sr > er || (sr == er && sc > ec) {
 		sr, sc, er, ec = er, ec, sr, sc
@@ -481,8 +484,8 @@ func (e *Editor) hasSelect() bool {
 	return e.selecting && !(e.selStartRow == e.selEndRow && e.selStartCol == e.selEndCol)
 }
 
-func (e *Editor) getSelect() string {
-	sr, sc, er, ec := e.adjustSelect()
+func (e *Editor) selectedText() string {
+	sr, sc, er, ec := e.normalizedSelection()
 	if sr == er {
 		line := []rune(e.lines[sr])
 		return string(line[sc:ec])
@@ -504,14 +507,14 @@ func (e *Editor) copySelect() {
 		e.clipboard = e.lines[e.row]
 		return
 	}
-	e.clipboard = e.getSelect()
+	e.clipboard = e.selectedText()
 }
 
 func (e *Editor) indentSelect() {
 	if !e.hasSelect() {
 		return
 	}
-	sr, _, er, ec := e.adjustSelect()
+	sr, _, er, ec := e.normalizedSelection()
 	if sr == er {
 		return
 	}
@@ -557,7 +560,7 @@ func (e *Editor) unindentSelectOrLine() {
 		return
 	}
 
-	sr, _, er, ec := e.adjustSelect()
+	sr, _, er, ec := e.normalizedSelection()
 	lastRow := er
 	if ec == 0 && er > sr {
 		lastRow = er - 1
@@ -588,7 +591,7 @@ func (e *Editor) deleteSelect() {
 	if !e.hasSelect() {
 		return
 	}
-	sr, sc, er, ec := e.adjustSelect()
+	sr, sc, er, ec := e.normalizedSelection()
 	if sr == er {
 		line := []rune(e.lines[sr])
 		left := string(line[:sc])
@@ -762,39 +765,40 @@ func (e *Editor) drawSaveAs(f *kero.Frame, y int, width int) {
 	e.saveInput.Draw(f, kero.Rect{X: inputX, Y: y, W: width - inputX, H: 1}, style)
 }
 
-// startCommand puts the editor into command-line mode (like vim's :)
-func (e *Editor) startCommand() {
-	e.cmdMode = true
-	e.cmdInput = TextInput{}
-	e.cmdInput.Value = ""
-	e.cmdInput.Cursor = 0
+// startGoto puts the editor into goto-anything mode
+func (e *Editor) startGoto(prefix string) {
+	e.gotoMode = true
+	e.gotoInput = TextInput{}
+	e.gotoInput.Value = prefix
+	e.gotoInput.Cursor = len([]rune(prefix))
 	e.message = ""
 }
 
-func (e *Editor) updateCommand(key kero.KeyEvent) error {
+func (e *Editor) updateGoto(key kero.KeyEvent) error {
 	switch key.Key {
 	case kero.KeyEnter:
-		return e.finishCommand()
+		return e.finishGoto()
 	case kero.KeyEsc:
-		e.cmdMode = false
+		e.gotoMode = false
 		return nil
 	}
 
-	e.cmdInput.Update(key)
+	e.gotoInput.Update(key)
 	return nil
 }
 
-func (e *Editor) drawCommand(f *kero.Frame, y int, width int) {
+func (e *Editor) drawGoto(f *kero.Frame, y int, width int) {
 	style := kero.NewStyle()
-	prompt := ">"
-	f.Write(0, y, trimToWidth(prompt, width), style)
+	prompt := " Goto "
+	f.Write(0, y, trimToWidth(prompt, width), style.Foreground(kero.ColorYellow))
 	inputX := len([]rune(prompt))
 	if inputX >= width {
 		return
 	}
-	e.cmdInput.Draw(f, kero.Rect{X: inputX, Y: y, W: width - inputX, H: 1}, style)
+	e.gotoInput.Draw(f, kero.Rect{X: inputX, Y: y, W: width - inputX, H: 1}, style)
 }
 
+// gotoQueries makes cursor jump to the first matching line, with loose string matching
 func (e *Editor) gotoQueries(queries []string) bool {
 	if len(queries) == 0 {
 		return false
@@ -876,7 +880,7 @@ func (e *Editor) wordUnderCursor() string {
 func (e *Editor) smartGoto() error {
 	var target string
 	if e.hasSelect() {
-		target = strings.TrimSpace(e.getSelect())
+		target = strings.TrimSpace(e.selectedText())
 	} else {
 		target = strings.TrimSpace(e.wordUnderCursor())
 	}
@@ -889,13 +893,13 @@ func (e *Editor) smartGoto() error {
 	defPrefixes := []string{"type", "func", "struct", "var", "const"}
 	for _, prefix := range defPrefixes {
 		if e.gotoQueries([]string{prefix, target}) {
-			e.message = "goto: " + prefix + " " + target
+			// e.message = "goto: " + prefix + " " + target
 			return nil
 		}
 	}
 
 	if e.gotoQueries([]string{target}) {
-		e.message = "goto: " + target
+		// e.message = "goto: " + target
 		return nil
 	}
 
@@ -903,30 +907,60 @@ func (e *Editor) smartGoto() error {
 	return nil
 }
 
-func (e *Editor) finishCommand() error {
-	cmd := strings.TrimSpace(e.cmdInput.Value)
-	e.cmdMode = false
-	if cmd == "" {
+func (e *Editor) finishGoto() error {
+	input := strings.TrimSpace(e.gotoInput.Value)
+	e.gotoMode = false
+	if input == "" {
 		e.message = ""
 		return nil
 	}
-	parts := strings.Fields(cmd)
-	switch parts[0] {
-	case "goto":
-		// go to a line containing the query, case-insensitive
-		// can acts like Go To Definition, for example "goto func xxx" or "goto type xxx"
-		if len(parts) < 2 {
-			e.message = "usage: goto <query> [query2 ...]"
+
+	switch input[0] {
+	case ':':
+		// goto line, for example :123
+		if len(input) < 2 {
 			return nil
 		}
-		if !e.gotoQueries(parts[1:]) {
-			e.message = "no match found for: " + strings.Join(parts[1:], " ")
-		} else {
-			e.message = ""
+		lineStr := strings.TrimSpace(input[1:])
+		lineNum, err := strconv.Atoi(lineStr)
+		if err != nil  {
+			e.message = "invalid line number: " + lineStr
+			return nil
 		}
-		return nil
+		if lineNum < 1 || lineNum > len(e.lines) {
+			e.message = "line number out of range: " + lineStr
+			return nil
+		}
+		e.row = lineNum - 1
+		e.col = 0
+		if e.hasSelect() {
+			e.clearSelect()
+		}
+	case '@':
+		// "@filter symbol" goto symbol,
+		// filter can be any keyword like Go's type/func/var, or Python's def.
+		if len(input) < 2 {
+			return nil
+		}
+		parts := strings.Fields(input[1:])
+		if len(parts) == 0 {
+			e.message = "symbol required after @"
+			return nil
+		}
+		/*
+			defPrefixes := []string{"type", "func", "struct", "var", "const"}
+			for _, prefix := range defPrefixes {
+				if e.gotoQueries([]string{prefix, symbol}) {
+					return nil
+				}
+			}
+		*/
+		if e.gotoQueries(parts) {
+			return nil
+		}
+		e.message = "no match found for symbol: " + input[1:]
 	default:
-		e.message = "unknown command: " + cmd
+		e.message = "warn: goto-anything must start with : or @"
 	}
 	return nil
 }
@@ -934,7 +968,7 @@ func (e *Editor) finishCommand() error {
 func (e *Editor) startFind() {
 	e.finding = true
 	if e.hasSelect() {
-		e.findInput.Value = e.getSelect()
+		e.findInput.Value = e.selectedText()
 		e.findInput.Cursor = len([]rune(e.findInput.Value))
 		e.findInput.SelStart = 0
 		e.findInput.SelEnd = e.findInput.Cursor
@@ -969,7 +1003,7 @@ func (e *Editor) updateFind(ev kero.KeyEvent) error {
 func (e *Editor) drawFind(f *kero.Frame, y int, width int) {
 	normal := kero.NewStyle()
 	prompt := " Find: "
-	f.Write(0, y, trimToWidth(prompt, width), normal)
+	f.Write(0, y, trimToWidth(prompt, width), normal.Foreground(kero.ColorYellow))
 	inputX := len([]rune(prompt))
 	if inputX >= width {
 		return

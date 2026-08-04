@@ -286,7 +286,7 @@ func TestWordUnderCursor(t *testing.T) {
 	}
 }
 
-func TestCtrlKCtrlD_SmartGoto(t *testing.T) {
+func TestSmartGoto(t *testing.T) {
 	ed := &Editor{
 		lines: []string{
 			"package main",
@@ -317,8 +317,5 @@ func TestCtrlKCtrlD_SmartGoto(t *testing.T) {
 
 	if ed.row != 5 {
 		t.Errorf("ed.row = %d, want 5 (line of func (e *Editor) finishCommand)", ed.row)
-	}
-	if ed.message != "goto: func finishCommand" {
-		t.Errorf("unexpected message after ctrl+k ctrl+d: %q", ed.message)
 	}
 }

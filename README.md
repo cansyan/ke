@@ -1,4 +1,4 @@
-Key bindings:
+Built-in key bindings:
 - Ctrl+S save
 - Ctrl+Q quit
 - Ctrl+F find
@@ -8,7 +8,10 @@ Key bindings:
 - Ctrl+C copy
 - Ctrl+X cut
 - Ctrl+V paste
-- Ctrl+; run command
-- Ctrl+] goto definition (smart jump)
+- Ctrl+] smart jump
+- Ctrl+P goto anything
+	- `:123` goto line 123
+	- `@filter symbol` goto symbol, filter can be any keyword like Go's type/func/var, or Python's def
+- Ctrl+R goto any symbol/type/function (identical to Ctrl+P with @ prefix)
 - Ctrl+Enter insert line below
 - Esc cancel
