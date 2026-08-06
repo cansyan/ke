@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"unicode"
@@ -43,6 +44,7 @@ type Editor struct {
 	selEndRow   int
 	selEndCol   int
 	clipboard   string
+	clipIsLine  bool
 
 	lastKey kero.KeyEvent
 }
@@ -503,11 +505,13 @@ func (e *Editor) selectedText() string {
 
 func (e *Editor) copySelect() {
 	if !e.hasSelect() {
-		// copy entire current line
+		// copy entire current line (without trailing newline), remember it's a line copy
 		e.clipboard = e.lines[e.row]
+		e.clipIsLine = true
 		return
 	}
 	e.clipboard = e.selectedText()
+	e.clipIsLine = false
 }
 
 func (e *Editor) indentSelect() {
@@ -622,6 +626,7 @@ func (e *Editor) cutSelect() {
 	if !e.hasSelect() {
 		// cut current line
 		e.clipboard = e.lines[e.row]
+		e.clipIsLine = true
 		if len(e.lines) == 1 {
 			e.lines[0] = ""
 			e.row = 0
@@ -642,6 +647,7 @@ func (e *Editor) cutSelect() {
 	}
 	e.copySelect()
 	e.deleteSelect()
+	e.clipIsLine = false
 }
 
 func (e *Editor) pasteClipboard() {
@@ -652,6 +658,16 @@ func (e *Editor) pasteClipboard() {
 	if e.hasSelect() {
 		e.deleteSelect()
 	}
+
+	// whole-line copy: paste a fresh copy of that line ABOVE the current line,
+	// pushing the current line downward.
+	if e.clipIsLine && e.clipboard != "" {
+		e.lines = slices.Insert(e.lines, e.row, e.clipboard)
+		e.row++
+		e.markDirty()
+		return
+	}
+
 	clip := e.clipboard
 	if !strings.Contains(clip, "\n") {
 		// simple insert
@@ -663,6 +679,7 @@ func (e *Editor) pasteClipboard() {
 		e.markDirty()
 		return
 	}
+
 	// multi-line paste
 	line := []rune(e.currentLine())
 	left := string(line[:e.col])
@@ -674,10 +691,8 @@ func (e *Editor) pasteClipboard() {
 		insert = append(insert, parts[i])
 	}
 	// append right to the last inserted line
-	last := insert[len(insert)-1]
-	insert[len(insert)-1] = last + right
-	// splice into lines
-	e.lines = append(e.lines[:e.row+1], append(insert, e.lines[e.row+1:]...)...)
+	insert[len(insert)-1] = insert[len(insert)-1] + right
+	e.lines = slices.Insert(e.lines, e.row+1, insert...)
 	e.row = e.row + len(parts) - 1
 	e.col = len([]rune(parts[len(parts)-1]))
 	e.markDirty()
@@ -923,7 +938,7 @@ func (e *Editor) finishGoto() error {
 		}
 		lineStr := strings.TrimSpace(input[1:])
 		lineNum, err := strconv.Atoi(lineStr)
-		if err != nil  {
+		if err != nil {
 			e.message = "invalid line number: " + lineStr
 			return nil
 		}
