@@ -780,10 +780,10 @@ func (e *Editor) drawSaveAs(f *kero.Frame, y int, width int) {
 	e.saveInput.Draw(f, kero.Rect{X: inputX, Y: y, W: width - inputX, H: 1}, style)
 }
 
-// startGoto puts the editor into goto-anything mode
+// startGoto starts the goto prompt
 func (e *Editor) startGoto(prefix string) {
 	e.gotoMode = true
-	e.gotoInput = TextInput{}
+	e.gotoInput = TextInput{Hint: " :linenumber or @filter symbol"}
 	e.gotoInput.Value = prefix
 	e.gotoInput.Cursor = len([]rune(prefix))
 	e.message = ""
@@ -962,14 +962,6 @@ func (e *Editor) finishGoto() error {
 			e.message = "symbol required after @"
 			return nil
 		}
-		/*
-			defPrefixes := []string{"type", "func", "struct", "var", "const"}
-			for _, prefix := range defPrefixes {
-				if e.gotoQueries([]string{prefix, symbol}) {
-					return nil
-				}
-			}
-		*/
 		if e.gotoQueries(parts) {
 			return nil
 		}

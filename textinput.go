@@ -8,6 +8,7 @@ type TextInput struct {
 	Cursor   int
 	SelStart int // selection start
 	SelEnd   int
+	Hint     string // only display when Value is empty
 }
 
 func (t *TextInput) adjustSelect() (int, int) {
@@ -149,6 +150,16 @@ func (t TextInput) Draw(f *kero.Frame, r kero.Rect, s kero.Style) {
 		x := r.X + t.Cursor
 		if x < r.Right() {
 			f.Set(x, r.Y, ' ', cursorStyle)
+		}
+	}
+
+	if t.Value == "" && t.Hint != "" {
+		for i, ch := range []rune(t.Hint) {
+			if i == 0 {
+				f.Set(r.X+i, r.Y, ch, cursorStyle)
+			} else {
+				f.Set(r.X+i, r.Y, ch, s.Dim())
+			}
 		}
 	}
 }
