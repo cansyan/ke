@@ -12,6 +12,7 @@ import (
 	"kero"
 )
 
+// Editor implements kero.App interface
 type Editor struct {
 	path string
 
@@ -161,6 +162,9 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 				e.selEndCol = e.col
 			}
 			return nil
+		case "ctrl+k":
+			e.deleteToLineEnd()
+			return nil
 		}
 		if key.Mod != 0 {
 			break
@@ -195,6 +199,10 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 		}
 		e.insertRune('\t')
 	case kero.KeyBackspace:
+		if key.Mod&kero.ModCtrl != 0 {
+			e.deleteToLineStart()
+			break
+		}
 		e.backspace()
 	case kero.KeyDelete:
 		e.delete()
@@ -943,7 +951,7 @@ func (e *Editor) finishGoto() error {
 			return nil
 		}
 		if lineNum < 1 || lineNum > len(e.lines) {
-			e.message = "line number out of range: " + lineStr
+			e.message = "line number out of range"
 			return nil
 		}
 		e.row = lineNum - 1
@@ -1159,6 +1167,28 @@ func (e *Editor) delete() {
 
 	e.lines[e.row] += e.lines[e.row+1]
 	e.lines = append(e.lines[:e.row+1], e.lines[e.row+2:]...)
+	e.markDirty()
+}
+
+func (e *Editor) deleteToLineStart() {
+	if e.hasSelect() {
+		e.deleteSelect()
+		return
+	}
+
+	line := []rune(e.currentLine())
+	e.lines[e.row] = string(line[e.col:])
+	e.col = 0
+	e.markDirty()
+}
+
+func (e *Editor) deleteToLineEnd() {
+	if e.hasSelect() {
+		e.deleteSelect()
+		return
+	}
+	line := []rune(e.currentLine())
+	e.lines[e.row] = string(line[:e.col])
 	e.markDirty()
 }
 
