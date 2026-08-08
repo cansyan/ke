@@ -791,7 +791,7 @@ func (e *Editor) drawSaveAs(f *kero.Frame, y int, width int) {
 // startGoto starts the goto prompt
 func (e *Editor) startGoto(prefix string) {
 	e.gotoMode = true
-	e.gotoInput = TextInput{Hint: " :linenumber or @filter symbol"}
+	e.gotoInput = TextInput{Placeholder: " :linenumber or @filter symbol"}
 	e.gotoInput.Value = prefix
 	e.gotoInput.Cursor = len([]rune(prefix))
 	e.message = ""

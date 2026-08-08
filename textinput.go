@@ -4,11 +4,11 @@ import "kero"
 
 // TextInput is a small editable single-line text widget.
 type TextInput struct {
-	Value    string
-	Cursor   int
-	SelStart int // selection start
-	SelEnd   int
-	Hint     string // only display when Value is empty
+	Value       string
+	Cursor      int
+	SelStart    int // selection start
+	SelEnd      int
+	Placeholder string // displayed when Value is empty
 }
 
 func (t *TextInput) adjustSelect() (int, int) {
@@ -153,8 +153,8 @@ func (t TextInput) Draw(f *kero.Frame, r kero.Rect, s kero.Style) {
 		}
 	}
 
-	if t.Value == "" && t.Hint != "" {
-		for i, ch := range []rune(t.Hint) {
+	if t.Value == "" && t.Placeholder != "" {
+		for i, ch := range []rune(t.Placeholder) {
 			if i == 0 {
 				f.Set(r.X+i, r.Y, ch, cursorStyle)
 			} else {
