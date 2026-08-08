@@ -143,6 +143,13 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 		case "ctrl+v":
 			e.pasteClipboard()
 			return nil
+		case "ctrl+w":
+			// move to start of next word (like vim 'w')
+			e.moveToNextWord()
+			if e.selecting {
+				e.selEndRow, e.selEndCol = e.row, e.col
+			}
+			return nil
 		case "ctrl+d":
 			if !e.hasSelect() {
 				if start, end := e.wordRangeAt(e.row, e.col); start != end {
@@ -482,6 +489,63 @@ func (e *Editor) wordRangeAt(row, col int) (startCol, endCol int) {
 	}
 
 	return start, end
+}
+
+func (e *Editor) moveToNextWord() {
+	row, col := e.row, e.col
+	for {
+		// If past last line, clamp to EOF
+		if row >= len(e.lines) {
+			if len(e.lines) == 0 {
+				e.row, e.col = 0, 0
+				return
+			}
+			e.row = len(e.lines) - 1
+			e.col = len([]rune(e.currentLine()))
+			return
+		}
+
+		lineRunes := []rune(e.lines[row])
+		n := len(lineRunes)
+
+		// If column is inside this line
+		if col < n {
+			// If currently on a word char, advance to the end of this word first,
+			// then skip non-word chars to the start of the next word.
+			if isWordChar(lineRunes[col]) {
+				i := col
+				for i < n && isWordChar(lineRunes[i]) {
+					i++
+				}
+				j := i
+				for j < n && !isWordChar(lineRunes[j]) {
+					j++
+				}
+				if j < n {
+					e.row = row
+					e.col = j
+					return
+				}
+				// fallthrough to next line
+			} else {
+				// Not on a word char: find next word start in this line
+				i := col
+				for i < n && !isWordChar(lineRunes[i]) {
+					i++
+				}
+				if i < n {
+					e.row = row
+					e.col = i
+					return
+				}
+				// else fallthrough to next line
+			}
+		}
+
+		// Move to next line and continue search from column 0
+		row++
+		col = 0
+	}
 }
 
 func (e *Editor) hasSelect() bool {
