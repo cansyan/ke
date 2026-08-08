@@ -44,8 +44,9 @@ type Editor struct {
 	selStartCol int
 	selEndRow   int
 	selEndCol   int
-	clipboard   string
-	clipIsLine  bool
+
+	clipboard  string
+	clipIsLine bool
 
 	lastKey kero.KeyEvent
 }
@@ -142,9 +143,17 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 		case "ctrl+v":
 			e.pasteClipboard()
 			return nil
-		case "ctrl+w":
-			// select the word under cursor
-			e.selectWord()
+		case "ctrl+d":
+			if !e.hasSelect() {
+				if start, end := e.wordRangeAt(e.row, e.col); start != end {
+					e.selecting = true
+					e.selStartRow = e.row
+					e.selStartCol = start
+					e.selEndRow = e.row
+					e.selEndCol = end
+					e.col = end
+				}
+			}
 			return nil
 		case "ctrl+l":
 			// select the line under cursor
@@ -303,13 +312,14 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 			visPadded = visPadded[:limit]
 		}
 
+		// draw the line
 		style := textStyle
 		if lineIndex == e.row {
 			style = style.Underline()
 		}
 		f.Write(lineNoW+1, y, visPadded, style)
 
-		// overlay selection if present
+		// highlight selection if any
 		if e.selecting {
 			sr, sc, er, ec := e.normalizedSelection()
 			if lineIndex >= sr && lineIndex <= er {
@@ -422,7 +432,7 @@ func (e *Editor) selectLine() {
 		return
 	}
 
-	// Already selecting: extend line selection to next line
+	// Already selecting: expand line selection to next line
 	if e.selEndRow < len(e.lines)-1 {
 		e.selEndRow++
 		e.selEndCol = 0
@@ -437,57 +447,41 @@ func isWordChar(r rune) bool {
 	return unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_'
 }
 
-func (e *Editor) selectWord() {
-	e.selecting = true
-	line := []rune(e.currentLine())
-	if len(line) == 0 {
-		e.selStartCol = 0
-		e.selEndCol = 0
-		e.selStartRow = e.row
-		e.selEndRow = e.row
-		return
+// wordRangeAt returns the half-open column range [startCol, endCol) of the word
+// at the given (row, col) position.
+//
+// If line[pos] is a non-word character or line is empty, it returns an empty
+// range where startCol == endCol.
+func (e *Editor) wordRangeAt(row, col int) (startCol, endCol int) {
+	if row < 0 || row >= len(e.lines) {
+		return 0, 0
 	}
-	// position normalized
-	pos := e.col
-	if pos > 0 && pos == len(line) {
-		pos = pos - 1
+
+	line := []rune(e.lines[row])
+	n := len(line)
+	if n == 0 {
+		return 0, 0
 	}
-	// if current rune is not a word char, advance to the next word char to the right
-	if pos < len(line) && !isWordChar(line[pos]) {
-		i := pos
-		for i < len(line) && !isWordChar(line[i]) {
-			i++
-		}
-		pos = min(i, len(line))
-		// if we didn't find a word to the right, try moving left
-		if pos >= len(line) {
-			j := e.col
-			for j > 0 && !isWordChar(line[j-1]) {
-				j--
-			}
-			pos = min(j, len(line))
-		}
+
+	// Clamp col within [0, n-1]
+	pos := col
+	if pos >= n {
+		pos = n - 1
+	} else if pos < 0 {
+		pos = 0
 	}
-	// find word boundaries around pos
+
 	start := pos
 	for start > 0 && isWordChar(line[start-1]) {
 		start--
 	}
+
 	end := pos
-	for end < len(line) && isWordChar(line[end]) {
+	for end < n && isWordChar(line[end]) {
 		end++
 	}
-	if start == end {
-		// nothing selectable, keep empty selection at cursor
-		start = pos
-		end = pos
-	}
-	e.selStartRow = e.row
-	e.selEndRow = e.row
-	e.selStartCol = start
-	e.selEndCol = end
-	// put cursor at end
-	e.col = end
+
+	return start, end
 }
 
 func (e *Editor) hasSelect() bool {
@@ -857,55 +851,12 @@ func (e *Editor) gotoQueries(queries []string) bool {
 	return false
 }
 
-func (e *Editor) wordUnderCursor() string {
-	line := []rune(e.currentLine())
-	if len(line) == 0 {
-		return ""
-	}
-	pos := e.col
-	if pos >= len(line) {
-		pos = len(line) - 1
-	}
-	if pos < 0 {
-		pos = 0
-	}
-	if !isWordChar(line[pos]) {
-		i := pos
-		for i < len(line) && !isWordChar(line[i]) {
-			i++
-		}
-		if i < len(line) {
-			pos = i
-		} else {
-			j := pos
-			for j > 0 && !isWordChar(line[j-1]) {
-				j--
-			}
-			if j > 0 && isWordChar(line[j-1]) {
-				pos = j - 1
-			}
-		}
-	}
-	if pos < 0 || pos >= len(line) || !isWordChar(line[pos]) {
-		return ""
-	}
-	start := pos
-	for start > 0 && isWordChar(line[start-1]) {
-		start--
-	}
-	end := pos
-	for end < len(line) && isWordChar(line[end]) {
-		end++
-	}
-	return string(line[start:end])
-}
-
 func (e *Editor) smartGoto() error {
 	var target string
 	if e.hasSelect() {
 		target = strings.TrimSpace(e.selectedText())
-	} else {
-		target = strings.TrimSpace(e.wordUnderCursor())
+	} else if start, end := e.wordRangeAt(e.row, e.col); start != end {
+		target = strings.TrimSpace(e.lines[e.row][start:end])
 	}
 
 	if target == "" {
@@ -999,15 +950,32 @@ func (e *Editor) startFind() {
 
 func (e *Editor) updateFind(ev kero.KeyEvent) error {
 	switch ev.Key {
-	case kero.KeyEnter:
-		if ev.Mod&kero.ModShift != 0 {
-			e.findPrev()
-		} else {
-			e.findNext()
-		}
-		return nil
 	case kero.KeyEsc:
 		e.finding = false
+		return nil
+	case kero.KeyEnter:
+		query := e.findInput.Value
+		if query == "" {
+			return nil
+		}
+
+		if ev.Mod&kero.ModShift != 0 {
+			if row, col, ok := e.findPrev(query, e.row, e.col, false); ok {
+				e.row, e.col = row, col
+				if e.hasSelect() {
+					e.clearSelect()
+				}
+			}
+			return nil
+		}
+
+		row, col, ok := e.findNext(query, e.row, e.col, false)
+		if ok {
+			e.row, e.col = row, col+len([]rune(query))
+			if e.hasSelect() {
+				e.clearSelect()
+			}
+		}
 		return nil
 	}
 
@@ -1026,67 +994,59 @@ func (e *Editor) drawFind(f *kero.Frame, y int, width int) {
 	e.findInput.Draw(f, kero.Rect{X: inputX, Y: y, W: width - inputX, H: 1}, normal)
 }
 
-func (e *Editor) findNext() {
-	query := e.findInput.Value
-	if strings.TrimSpace(query) == "" {
-		return
-	}
-
-	row := e.row
-	col := e.col
+func (e *Editor) findNext(query string, startRow, startCol int, matchCase bool) (row, col int, ok bool) {
+	row = startRow
+	col = startCol
 	for {
 		line := e.lines[row][col:]
-		i := strings.Index(strings.ToLower(line), strings.ToLower(query))
+		var i int
+		if matchCase {
+			i = strings.Index(line, query)
+		} else {
+			i = strings.Index(strings.ToLower(line), strings.ToLower(query))
+		}
 		if i >= 0 {
-			e.row = row
-			e.col = col + i + len(query)
-			if e.hasSelect() {
-				e.clearSelect()
-			}
-			return
+			return row, col + i, true
 		}
 		if row < len(e.lines)-1 {
 			row++
 		} else {
 			row = 0
 		}
-		if row == e.row {
-			// loop back
+		if row == startRow {
 			break
 		}
 		col = 0
 	}
+	return startRow, startCol, false
 }
 
-func (e *Editor) findPrev() {
-	query := e.findInput.Value
-	if strings.TrimSpace(query) == "" {
-		return
-	}
-
-	row := e.row
-	col := e.col
+func (e *Editor) findPrev(query string, startRow, startCol int, matchCase bool) (row, col int, ok bool) {
+	row = startRow
+	col = startCol
 	for {
 		line := e.lines[row][:col]
-		i := strings.Index(strings.ToLower(line), strings.ToLower(query))
-		if i >= 0 {
-			e.row = row
-			e.col = i
-			if e.hasSelect() {
-				e.clearSelect()
-			}
-			return
+		var i int
+		if matchCase {
+			i = strings.Index(line, query)
+		} else {
+			i = strings.Index(strings.ToLower(line), strings.ToLower(query))
 		}
+		if i >= 0 {
+			return row, i, true
+		}
+
 		if row > 0 {
 			row--
 		} else {
 			row = len(e.lines) - 1
 		}
-		if row == e.row {
+		if row == startRow {
 			break
 		}
 		col = max(0, len(e.lines[row])-1)
 	}
+	return startRow, startCol, false
 }
 
 func (e *Editor) insertRune(r rune) {

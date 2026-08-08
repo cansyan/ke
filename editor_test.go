@@ -281,8 +281,13 @@ func TestWordUnderCursor(t *testing.T) {
 		row: 0,
 		col: 20, // on 'f' in finishCommand
 	}
-	if got := ed.wordUnderCursor(); got != "finishCommand" {
-		t.Fatalf("wordUnderCursor() = %q, want %q", got, "finishCommand")
+	start, end := ed.wordRangeAt(ed.row, ed.col)
+	if start == end {
+		t.Fatalf("wordAt(%d, %d) returned empty range", ed.row, ed.col)
+	}
+	word := ed.lines[ed.row][start:end]
+	if word != "finishCommand" {
+		t.Fatalf("wordAt(%d, %d) = %q, want %q", ed.row, ed.col, word, "finishCommand")
 	}
 }
 

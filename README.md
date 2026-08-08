@@ -3,8 +3,8 @@ Key bindings:
 - Ctrl+Q quit
 - Ctrl+F find
 - Ctrl+. select
-	- Ctrl+W select the word under cursor
-	- Ctrl+L select current line
+	- Ctrl+D select word under cursor
+	- Ctrl+L select line
 - Ctrl+C copy
 - Ctrl+X cut
 - Ctrl+V paste
@@ -17,3 +17,6 @@ Key bindings:
 - Ctrl+K delete to line end
 - Ctrl+Enter insert line below
 - Esc cancel
+
+Early versions should keep things tiny.
+Later, may consider duplicate selection, mutilple cursor, undo/redo, jump back/forward.
