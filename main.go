@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"slices"
 	"strconv"
 	"strings"
 	"unicode"
@@ -16,11 +15,10 @@ import (
 type Editor struct {
 	path string
 
-	lines []string
-	row   int
-	col   int
+	buf    *Buffer
+	cursor Position
 
-	rowOffset int
+	rowOffset int // Scroll offsets for the view viewport
 	colOffset int // visual display column offset (0-based horizontal scroll position)
 
 	dirty   bool
@@ -31,19 +29,21 @@ type Editor struct {
 	saveInput TextInput
 
 	// find mode opens a find line at the message area
-	finding   bool
-	findInput TextInput
+	finding        bool
+	replacing      bool
+	findInput      TextInput
+	replaceInput   TextInput
+	findMatch      bool
+	findMatchStart Position
+	findMatchEnd   Position
 
 	// goto mode opens a input line at the message area
 	gotoMode  bool
 	gotoInput TextInput
 
 	// selection state
-	selecting   bool
-	selStartRow int
-	selStartCol int
-	selEndRow   int
-	selEndCol   int
+	selecting bool
+	selAnchor Position // selection at [e.selAnchor, e.pos)
 
 	clipboard  string
 	clipIsLine bool
@@ -53,8 +53,8 @@ type Editor struct {
 
 func (e *Editor) Init(ctx *kero.Context) error {
 	if e.path == "" {
-		e.lines = []string{""}
-		e.row, e.col = 0, 0
+		e.buf = NewBuffer("")
+		e.cursor.Row, e.cursor.Col = 0, 0
 		e.message = "new buffer"
 		return nil
 	}
@@ -62,8 +62,8 @@ func (e *Editor) Init(ctx *kero.Context) error {
 	data, err := os.ReadFile(e.path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			e.lines = []string{""}
-			e.row, e.col = 0, 0
+			e.buf = NewBuffer("")
+			e.cursor.Row, e.cursor.Col = 0, 0
 			e.message = "new file"
 			return nil
 		}
@@ -72,13 +72,8 @@ func (e *Editor) Init(ctx *kero.Context) error {
 
 	text := strings.ReplaceAll(string(data), "\r\n", "\n")
 	text = strings.TrimSuffix(text, "\n")
-	e.lines = strings.Split(text, "\n")
-	if len(e.lines) == 0 {
-		e.lines = []string{""}
-	}
-
-	e.row = min(e.row, len(e.lines)-1)
-	e.clampCol()
+	e.buf = NewBuffer(text)
+	e.cursor = e.buf.ClampPos(e.cursor)
 	e.ensureCursorVisible(ctx)
 	return nil
 }
@@ -125,41 +120,32 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 			// goto anything
 			e.startGoto("")
 			return nil
-		case "ctrl+r":
-			// goto any symbol/type/function (identical to ctrl+p with @ prefix)
-			e.startGoto("@")
-			return nil
 		case "ctrl+s":
 			return e.save()
 		case "ctrl+f":
 			e.startFind()
 			return nil
 		case "ctrl+c":
-			e.copySelect()
+			e.copy()
 			return nil
 		case "ctrl+x":
-			e.cutSelect()
+			e.cut()
 			return nil
 		case "ctrl+v":
-			e.pasteClipboard()
+			e.paste()
 			return nil
 		case "ctrl+w":
-			// move to start of next word (like vim 'w')
-			e.moveToNextWord()
-			if e.selecting {
-				e.selEndRow, e.selEndCol = e.row, e.col
-			}
+			e.cursor = e.buf.NextWord(e.cursor)
 			return nil
 		case "ctrl+d":
-			if !e.hasSelect() {
-				if start, end := e.wordRangeAt(e.row, e.col); start != end {
-					e.selecting = true
-					e.selStartRow = e.row
-					e.selStartCol = start
-					e.selEndRow = e.row
-					e.selEndCol = end
-					e.col = end
-				}
+			if e.hasSelect() {
+				// duplicate selection not implemented yet
+				return nil
+			}
+			if start, end := e.buf.WordBounds(e.cursor); start != end {
+				e.selecting = true
+				e.selAnchor = start
+				e.cursor = end
 			}
 			return nil
 		case "ctrl+l":
@@ -172,10 +158,7 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 				e.clearSelect()
 			} else {
 				e.selecting = true
-				e.selStartRow = e.row
-				e.selStartCol = e.col
-				e.selEndRow = e.row
-				e.selEndCol = e.col
+				e.selAnchor = e.cursor
 			}
 			return nil
 		case "ctrl+k":
@@ -187,8 +170,11 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 		}
 		e.insertRune(key.Rune)
 	case kero.KeyEnter:
+		if e.hasSelect() {
+			e.deleteSelect()
+		}
 		var n int
-		line := e.currentLine()
+		line := e.buf.Line(e.cursor.Row)
 		for _, b := range line {
 			if !unicode.IsSpace(b) {
 				break
@@ -197,18 +183,20 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 		}
 		indent := line[:n]
 		if key.Mod&kero.ModCtrl != 0 {
-			e.col = len([]rune(line))
+			p := Position{Row: e.cursor.Row, Col: len(line)}
+			e.cursor = e.buf.Insert(p, "\n"+string(indent))
+		} else {
+			e.cursor = e.buf.Insert(e.cursor, "\n"+string(indent))
 		}
-		e.insertNewline()
-		e.insertString(indent)
+		e.markDirty()
 	case kero.KeyTab:
 		if key.Mod&kero.ModShift != 0 {
 			e.unindentSelectOrLine()
 			break
 		}
 		if e.hasSelect() {
-			sr, _, er, _ := e.normalizedSelection()
-			if sr != er {
+			start, end := orderPos(e.selAnchor, e.cursor)
+			if start.Row != end.Row {
 				e.indentSelect()
 				break
 			}
@@ -224,50 +212,32 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 		e.delete()
 	case kero.KeyLeft:
 		e.moveLeft()
-		if e.selecting {
-			e.selEndRow, e.selEndCol = e.row, e.col
-		}
 	case kero.KeyRight:
 		e.moveRight()
-		if e.selecting {
-			e.selEndRow, e.selEndCol = e.row, e.col
-		}
 	case kero.KeyUp:
 		e.moveUp()
-		if e.selecting {
-			e.selEndRow, e.selEndCol = e.row, e.col
-		}
 	case kero.KeyDown:
 		e.moveDown()
-		if e.selecting {
-			e.selEndRow, e.selEndCol = e.row, e.col
-		}
 	case kero.KeyHome:
 		if e.lastKey.Key == kero.KeyHome {
-			e.col = 0
+			e.cursor.Col = 0
 			return nil
 		}
-		for i, char := range e.lines[e.row] {
+		for i, char := range e.buf.Line(e.cursor.Row) {
 			if !unicode.IsSpace(char) {
-				e.col = i
+				e.cursor.Col = i
 				return nil
 			}
 		}
-		e.col = 0
+		e.cursor.Col = 0
 	case kero.KeyEnd:
-		e.col = len([]rune(e.currentLine()))
+		e.cursor.Col = len(e.buf.Line(e.cursor.Row))
 	case kero.KeyPgUp:
-		e.row -= editorHeight(ctx)
-		if e.row < 0 {
-			e.row = 0
-		}
-		e.clampCol()
+		e.cursor.Row -= editorHeight(ctx)
+		e.cursor = e.buf.ClampPos(e.cursor)
 	case kero.KeyPgDown:
-		e.row += editorHeight(ctx)
-		if e.row >= len(e.lines) {
-			e.row = len(e.lines) - 1
-		}
-		e.clampCol()
+		e.cursor.Row += editorHeight(ctx)
+		e.cursor = e.buf.ClampPos(e.cursor)
 	case kero.KeyEsc:
 		e.clearSelect()
 	}
@@ -296,18 +266,18 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 	}
 
 	editorH := editorHeight(ctx)
-	lineNoW := lineNumberWidth(len(e.lines))
+	lineNoW := lineNumberWidth(e.buf.LenLines())
 	for y := range editorH {
 		lineIndex := e.rowOffset + y
-		if lineIndex >= len(e.lines) {
+		if lineIndex >= e.buf.LenLines() {
 			f.Write(0, y, "~", lineNoStyle)
 			continue
 		}
 
 		f.Write(0, y, fmt.Sprintf("%*d ", lineNoW, lineIndex+1), lineNoStyle)
 
-		origLine := e.lines[lineIndex]
-		fullPadded := padTab(origLine, 4)
+		origLine := e.buf.Line(lineIndex)
+		fullPadded := padTab(string(origLine), 4)
 		limit := ctx.Width - lineNoW - 1
 		limit = max(0, limit)
 
@@ -321,33 +291,33 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 
 		// draw the line
 		style := textStyle
-		if lineIndex == e.row {
+		if lineIndex == e.cursor.Row {
 			style = style.Underline()
 		}
 		f.Write(lineNoW+1, y, visPadded, style)
 
 		// highlight selection if any
 		if e.selecting {
-			sr, sc, er, ec := e.normalizedSelection()
-			if lineIndex >= sr && lineIndex <= er {
+			start, end := orderPos(e.selAnchor, e.cursor)
+			if lineIndex >= start.Row && lineIndex <= end.Row {
 				lineRunes := []rune(origLine)
-				var selStartRune, selEndRune int
-				if sr == er {
-					selStartRune = sc
-					selEndRune = ec
-				} else if lineIndex == sr {
-					selStartRune = sc
-					selEndRune = len(lineRunes)
-				} else if lineIndex == er {
-					selStartRune = 0
-					selEndRune = ec
+				var selStartCol, selEndCol int
+				if start.Row == end.Row {
+					selStartCol = start.Col
+					selEndCol = end.Col
+				} else if lineIndex == start.Row {
+					selStartCol = start.Col
+					selEndCol = len(lineRunes)
+				} else if lineIndex == end.Row {
+					selStartCol = 0
+					selEndCol = end.Col
 				} else {
-					selStartRune = 0
-					selEndRune = len(lineRunes)
+					selStartCol = 0
+					selEndCol = len(lineRunes)
 				}
 
-				startVisCol := runeIndexToDisplayColumn(origLine, selStartRune)
-				endVisCol := runeIndexToDisplayColumn(origLine, selEndRune)
+				startVisCol := runeIndexToDisplayColumn(origLine, selStartCol)
+				endVisCol := runeIndexToDisplayColumn(origLine, selEndCol)
 
 				startDisplay := max(0, min(startVisCol-e.colOffset, len(visPadded)))
 				endDisplay := max(0, min(endVisCol-e.colOffset, len(visPadded)))
@@ -360,12 +330,12 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 		}
 	}
 
-	line := e.currentLine()
-	cursorDisplayCol := runeIndexToDisplayColumn(line, e.col)
+	line := e.buf.Line(e.cursor.Row)
+	cursorDisplayCol := runeIndexToDisplayColumn(line, e.cursor.Col)
 	cursorX := lineNoW + 1 + cursorDisplayCol - e.colOffset
-	cursorY := 0 + e.row - e.rowOffset
+	cursorY := 0 + e.cursor.Row - e.rowOffset
 	if cursorY >= 0 && cursorY < editorH && cursorX >= lineNoW+1 && cursorX < ctx.Width {
-		fullLinePadded := padTab(line, 4)
+		fullLinePadded := padTab(string(line), 4)
 		ch := ' '
 		if cursorDisplayCol < len(fullLinePadded) {
 			ch = rune(fullLinePadded[cursorDisplayCol])
@@ -376,7 +346,7 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 	statusY := ctx.Height - 1
 	if statusY >= 0 {
 		status := fmt.Sprintf(" %s | %d lines | Ln %d, Col %d",
-			name+modified, len(e.lines), e.row+1, cursorDisplayCol+1)
+			name+modified, e.buf.LenLines(), e.cursor.Row+1, cursorDisplayCol+1)
 		if e.selecting {
 			status = status + " | Selecting"
 		}
@@ -409,198 +379,71 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 	}
 }
 
-func (e *Editor) clearSelect() {
-	e.selecting = false
-}
-
-// normalizedSelection returns the selection start and end positions in normalized order (start <= end).
-func (e *Editor) normalizedSelection() (startRow, startCol, endRow, endCol int) {
-	sr, sc, er, ec := e.selStartRow, e.selStartCol, e.selEndRow, e.selEndCol
-	if sr > er || (sr == er && sc > ec) {
-		sr, sc, er, ec = er, ec, sr, sc
-	}
-	return sr, sc, er, ec
-}
-
 func (e *Editor) selectLine() {
 	if !e.selecting {
 		e.selecting = true
-		e.selStartRow = e.row
-		e.selStartCol = 0
-		if e.row < len(e.lines)-1 {
-			e.selEndRow = e.row + 1
-			e.selEndCol = 0
+		e.selAnchor = Position{Row: e.cursor.Row, Col: 0}
+		if e.cursor.Row < e.buf.LenLines()-1 {
+			e.cursor = Position{Row: e.cursor.Row + 1, Col: 0}
 		} else {
-			e.selEndRow = e.row
-			e.selEndCol = len([]rune(e.currentLine()))
+			e.cursor = Position{Row: e.cursor.Row, Col: len(e.buf.Line(e.cursor.Row))}
 		}
-		e.row = e.selEndRow
-		e.col = e.selEndCol
 		return
 	}
 
 	// Already selecting: expand line selection to next line
-	if e.selEndRow < len(e.lines)-1 {
-		e.selEndRow++
-		e.selEndCol = 0
+	if e.cursor.Row < e.buf.LenLines()-1 {
+		e.cursor.Row++
+		e.cursor.Col = 0
 	} else {
-		e.selEndCol = len([]rune(e.lines[e.selEndRow]))
+		e.cursor.Col = len(e.buf.Line(e.cursor.Row))
 	}
-	e.row = e.selEndRow
-	e.col = e.selEndCol
 }
 
 func isWordChar(r rune) bool {
 	return unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_'
 }
 
-// wordRangeAt returns the half-open column range [startCol, endCol) of the word
-// at the given (row, col) position.
-//
-// If line[pos] is a non-word character or line is empty, it returns an empty
-// range where startCol == endCol.
-func (e *Editor) wordRangeAt(row, col int) (startCol, endCol int) {
-	if row < 0 || row >= len(e.lines) {
-		return 0, 0
-	}
-
-	line := []rune(e.lines[row])
-	n := len(line)
-	if n == 0 {
-		return 0, 0
-	}
-
-	// Clamp col within [0, n-1]
-	pos := col
-	if pos >= n {
-		pos = n - 1
-	} else if pos < 0 {
-		pos = 0
-	}
-
-	start := pos
-	for start > 0 && isWordChar(line[start-1]) {
-		start--
-	}
-
-	end := pos
-	for end < n && isWordChar(line[end]) {
-		end++
-	}
-
-	return start, end
-}
-
-func (e *Editor) moveToNextWord() {
-	row, col := e.row, e.col
-	for {
-		// If past last line, clamp to EOF
-		if row >= len(e.lines) {
-			if len(e.lines) == 0 {
-				e.row, e.col = 0, 0
-				return
-			}
-			e.row = len(e.lines) - 1
-			e.col = len([]rune(e.currentLine()))
-			return
-		}
-
-		lineRunes := []rune(e.lines[row])
-		n := len(lineRunes)
-
-		// If column is inside this line
-		if col < n {
-			// If currently on a word char, advance to the end of this word first,
-			// then skip non-word chars to the start of the next word.
-			if isWordChar(lineRunes[col]) {
-				i := col
-				for i < n && isWordChar(lineRunes[i]) {
-					i++
-				}
-				j := i
-				for j < n && !isWordChar(lineRunes[j]) {
-					j++
-				}
-				if j < n {
-					e.row = row
-					e.col = j
-					return
-				}
-				// fallthrough to next line
-			} else {
-				// Not on a word char: find next word start in this line
-				i := col
-				for i < n && !isWordChar(lineRunes[i]) {
-					i++
-				}
-				if i < n {
-					e.row = row
-					e.col = i
-					return
-				}
-				// else fallthrough to next line
-			}
-		}
-
-		// Move to next line and continue search from column 0
-		row++
-		col = 0
-	}
-}
-
 func (e *Editor) hasSelect() bool {
-	return e.selecting && !(e.selStartRow == e.selEndRow && e.selStartCol == e.selEndCol)
+	return e.selecting && e.selAnchor != e.cursor
 }
 
-func (e *Editor) selectedText() string {
-	sr, sc, er, ec := e.normalizedSelection()
-	if sr == er {
-		line := []rune(e.lines[sr])
-		return string(line[sc:ec])
-	}
-	var sb strings.Builder
-	sb.WriteString(string([]rune(e.lines[sr])[sc:]))
-	sb.WriteRune('\n')
-	for r := sr + 1; r < er; r++ {
-		sb.WriteString(e.lines[r])
-		sb.WriteRune('\n')
-	}
-	sb.WriteString(string([]rune(e.lines[er])[0:ec]))
-	return sb.String()
+func (e *Editor) clearSelect() {
+	e.selecting = false
 }
 
-func (e *Editor) copySelect() {
-	if !e.hasSelect() {
-		// copy entire current line (without trailing newline), remember it's a line copy
-		e.clipboard = e.lines[e.row]
-		e.clipIsLine = true
+func (e *Editor) copy() {
+	if e.hasSelect() {
+		e.clipboard = e.buf.GetRange(e.selAnchor, e.cursor)
+		e.clipIsLine = false
 		return
 	}
-	e.clipboard = e.selectedText()
-	e.clipIsLine = false
+	// copy entire current line, remember it's a line copy
+	e.clipboard = string(e.buf.Line(e.cursor.Row))
+	e.clipIsLine = true
 }
 
 func (e *Editor) indentSelect() {
 	if !e.hasSelect() {
 		return
 	}
-	sr, _, er, ec := e.normalizedSelection()
-	if sr == er {
+
+	start, end := orderPos(e.selAnchor, e.cursor)
+	if start.Row == end.Row {
 		return
 	}
-	lastRow := er
-	if ec == 0 && er > sr {
-		lastRow = er - 1
+	lastRow := end.Row
+	if end.Col == 0 && end.Row > start.Row {
+		lastRow = end.Row - 1
 	}
-	for r := sr; r <= lastRow; r++ {
-		e.lines[r] = "\t" + e.lines[r]
+	for r := start.Row; r <= lastRow; r++ {
+		e.buf.Insert(Position{Row: r, Col: 0}, "\t")
 	}
-	if sr <= e.selStartRow && e.selStartRow <= lastRow {
-		e.selStartCol++
+	if start.Row <= e.selAnchor.Row && e.selAnchor.Row <= lastRow {
+		e.selAnchor.Col++
 	}
-	if sr <= e.selEndRow && e.selEndRow <= lastRow {
-		e.selEndCol++
-		e.col++
+	if start.Row <= e.cursor.Row && e.cursor.Row <= lastRow {
+		e.cursor.Col++
 	}
 	e.markDirty()
 }
@@ -621,38 +464,37 @@ func unindentLine(s string) (string, int) {
 
 func (e *Editor) unindentSelectOrLine() {
 	if !e.hasSelect() {
-		newLine, removed := unindentLine(e.lines[e.row])
+		newLine, removed := unindentLine(string(e.buf.Line(e.cursor.Row)))
 		if removed > 0 {
-			e.lines[e.row] = newLine
-			e.col = max(0, e.col-removed)
+			e.buf.SetLine(e.cursor.Row, []rune(newLine))
+			e.cursor.Col = max(0, e.cursor.Col-removed)
 			e.markDirty()
 		}
 		return
 	}
 
-	sr, _, er, ec := e.normalizedSelection()
-	lastRow := er
-	if ec == 0 && er > sr {
-		lastRow = er - 1
+	start, end := orderPos(e.selAnchor, e.cursor)
+	lastRow := end.Row
+	if end.Col == 0 && end.Row > start.Row {
+		lastRow = end.Row - 1
 	}
 	var startRemoved, endRemoved int
-	for r := sr; r <= lastRow; r++ {
-		newLine, removed := unindentLine(e.lines[r])
-		if r == e.selStartRow {
+	for r := start.Row; r <= lastRow; r++ {
+		newLine, removed := unindentLine(string(e.buf.Line(r)))
+		if r == e.selAnchor.Row {
 			startRemoved = removed
 		}
-		if r == e.selEndRow {
+		if r == e.cursor.Row {
 			endRemoved = removed
 		}
-		e.lines[r] = newLine
+		e.buf.SetLine(r, []rune(newLine))
 	}
 
-	if e.selStartRow <= lastRow {
-		e.selStartCol = max(0, e.selStartCol-startRemoved)
+	if e.selAnchor.Row <= lastRow {
+		e.selAnchor.Col = max(0, e.selAnchor.Col-startRemoved)
 	}
-	if e.selEndRow <= lastRow {
-		e.selEndCol = max(0, e.selEndCol-endRemoved)
-		e.col = max(0, e.col-endRemoved)
+	if e.cursor.Row <= lastRow {
+		e.cursor.Col = max(0, e.cursor.Col-endRemoved)
 	}
 	e.markDirty()
 }
@@ -661,62 +503,28 @@ func (e *Editor) deleteSelect() {
 	if !e.hasSelect() {
 		return
 	}
-	sr, sc, er, ec := e.normalizedSelection()
-	if sr == er {
-		line := []rune(e.lines[sr])
-		left := string(line[:sc])
-		right := string(line[ec:])
-		e.lines[sr] = left + right
-		e.row = sr
-		e.col = sc
-		e.selecting = false
-		e.markDirty()
-		return
-	}
-	left := string([]rune(e.lines[sr])[:sc])
-	right := string([]rune(e.lines[er])[ec:])
-	e.lines[sr] = left + right
-	// remove middle lines
-	if er >= sr+1 {
-		e.lines = append(e.lines[:sr+1], e.lines[er+1:]...)
-	} else {
-		e.lines = append(e.lines[:sr+1], e.lines[er+1:]...)
-	}
-	e.row = sr
-	e.col = sc
+	start, end := orderPos(e.selAnchor, e.cursor)
+	e.cursor = e.buf.DeleteRange(start, end)
 	e.selecting = false
 	e.markDirty()
 }
 
-func (e *Editor) cutSelect() {
-	if !e.hasSelect() {
-		// cut current line
-		e.clipboard = e.lines[e.row]
-		e.clipIsLine = true
-		if len(e.lines) == 1 {
-			e.lines[0] = ""
-			e.row = 0
-			e.col = 0
-		} else {
-			// remove line
-			if e.row == len(e.lines)-1 {
-				e.lines = e.lines[:len(e.lines)-1]
-				e.row--
-				e.col = 0
-			} else {
-				e.lines = append(e.lines[:e.row], e.lines[e.row+1:]...)
-				e.col = 0
-			}
-		}
-		e.markDirty()
+func (e *Editor) cut() {
+	if e.hasSelect() {
+		e.copy()
+		e.deleteSelect()
+		e.clipIsLine = false
 		return
 	}
-	e.copySelect()
-	e.deleteSelect()
-	e.clipIsLine = false
+	// cut current line
+	p1 := Position{Row: e.cursor.Row}
+	e.clipboard = e.buf.GetRange(p1, Position{Row: e.cursor.Row, Col: len(e.buf.Line(e.cursor.Row))})
+	e.clipIsLine = true
+	e.cursor = e.buf.DeleteRange(p1, Position{Row: e.cursor.Row + 1})
+	e.markDirty()
 }
 
-func (e *Editor) pasteClipboard() {
+func (e *Editor) paste() {
 	if e.clipboard == "" {
 		return
 	}
@@ -728,39 +536,13 @@ func (e *Editor) pasteClipboard() {
 	// whole-line copy: paste a fresh copy of that line ABOVE the current line,
 	// pushing the current line downward.
 	if e.clipIsLine && e.clipboard != "" {
-		e.lines = slices.Insert(e.lines, e.row, e.clipboard)
-		e.row++
+		e.buf.Insert(Position{Row: e.cursor.Row, Col: 0}, e.clipboard+"\n")
+		e.cursor.Row++
 		e.markDirty()
 		return
 	}
 
-	clip := e.clipboard
-	if !strings.Contains(clip, "\n") {
-		// simple insert
-		line := []rune(e.currentLine())
-		left := string(line[:e.col])
-		right := string(line[e.col:])
-		e.lines[e.row] = left + clip + right
-		e.col += len([]rune(clip))
-		e.markDirty()
-		return
-	}
-
-	// multi-line paste
-	line := []rune(e.currentLine())
-	left := string(line[:e.col])
-	right := string(line[e.col:])
-	parts := strings.Split(clip, "\n")
-	e.lines[e.row] = left + parts[0]
-	insert := make([]string, 0, len(parts)-1)
-	for i := 1; i < len(parts); i++ {
-		insert = append(insert, parts[i])
-	}
-	// append right to the last inserted line
-	insert[len(insert)-1] = insert[len(insert)-1] + right
-	e.lines = slices.Insert(e.lines, e.row+1, insert...)
-	e.row = e.row + len(parts) - 1
-	e.col = len([]rune(parts[len(parts)-1]))
+	e.cursor = e.buf.Insert(e.cursor, e.clipboard)
 	e.markDirty()
 }
 
@@ -786,7 +568,7 @@ func (e *Editor) save() error {
 		return nil
 	}
 
-	if err := os.WriteFile(e.path, []byte(strings.Join(e.lines, "\n")+"\n"), 0644); err != nil {
+	if err := os.WriteFile(e.path, []byte(e.buf.String()+"\n"), 0644); err != nil {
 		e.message = "error: " + err.Error()
 		return nil
 	}
@@ -894,8 +676,8 @@ func (e *Editor) gotoQueries(queries []string) bool {
 	if len(lowerQueries) == 0 {
 		return false
 	}
-	for row, line := range e.lines {
-		lineLower := strings.ToLower(line)
+	for row, line := range e.buf.Lines() {
+		lineLower := strings.ToLower(string(line))
 		match := true
 		for _, query := range lowerQueries {
 			if !strings.Contains(lineLower, query) {
@@ -904,8 +686,7 @@ func (e *Editor) gotoQueries(queries []string) bool {
 			}
 		}
 		if match {
-			e.row = row
-			e.col = 0
+			e.cursor = Position{Row: row, Col: 0}
 			if e.hasSelect() {
 				e.clearSelect()
 			}
@@ -918,9 +699,9 @@ func (e *Editor) gotoQueries(queries []string) bool {
 func (e *Editor) smartGoto() error {
 	var target string
 	if e.hasSelect() {
-		target = strings.TrimSpace(e.selectedText())
-	} else if start, end := e.wordRangeAt(e.row, e.col); start != end {
-		target = strings.TrimSpace(e.lines[e.row][start:end])
+		target = strings.TrimSpace(e.buf.GetRange(e.selAnchor, e.cursor))
+	} else if start, end := e.buf.WordBounds(e.cursor); start != end {
+		target = strings.TrimSpace(e.buf.GetRange(start, end))
 	}
 
 	if target == "" {
@@ -965,12 +746,12 @@ func (e *Editor) finishGoto() error {
 			e.message = "invalid line number: " + lineStr
 			return nil
 		}
-		if lineNum < 1 || lineNum > len(e.lines) {
+		if lineNum < 1 || lineNum > e.buf.LenLines() {
 			e.message = "line number out of range"
 			return nil
 		}
-		e.row = lineNum - 1
-		e.col = 0
+		e.cursor.Row = lineNum - 1
+		e.cursor.Col = 0
 		if e.hasSelect() {
 			e.clearSelect()
 		}
@@ -997,8 +778,9 @@ func (e *Editor) finishGoto() error {
 
 func (e *Editor) startFind() {
 	e.finding = true
+	e.replacing = false
 	if e.hasSelect() {
-		e.findInput.Value = e.selectedText()
+		e.findInput.Value = e.buf.GetRange(e.selAnchor, e.cursor)
 		e.findInput.Cursor = len([]rune(e.findInput.Value))
 		e.findInput.SelStart = 0
 		e.findInput.SelEnd = e.findInput.Cursor
@@ -1013,6 +795,32 @@ func (e *Editor) startFind() {
 }
 
 func (e *Editor) updateFind(ev kero.KeyEvent) error {
+	if ev.String() == "ctrl+r" {
+		e.replacing = !e.replacing
+		if e.replacing {
+			e.replaceInput.Placeholder = "replacement"
+		}
+		return nil
+	}
+	if e.replacing {
+		switch ev.Key {
+		case kero.KeyEsc:
+			e.finding = false
+			e.replacing = false
+			return nil
+		case kero.KeyTab:
+			e.skipFindMatch()
+			return nil
+		case kero.KeyEnter:
+			if ev.Mod&kero.ModCtrl != 0 {
+				return e.replaceAll()
+			}
+			return e.replaceCurrent()
+		}
+		e.replaceInput.Update(ev)
+		return nil
+	}
+
 	switch ev.Key {
 	case kero.KeyEsc:
 		e.finding = false
@@ -1024,25 +832,28 @@ func (e *Editor) updateFind(ev kero.KeyEvent) error {
 		}
 
 		if ev.Mod&kero.ModShift != 0 {
-			if row, col, ok := e.findPrev(query, e.row, e.col, false); ok {
-				e.row, e.col = row, col
-				if e.hasSelect() {
-					e.clearSelect()
-				}
+			if start, end, ok := e.buf.FindPrevIgnoreCase(query, e.cursor); ok {
+				e.findMatch = true
+				e.findMatchStart = start
+				e.findMatchEnd = end
+				e.cursor = start
+				e.clearSelect()
 			}
 			return nil
 		}
 
-		row, col, ok := e.findNext(query, e.row, e.col, false)
+		start, end, ok := e.buf.FindNextIgnoreCase(query, e.cursor)
 		if ok {
-			e.row, e.col = row, col+len([]rune(query))
-			if e.hasSelect() {
-				e.clearSelect()
-			}
+			e.findMatch = true
+			e.findMatchStart = start
+			e.findMatchEnd = end
+			e.cursor = end
+			e.clearSelect()
 		}
 		return nil
 	}
 
+	e.findMatch = false
 	e.findInput.Update(ev)
 	return nil
 }
@@ -1055,94 +866,84 @@ func (e *Editor) drawFind(f *kero.Frame, y int, width int) {
 	if inputX >= width {
 		return
 	}
+	if !e.replacing {
+		e.findInput.Draw(f, kero.Rect{X: inputX, Y: y, W: width - inputX, H: 1}, normal)
+		return
+	}
 	e.findInput.Draw(f, kero.Rect{X: inputX, Y: y, W: width - inputX, H: 1}, normal)
+	replaceX := inputX + len([]rune(e.findInput.Value)) + 3
+	if replaceX < width {
+		f.Write(replaceX-3, y, " -> ", normal.Foreground(kero.ColorYellow))
+		e.replaceInput.Draw(f, kero.Rect{X: replaceX, Y: y, W: width - replaceX, H: 1}, normal)
+	}
 }
 
-func (e *Editor) findNext(query string, startRow, startCol int, matchCase bool) (row, col int, ok bool) {
-	row = startRow
-	col = startCol
-	for {
-		line := e.lines[row][col:]
-		var i int
-		if matchCase {
-			i = strings.Index(line, query)
-		} else {
-			i = strings.Index(strings.ToLower(line), strings.ToLower(query))
-		}
-		if i >= 0 {
-			return row, col + i, true
-		}
-		if row < len(e.lines)-1 {
-			row++
-		} else {
-			row = 0
-		}
-		if row == startRow {
-			break
-		}
-		col = 0
+func (e *Editor) skipFindMatch() {
+	query := e.findInput.Value
+	if query == "" {
+		return
 	}
-	return startRow, startCol, false
+	from := e.cursor
+	if e.findMatch {
+		from = e.findMatchEnd
+	}
+	start, end, ok := e.buf.FindNextIgnoreCase(query, from)
+	if !ok {
+		e.findMatch = false
+		return
+	}
+	e.findMatch = true
+	e.findMatchStart = start
+	e.findMatchEnd = end
+	e.cursor = end
+	e.clearSelect()
 }
 
-func (e *Editor) findPrev(query string, startRow, startCol int, matchCase bool) (row, col int, ok bool) {
-	row = startRow
-	col = startCol
-	for {
-		line := e.lines[row][:col]
-		var i int
-		if matchCase {
-			i = strings.Index(line, query)
-		} else {
-			i = strings.Index(strings.ToLower(line), strings.ToLower(query))
-		}
-		if i >= 0 {
-			return row, i, true
-		}
-
-		if row > 0 {
-			row--
-		} else {
-			row = len(e.lines) - 1
-		}
-		if row == startRow {
-			break
-		}
-		col = max(0, len(e.lines[row])-1)
+func (e *Editor) replaceCurrent() error {
+	query := e.findInput.Value
+	if query == "" {
+		return nil
 	}
-	return startRow, startCol, false
+	if !e.findMatch {
+		e.skipFindMatch()
+	}
+	if !e.findMatch {
+		return nil
+	}
+
+	start := e.findMatchStart
+	replacedEnd := e.buf.DeleteRange(start, e.findMatchEnd)
+	replacedEnd = e.buf.Insert(replacedEnd, e.replaceInput.Value)
+	e.markDirty()
+	e.cursor = replacedEnd
+	e.findMatch = false
+	if e.replaceInput.Value == query && replacedEnd.Col < len(e.buf.Line(replacedEnd.Row)) {
+		replacedEnd.Col++
+		e.cursor = replacedEnd
+	}
+	e.skipFindMatch()
+	return nil
+}
+
+func (e *Editor) replaceAll() error {
+	query := e.findInput.Value
+	if query == "" {
+		return nil
+	}
+	count := e.buf.ReplaceAllIgnoreCase(query, e.replaceInput.Value)
+	if count > 0 {
+		e.markDirty()
+	}
+	e.findMatch = false
+	e.message = fmt.Sprintf("replaced %d matches", count)
+	return nil
 }
 
 func (e *Editor) insertRune(r rune) {
 	if e.hasSelect() {
 		e.deleteSelect()
 	}
-	line := []rune(e.currentLine())
-	line = append(line, 0)
-	copy(line[e.col+1:], line[e.col:])
-	line[e.col] = r
-	e.lines[e.row] = string(line)
-	e.col++
-	e.markDirty()
-}
-
-func (e *Editor) insertString(s string) {
-	for _, r := range s {
-		e.insertRune(r)
-	}
-}
-
-func (e *Editor) insertNewline() {
-	line := []rune(e.currentLine())
-	left := string(line[:e.col])
-	right := string(line[e.col:])
-
-	e.lines[e.row] = left
-	e.lines = append(e.lines, "")
-	copy(e.lines[e.row+2:], e.lines[e.row+1:])
-	e.lines[e.row+1] = right
-	e.row++
-	e.col = 0
+	e.cursor = e.buf.Insert(e.cursor, string([]rune{r}))
 	e.markDirty()
 }
 
@@ -1151,24 +952,8 @@ func (e *Editor) backspace() {
 		e.deleteSelect()
 		return
 	}
-	if e.col > 0 {
-		line := []rune(e.currentLine())
-		line = append(line[:e.col-1], line[e.col:]...)
-		e.lines[e.row] = string(line)
-		e.col--
-		e.markDirty()
-		return
-	}
-
-	if e.row == 0 {
-		return
-	}
-
-	prev := []rune(e.lines[e.row-1])
-	e.col = len(prev)
-	e.lines[e.row-1] += e.lines[e.row]
-	e.lines = append(e.lines[:e.row], e.lines[e.row+1:]...)
-	e.row--
+	prevLineEnd := Position{Row: e.cursor.Row - 1, Col: len(e.buf.Line(e.cursor.Row - 1))}
+	e.cursor = e.buf.DeleteRange(prevLineEnd, e.cursor)
 	e.markDirty()
 }
 
@@ -1177,20 +962,7 @@ func (e *Editor) delete() {
 		e.deleteSelect()
 		return
 	}
-	line := []rune(e.currentLine())
-	if e.col < len(line) {
-		line = append(line[:e.col], line[e.col+1:]...)
-		e.lines[e.row] = string(line)
-		e.markDirty()
-		return
-	}
-
-	if e.row >= len(e.lines)-1 {
-		return
-	}
-
-	e.lines[e.row] += e.lines[e.row+1]
-	e.lines = append(e.lines[:e.row+1], e.lines[e.row+2:]...)
+	e.cursor = e.buf.DeleteRange(e.cursor, Position{Row: e.cursor.Row, Col: e.cursor.Col + 1})
 	e.markDirty()
 }
 
@@ -1199,10 +971,7 @@ func (e *Editor) deleteToLineStart() {
 		e.deleteSelect()
 		return
 	}
-
-	line := []rune(e.currentLine())
-	e.lines[e.row] = string(line[e.col:])
-	e.col = 0
+	e.cursor = e.buf.DeleteRange(Position{Row: e.cursor.Row, Col: 0}, e.cursor)
 	e.markDirty()
 }
 
@@ -1211,69 +980,49 @@ func (e *Editor) deleteToLineEnd() {
 		e.deleteSelect()
 		return
 	}
-	line := []rune(e.currentLine())
-	e.lines[e.row] = string(line[:e.col])
+	lineEnd := Position{Row: e.cursor.Row, Col: len(e.buf.Line(e.cursor.Row))}
+	e.cursor = e.buf.DeleteRange(e.cursor, lineEnd)
 	e.markDirty()
 }
 
 func (e *Editor) moveLeft() {
-	if e.col > 0 {
-		e.col--
+	if e.cursor.Col > 0 {
+		e.cursor.Col--
 		return
 	}
-	if e.row > 0 {
-		e.row--
-		e.col = len([]rune(e.currentLine()))
+	if e.cursor.Row > 0 {
+		e.cursor.Row--
+		e.cursor.Col = len(e.buf.Line(e.cursor.Row))
 	}
 }
 
 func (e *Editor) moveRight() {
-	if e.col < len([]rune(e.currentLine())) {
-		e.col++
+	if e.cursor.Col < len(e.buf.Line(e.cursor.Row)) {
+		e.cursor.Col++
 		return
 	}
-	if e.row < len(e.lines)-1 {
-		e.row++
-		e.col = 0
+	if e.cursor.Row < e.buf.LenLines()-1 {
+		e.cursor.Row++
+		e.cursor.Col = 0
 	}
 }
 
 func (e *Editor) moveUp() {
-	if e.row > 0 {
-		dstCol := runeIndexToDisplayColumn(e.currentLine(), e.col)
-		e.row--
-		e.col = displayColumnToRuneIndex(e.currentLine(), dstCol)
-		e.clampCol()
+	if e.cursor.Row == 0 {
+		return
 	}
+	displayCol := runeIndexToDisplayColumn(e.buf.Line(e.cursor.Row), e.cursor.Col)
+	i := displayColumnToRuneIndex(e.buf.Line(e.cursor.Row-1), displayCol)
+	e.cursor = Position{Row: e.cursor.Row - 1, Col: i}
 }
 
 func (e *Editor) moveDown() {
-	if e.row < len(e.lines)-1 {
-		dstCol := runeIndexToDisplayColumn(e.currentLine(), e.col)
-		e.row++
-		e.col = displayColumnToRuneIndex(e.currentLine(), dstCol)
-		e.clampCol()
+	if e.cursor.Row == e.buf.LenLines()-1 {
+		return
 	}
-}
-
-func (e *Editor) clampCol() {
-	lineLen := len([]rune(e.currentLine()))
-	if e.col > lineLen {
-		e.col = lineLen
-	}
-}
-
-func (e *Editor) currentLine() string {
-	if len(e.lines) == 0 {
-		e.lines = []string{""}
-	}
-	if e.row < 0 {
-		e.row = 0
-	}
-	if e.row >= len(e.lines) {
-		e.row = len(e.lines) - 1
-	}
-	return e.lines[e.row]
+	displayCol := runeIndexToDisplayColumn(e.buf.Line(e.cursor.Row), e.cursor.Col)
+	i := displayColumnToRuneIndex(e.buf.Line(e.cursor.Row+1), displayCol)
+	e.cursor = Position{Row: e.cursor.Row + 1, Col: i}
 }
 
 func (e *Editor) markDirty() {
@@ -1281,8 +1030,7 @@ func (e *Editor) markDirty() {
 	e.message = ""
 }
 
-func runeIndexToDisplayColumn(s string, pos int) int {
-	runes := []rune(s)
+func runeIndexToDisplayColumn(runes []rune, pos int) int {
 	if pos < 0 {
 		pos = 0
 	}
@@ -1301,8 +1049,7 @@ func runeIndexToDisplayColumn(s string, pos int) int {
 	return col
 }
 
-func displayColumnToRuneIndex(s string, targetCol int) int {
-	runes := []rune(s)
+func displayColumnToRuneIndex(runes []rune, targetCol int) int {
 	if targetCol <= 0 {
 		return 0
 	}
@@ -1323,22 +1070,22 @@ func displayColumnToRuneIndex(s string, targetCol int) int {
 
 func (e *Editor) ensureCursorVisible(ctx *kero.Context) {
 	editorH := editorHeight(ctx)
-	if e.row < e.rowOffset {
-		e.rowOffset = e.row
+	if e.cursor.Row < e.rowOffset {
+		e.rowOffset = e.cursor.Row
 	}
 	// for easy reading, controls scrolling behavior and edge padding around the cursor.
 	margin := 5
-	if e.row >= e.rowOffset+editorH-margin {
-		e.rowOffset = e.row - editorH + margin
+	if e.cursor.Row >= e.rowOffset+editorH-margin {
+		e.rowOffset = e.cursor.Row - editorH + margin
 	}
 	if e.rowOffset < 0 {
 		e.rowOffset = 0
 	}
 
-	textW := ctx.Width - lineNumberWidth(len(e.lines)) - 1
+	textW := ctx.Width - lineNumberWidth(e.buf.LenLines()) - 1
 	textW = max(1, textW)
-	line := e.currentLine()
-	cursorDisplay := runeIndexToDisplayColumn(line, e.col)
+	line := e.buf.Line(e.cursor.Row)
+	cursorDisplay := runeIndexToDisplayColumn(line, e.cursor.Col)
 	if cursorDisplay < e.colOffset {
 		e.colOffset = cursorDisplay
 	} else if cursorDisplay >= e.colOffset+textW {
@@ -1407,7 +1154,7 @@ func parsePathArg(arg string) (path string, row, col int) {
 func main() {
 	app := &Editor{}
 	if len(os.Args) > 1 {
-		app.path, app.row, app.col = parsePathArg(os.Args[1])
+		app.path, app.cursor.Row, app.cursor.Col = parsePathArg(os.Args[1])
 	}
 
 	p := kero.New(app, kero.WithAltScreen(true), kero.WithKitty(true))

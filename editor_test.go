@@ -1,13 +1,14 @@
 package main
 
 import (
+	"strings"
 	"testing"
 
 	"kero"
 )
 
 func TestDisplayColumnAndRuneIndex(t *testing.T) {
-	line := "a\tbc"
+	line := []rune("a\tbc")
 
 	if got := runeIndexToDisplayColumn(line, 2); got != 4 {
 		t.Fatalf("runeIndexToDisplayColumn(line, 2) = %d, want 4", got)
@@ -25,9 +26,8 @@ func TestDisplayColumnAndRuneIndex(t *testing.T) {
 
 func TestEnsureCursorVisible_WithTabs(t *testing.T) {
 	ed := &Editor{
-		lines: []string{"\thello world"},
-		row:   0,
-		col:   0,
+		buf:    NewBuffer("\thello world"),
+		cursor: Position{Row: 0, Col: 0},
 	}
 
 	// Mock context with width = 10 (line number width = 1, space = 1, textW = 8)
@@ -39,7 +39,7 @@ func TestEnsureCursorVisible_WithTabs(t *testing.T) {
 	}
 
 	// Move cursor to 'w' in "world" (rune index 7: '\t', h, e, l, l, o, ' ') -> display column 4 + 6 = 10
-	ed.col = 7
+	ed.cursor.Col = 7
 	ed.ensureCursorVisible(ctx)
 	// textW = 10 - 1 - 1 = 8. cursorDisplay = 10.
 	// 10 >= colOffset + 8 => colOffset = 10 - 8 + 1 = 3.
@@ -48,7 +48,7 @@ func TestEnsureCursorVisible_WithTabs(t *testing.T) {
 	}
 
 	// Move cursor back to index 0 ('\t', display column 0)
-	ed.col = 0
+	ed.cursor.Col = 0
 	ed.ensureCursorVisible(ctx)
 	if ed.colOffset != 0 {
 		t.Fatalf("expected colOffset = 0 when returning to start, got %d", ed.colOffset)
@@ -57,47 +57,35 @@ func TestEnsureCursorVisible_WithTabs(t *testing.T) {
 
 func TestMoveUpMoveDown_WithTabs(t *testing.T) {
 	ed := &Editor{
-		lines: []string{
-			"\thello", // tab is 4 spaces (cols 0-3), 'h' at col 4
-			"abcdefg", // 'e' is at col 4 (rune index 4)
-		},
-		row: 0,
-		col: 1, // on 'h' (display col 4)
+		buf:    NewBuffer("\thello\nabcdefg"),
+		cursor: Position{Row: 0, Col: 1}, // on 'h' (display col 4)
 	}
 
 	ed.moveDown()
-	if ed.row != 1 {
-		t.Fatalf("expected row 1, got %d", ed.row)
+	if ed.cursor.Row != 1 {
+		t.Fatalf("expected row 1, got %d", ed.cursor.Row)
 	}
 	// display col 4 on "abcdefg" corresponds to rune index 4 ('e')
-	if ed.col != 4 {
-		t.Fatalf("expected col 4, got %d", ed.col)
+	if ed.cursor.Col != 4 {
+		t.Fatalf("expected col 4, got %d", ed.cursor.Col)
 	}
 
 	ed.moveUp()
-	if ed.row != 0 {
-		t.Fatalf("expected row 0, got %d", ed.row)
+	if ed.cursor.Row != 0 {
+		t.Fatalf("expected row 0, got %d", ed.cursor.Row)
 	}
 	// display col 4 on "\thello" corresponds to rune index 1 ('h')
-	if ed.col != 1 {
-		t.Fatalf("expected col 1, got %d", ed.col)
+	if ed.cursor.Col != 1 {
+		t.Fatalf("expected col 1, got %d", ed.cursor.Col)
 	}
 }
 
 func TestTab_MultiLineSelection(t *testing.T) {
 	ed := &Editor{
-		lines: []string{
-			"first line",
-			"second line",
-			"third line",
-		},
-		row:         1,
-		col:         6,
-		selecting:   true,
-		selStartRow: 0,
-		selStartCol: 2,
-		selEndRow:   1,
-		selEndCol:   6,
+		buf:       NewBuffer("first line\nsecond line\nthird line"),
+		selecting: true,
+		selAnchor: Position{Row: 0, Col: 2},
+		cursor:    Position{Row: 1, Col: 6},
 	}
 
 	ctx := &kero.Context{Width: 80, Height: 24}
@@ -114,35 +102,26 @@ func TestTab_MultiLineSelection(t *testing.T) {
 		"third line",
 	}
 
-	for i, line := range ed.lines {
-		if line != expectedLines[i] {
-			t.Errorf("line %d = %q, want %q", i, line, expectedLines[i])
+	for i, line := range ed.buf.Lines() {
+		if string(line) != expectedLines[i] {
+			t.Errorf("line %d = %q, want %q", i, string(line), expectedLines[i])
 		}
 	}
 
-	if ed.selStartCol != 3 {
-		t.Errorf("selStartCol = %d, want 3", ed.selStartCol)
+	if ed.selAnchor.Col != 3 {
+		t.Errorf("seletion start col = %d, want 3", ed.selAnchor.Col)
 	}
-	if ed.selEndCol != 7 {
-		t.Errorf("selEndCol = %d, want 7", ed.selEndCol)
-	}
-	if ed.col != 7 {
-		t.Errorf("col = %d, want 7", ed.col)
+	if ed.cursor.Col != 7 {
+		t.Errorf("selection end col = %d, want 7", ed.cursor.Col)
 	}
 }
 
 func TestTab_SingleLineSelection(t *testing.T) {
 	ed := &Editor{
-		lines: []string{
-			"hello world",
-		},
-		row:         0,
-		col:         5,
-		selecting:   true,
-		selStartRow: 0,
-		selStartCol: 0,
-		selEndRow:   0,
-		selEndCol:   5,
+		buf:       NewBuffer("hello world"),
+		selecting: true,
+		selAnchor: Position{Row: 0, Col: 0},
+		cursor:    Position{Row: 0, Col: 5},
 	}
 
 	ctx := &kero.Context{Width: 80, Height: 24}
@@ -154,8 +133,8 @@ func TestTab_SingleLineSelection(t *testing.T) {
 	}
 
 	// Single line selection should be deleted and replaced with a tab character
-	if ed.lines[0] != "\t world" {
-		t.Errorf("lines[0] = %q, want %q", ed.lines[0], "\t world")
+	if string(ed.buf.Line(0)) != "\t world" {
+		t.Errorf("lines[0] = %q, want %q", string(ed.buf.Line(0)), "\t world")
 	}
 	if ed.selecting {
 		t.Errorf("expected selecting to be false")
@@ -164,18 +143,10 @@ func TestTab_SingleLineSelection(t *testing.T) {
 
 func TestShiftTab_UnindentSelection(t *testing.T) {
 	ed := &Editor{
-		lines: []string{
-			"\tfirst line",
-			"    second line",
-			"third line",
-		},
-		row:         1,
-		col:         7,
-		selecting:   true,
-		selStartRow: 0,
-		selStartCol: 3,
-		selEndRow:   1,
-		selEndCol:   7,
+		buf:       NewBuffer("\tfirst line\n    second line\nthird line"),
+		cursor:    Position{Row: 1, Col: 7},
+		selecting: true,
+		selAnchor: Position{Row: 0, Col: 3},
 	}
 
 	ctx := &kero.Context{Width: 80, Height: 24}
@@ -192,30 +163,24 @@ func TestShiftTab_UnindentSelection(t *testing.T) {
 		"third line",
 	}
 
-	for i, line := range ed.lines {
-		if line != expectedLines[i] {
-			t.Errorf("line %d = %q, want %q", i, line, expectedLines[i])
+	for i, line := range ed.buf.Lines() {
+		if string(line) != expectedLines[i] {
+			t.Errorf("line %d = %q, want %q", i, string(line), expectedLines[i])
 		}
 	}
 
-	if ed.selStartCol != 2 {
-		t.Errorf("selStartCol = %d, want 2", ed.selStartCol)
+	if ed.selAnchor.Col != 2 {
+		t.Errorf("selStartCol = %d, want 2", ed.selAnchor.Col)
 	}
-	if ed.selEndCol != 3 {
-		t.Errorf("selEndCol = %d, want 3", ed.selEndCol)
-	}
-	if ed.col != 3 {
-		t.Errorf("col = %d, want 3", ed.col)
+	if ed.cursor.Col != 3 {
+		t.Errorf("col = %d, want 3", ed.cursor.Col)
 	}
 }
 
 func TestShiftTab_UnindentLineWithoutSelection(t *testing.T) {
 	ed := &Editor{
-		lines: []string{
-			"\thello world",
-		},
-		row: 0,
-		col: 6,
+		buf:    NewBuffer("\thello world"),
+		cursor: Position{Row: 0, Col: 6},
 	}
 
 	ctx := &kero.Context{Width: 80, Height: 24}
@@ -226,23 +191,18 @@ func TestShiftTab_UnindentLineWithoutSelection(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if ed.lines[0] != "hello world" {
-		t.Errorf("lines[0] = %q, want %q", ed.lines[0], "hello world")
+	if string(ed.buf.Line(0)) != "hello world" {
+		t.Errorf("lines[0] = %q, want %q", ed.buf.Line(0), "hello world")
 	}
-	if ed.col != 5 {
-		t.Errorf("col = %d, want 5", ed.col)
+	if ed.cursor.Col != 5 {
+		t.Errorf("col = %d, want 5", ed.cursor.Col)
 	}
 }
 
 func TestStartSelectLine(t *testing.T) {
 	ed := &Editor{
-		lines: []string{
-			"first line",
-			"second line",
-			"third line",
-		},
-		row: 0,
-		col: 3,
+		buf:    NewBuffer("first line\nsecond line\nthird line"),
+		cursor: Position{Row: 0, Col: 3},
 	}
 
 	// 1st Ctrl+L: selects line 0 down to line 1 col 0
@@ -250,50 +210,44 @@ func TestStartSelectLine(t *testing.T) {
 	if !ed.selecting {
 		t.Errorf("expected selecting to be true")
 	}
-	if ed.selStartRow != 0 || ed.selStartCol != 0 {
-		t.Errorf("selStart = (%d, %d), want (0, 0)", ed.selStartRow, ed.selStartCol)
+	if ed.selAnchor.Row != 0 || ed.selAnchor.Col != 0 {
+		t.Errorf("selStart = (%d, %d), want (0, 0)", ed.selAnchor.Row, ed.selAnchor.Col)
 	}
-	if ed.selEndRow != 1 || ed.selEndCol != 0 {
-		t.Errorf("selEnd = (%d, %d), want (1, 0)", ed.selEndRow, ed.selEndCol)
-	}
-	if ed.row != 1 || ed.col != 0 {
-		t.Errorf("cursor = (%d, %d), want (1, 0)", ed.row, ed.col)
+	if ed.cursor.Row != 1 || ed.cursor.Col != 0 {
+		t.Errorf("cursor = (%d, %d), want (1, 0)", ed.cursor.Row, ed.cursor.Col)
 	}
 
 	// 2nd Ctrl+L: extends selection to line 2 col 0
 	ed.selectLine()
-	if ed.selEndRow != 2 || ed.selEndCol != 0 {
-		t.Errorf("selEnd = (%d, %d), want (2, 0)", ed.selEndRow, ed.selEndCol)
+	if ed.cursor.Row != 2 || ed.cursor.Col != 0 {
+		t.Errorf("cursor = (%d, %d), want (2, 0)", ed.cursor.Row, ed.cursor.Col)
 	}
 
 	// 3rd Ctrl+L: extends selection to line 2 end
 	ed.selectLine()
-	if ed.selEndRow != 2 || ed.selEndCol != len("third line") {
-		t.Errorf("selEnd = (%d, %d), want (2, %d)", ed.selEndRow, ed.selEndCol, len("third line"))
+	if ed.cursor.Row != 2 || ed.cursor.Col != len("third line") {
+		t.Errorf("cursor = (%d, %d), want (2, %d)", ed.cursor.Row, ed.cursor.Col, len("third line"))
 	}
 }
 
 func TestWordUnderCursor(t *testing.T) {
 	ed := &Editor{
-		lines: []string{
-			"func (e *Editor) finishCommand() error {",
-		},
-		row: 0,
-		col: 20, // on 'f' in finishCommand
+		buf:    NewBuffer("func (e *Editor) finishCommand() error {"),
+		cursor: Position{Row: 0, Col: 20}, // on 'f' in finishCommand
 	}
-	start, end := ed.wordRangeAt(ed.row, ed.col)
+	start, end := ed.buf.WordBounds(ed.cursor)
 	if start == end {
-		t.Fatalf("wordAt(%d, %d) returned empty range", ed.row, ed.col)
+		t.Fatalf("wordAt(%+v, %+v) returned empty range", ed.cursor.Row, ed.cursor.Col)
 	}
-	word := ed.lines[ed.row][start:end]
+	word := ed.buf.GetRange(start, end)
 	if word != "finishCommand" {
-		t.Fatalf("wordAt(%d, %d) = %q, want %q", ed.row, ed.col, word, "finishCommand")
+		t.Fatalf("wordAt(%+v, %+v) = %q, want %q", ed.cursor.Row, ed.cursor.Col, word, "finishCommand")
 	}
 }
 
 func TestSmartGoto(t *testing.T) {
 	ed := &Editor{
-		lines: []string{
+		buf: NewBuffer(strings.Join([]string{
 			"package main",
 			"",
 			"type Editor struct {",
@@ -307,9 +261,8 @@ func TestSmartGoto(t *testing.T) {
 			"    e := &Editor{}",
 			"    e.finishCommand()",
 			"}",
-		},
-		row: 11, // line with e.finishCommand()
-		col: 7,  // on finishCommand
+		}, "\n")),
+		cursor: Position{Row: 11, Col: 7}, // line with e.finishCommand(), on finishCommand
 	}
 
 	ctx := &kero.Context{Width: 80, Height: 24}
@@ -320,7 +273,59 @@ func TestSmartGoto(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if ed.row != 5 {
-		t.Errorf("ed.row = %d, want 5 (line of func (e *Editor) finishCommand)", ed.row)
+	if ed.cursor.Row != 5 {
+		t.Errorf("ed.pos.Row = %d, want 5 (line of func (e *Editor) finishCommand)", ed.cursor.Row)
+	}
+}
+
+func TestReplaceCurrentAndSkip(t *testing.T) {
+	ed := &Editor{
+		buf:    NewBuffer("one two one three one"),
+		cursor: Position{Row: 0, Col: 0},
+	}
+
+	ed.startFind()
+	ed.findInput.Value = "one"
+	ed.findInput.Cursor = 3
+	ed.updateFind(kero.KeyEvent{Key: kero.KeyEnter})
+	ed.updateFind(kero.KeyEvent{Key: kero.KeyRune, Rune: 'r', Mod: kero.ModCtrl})
+	ed.replaceInput.Value = "1"
+	ed.replaceInput.Cursor = 1
+	ed.updateFind(kero.KeyEvent{Key: kero.KeyEnter})
+
+	if got := ed.buf.String(); got != "1 two one three one" {
+		t.Fatalf("after replace current = %q, want %q", got, "1 two one three one")
+	}
+	if !ed.findMatch || ed.findMatchStart.Col != 6 {
+		t.Fatalf("next match = (%+v, %+v, %v), want start at column 6", ed.findMatchStart, ed.findMatchEnd, ed.findMatch)
+	}
+
+	ed.updateFind(kero.KeyEvent{Key: kero.KeyTab})
+	if !ed.findMatch {
+		t.Fatal("expected skip to wrap to the first remaining match")
+	}
+	if ed.findMatchStart.Col != 16 {
+		t.Fatalf("skipped match start = %d, want 16", ed.findMatchStart.Col)
+	}
+}
+
+func TestReplaceAll(t *testing.T) {
+	ed := &Editor{
+		buf: NewBuffer("Cat\ncatapult\nDOG"),
+	}
+	ed.startFind()
+	ed.findInput.Value = "cat"
+	ed.findInput.Cursor = 3
+	ed.updateFind(kero.KeyEvent{Key: kero.KeyRune, Rune: 'r', Mod: kero.ModCtrl})
+	ed.replaceInput.Value = "fox"
+	ed.replaceInput.Cursor = 3
+	ctrlEnter := kero.KeyEvent{Key: kero.KeyEnter, Mod: kero.ModCtrl}
+	ed.updateFind(ctrlEnter)
+
+	if got := ed.buf.String(); got != "fox\nfoxapult\nDOG" {
+		t.Fatalf("after replace all = %q, want %q", got, "fox\nfoxapult\nDOG")
+	}
+	if ed.message != "replaced 2 matches" {
+		t.Fatalf("message = %q, want replacement count", ed.message)
 	}
 }
