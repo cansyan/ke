@@ -1140,25 +1140,11 @@ func (e *Editor) deleteToLineEnd() {
 }
 
 func (e *Editor) moveLeft() {
-	if e.cursor.Col > 0 {
-		e.cursor.Col--
-		return
-	}
-	if e.cursor.Row > 0 {
-		e.cursor.Row--
-		e.cursor.Col = len(e.buf.Line(e.cursor.Row))
-	}
+	e.cursor = e.buf.PrevPos(e.cursor)
 }
 
 func (e *Editor) moveRight() {
-	if e.cursor.Col < len(e.buf.Line(e.cursor.Row)) {
-		e.cursor.Col++
-		return
-	}
-	if e.cursor.Row < e.buf.LenLines()-1 {
-		e.cursor.Row++
-		e.cursor.Col = 0
-	}
+	e.cursor = e.buf.NextPos(e.cursor)
 }
 
 func (e *Editor) moveUp() {
@@ -1357,27 +1343,44 @@ func displayColumnToRuneIndex(runes []rune, targetCol int) int {
 
 func (e *Editor) ensureCursorVisible(ctx *kero.Context) {
 	editorH := editorHeight(ctx)
-	if e.cursor.Row < e.rowOffset {
-		e.rowOffset = e.cursor.Row
+	if editorH <= 0 {
+		return
 	}
-	// for easy reading, controls scrolling behavior and edge padding around the cursor.
-	margin := 5
-	if e.cursor.Row >= e.rowOffset+editorH-margin {
-		e.rowOffset = e.cursor.Row - editorH + margin
+
+	// Dynamic margin: keep 5 lines padding, but never exceed half the viewport height
+	margin := min(5, max(0, (editorH-1)/2))
+
+	// 1. Vertical Scrolling (Row)
+	// Ensure cursor is above the bottom margin
+	maxRowOffset := e.cursor.Row - (editorH - 1 - margin)
+	if e.rowOffset < maxRowOffset {
+		e.rowOffset = maxRowOffset
 	}
+
+	// Ensure cursor is below the top margin
+	minRowOffset := e.cursor.Row - margin
+	if e.rowOffset > minRowOffset {
+		e.rowOffset = minRowOffset
+	}
+
+	// Clamp to top boundary
 	if e.rowOffset < 0 {
 		e.rowOffset = 0
 	}
 
+	// 2. Horizontal Scrolling (Column)
 	textW := ctx.Width - lineNumberWidth(e.buf.LenLines()) - 2
 	textW = max(1, textW)
+
 	line := e.buf.Line(e.cursor.Row)
 	cursorDisplay := runeIndexToDisplayColumn(line, e.cursor.Col)
+
 	if cursorDisplay < e.colOffset {
 		e.colOffset = cursorDisplay
 	} else if cursorDisplay >= e.colOffset+textW {
 		e.colOffset = cursorDisplay - textW + 1
 	}
+
 	if e.colOffset < 0 {
 		e.colOffset = 0
 	}
@@ -1424,6 +1427,7 @@ func CheckGoSyntax(filename string, content []byte) []Diagnostic {
 	fset := token.NewFileSet()
 
 	// ParseHeader or ParseComments keeps it fast
+	// TODO: with the abstract syntax tree, maybe I can do something, like refactor the Goto Definition/Symbol
 	_, err := parser.ParseFile(fset, filename, content, parser.AllErrors)
 	if err == nil {
 		return nil

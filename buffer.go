@@ -509,3 +509,27 @@ func (b *Buffer) MoveWordLeft(p Position) Position {
 	}
 	return Position{Row: p.Row, Col: i}
 }
+
+// NextPos returns the Position after stepping one rune right, wrapping lines if needed.
+func (b *Buffer) NextPos(pos Position) Position {
+	lineLen := len(b.Line(pos.Row))
+	if pos.Col < lineLen {
+		return Position{Row: pos.Row, Col: pos.Col + 1}
+	}
+	if pos.Row < b.LenLines()-1 {
+		return Position{Row: pos.Row + 1, Col: 0}
+	}
+	return pos
+}
+
+// PrevPos returns the Position after stepping one rune left, wrapping lines if needed.
+func (b *Buffer) PrevPos(pos Position) Position {
+	if pos.Col > 0 {
+		return Position{Row: pos.Row, Col: pos.Col - 1}
+	}
+	if pos.Row > 0 {
+		prevRow := pos.Row - 1
+		return Position{Row: prevRow, Col: len(b.Line(prevRow))}
+	}
+	return pos
+}
