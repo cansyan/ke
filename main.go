@@ -713,23 +713,55 @@ func (e *Editor) gotoQueries(queries []string) bool {
 	if len(queries) == 0 {
 		return false
 	}
-	var lowerQueries []string
-	for _, q := range queries {
-		q = strings.TrimSpace(strings.ToLower(q))
-		if q != "" {
-			lowerQueries = append(lowerQueries, q)
-		}
+	type qSpec struct {
+		q          string
+		ignoreCase bool
 	}
-	if len(lowerQueries) == 0 {
+	var specs []qSpec
+	for _, q := range queries {
+		q = strings.TrimSpace(q)
+		if q == "" {
+			continue
+		}
+		ignore := true
+		for _, r := range q {
+			if unicode.IsUpper(r) {
+				ignore = false
+				break
+			}
+		}
+		specs = append(specs, qSpec{q: q, ignoreCase: ignore})
+	}
+	if len(specs) == 0 {
 		return false
 	}
 	for row, line := range e.buf.Lines() {
-		lineLower := strings.ToLower(string(line))
-		match := true
-		for _, query := range lowerQueries {
-			if !strings.Contains(lineLower, query) {
-				match = false
+		lineStr := string(line)
+		// prepare lowercased line only if needed
+		needLower := false
+		for _, s := range specs {
+			if s.ignoreCase {
+				needLower = true
 				break
+			}
+		}
+		var lineLower string
+		if needLower {
+			lineLower = strings.ToLower(lineStr)
+		}
+
+		match := true
+		for _, s := range specs {
+			if s.ignoreCase {
+				if !strings.Contains(lineLower, strings.ToLower(s.q)) {
+					match = false
+					break
+				}
+			} else {
+				if !strings.Contains(lineStr, s.q) {
+					match = false
+					break
+				}
 			}
 		}
 		if match {
@@ -853,6 +885,15 @@ func (e *Editor) startFind() {
 	}
 }
 
+func (e *Editor) findQueryIgnoreCase(query string) bool {
+	for _, r := range query {
+		if unicode.IsUpper(r) {
+			return false
+		}
+	}
+	return true
+}
+
 func (e *Editor) updateFind(ev kero.KeyEvent) error {
 	if ev.String() == "ctrl+r" {
 		e.replacing = !e.replacing
@@ -889,25 +930,47 @@ func (e *Editor) updateFind(ev kero.KeyEvent) error {
 		if query == "" {
 			return nil
 		}
+		ignoreCase := e.findQueryIgnoreCase(query)
 
 		if ev.Mod&kero.ModShift != 0 {
-			if start, end, ok := e.buf.FindPrevIgnoreCase(query, e.cursor); ok {
-				e.findMatch = true
-				e.findMatchStart = start
-				e.findMatchEnd = end
-				e.cursor = start
-				e.clearSelect()
+			if ignoreCase {
+				if start, end, ok := e.buf.FindPrevIgnoreCase(query, e.cursor); ok {
+					e.findMatch = true
+					e.findMatchStart = start
+					e.findMatchEnd = end
+					e.cursor = start
+					e.clearSelect()
+				}
+			} else {
+				if start, end, ok := e.buf.FindPrev(query, e.cursor); ok {
+					e.findMatch = true
+					e.findMatchStart = start
+					e.findMatchEnd = end
+					e.cursor = start
+					e.clearSelect()
+				}
 			}
 			return nil
 		}
 
-		start, end, ok := e.buf.FindNextIgnoreCase(query, e.cursor)
-		if ok {
-			e.findMatch = true
-			e.findMatchStart = start
-			e.findMatchEnd = end
-			e.cursor = end
-			e.clearSelect()
+		if ignoreCase {
+			start, end, ok := e.buf.FindNextIgnoreCase(query, e.cursor)
+			if ok {
+				e.findMatch = true
+				e.findMatchStart = start
+				e.findMatchEnd = end
+				e.cursor = end
+				e.clearSelect()
+			}
+		} else {
+			start, end, ok := e.buf.FindNext(query, e.cursor)
+			if ok {
+				e.findMatch = true
+				e.findMatchStart = start
+				e.findMatchEnd = end
+				e.cursor = end
+				e.clearSelect()
+			}
 		}
 		return nil
 	}
@@ -946,7 +1009,14 @@ func (e *Editor) skipFindMatch() {
 	if e.findMatch {
 		from = e.findMatchEnd
 	}
-	start, end, ok := e.buf.FindNextIgnoreCase(query, from)
+	ignoreCase := e.findQueryIgnoreCase(query)
+	var start, end Position
+	var ok bool
+	if ignoreCase {
+		start, end, ok = e.buf.FindNextIgnoreCase(query, from)
+	} else {
+		start, end, ok = e.buf.FindNext(query, from)
+	}
 	if !ok {
 		e.findMatch = false
 		return
@@ -989,7 +1059,13 @@ func (e *Editor) replaceAll() error {
 	if query == "" {
 		return nil
 	}
-	count := e.buf.ReplaceAllIgnoreCase(query, e.replaceInput.Value)
+	ignoreCase := e.findQueryIgnoreCase(query)
+	var count int
+	if ignoreCase {
+		count = e.buf.ReplaceAllIgnoreCase(query, e.replaceInput.Value)
+	} else {
+		count = e.buf.ReplaceAll(query, e.replaceInput.Value)
+	}
 	if count > 0 {
 		e.markDirty()
 	}

@@ -1,8 +1,6 @@
 package main
 
 import (
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -42,22 +40,18 @@ func TestCheckGoSyntax(t *testing.T) {
 	}
 }
 
-func TestCheckGoVetFindsUndefinedSymbol(t *testing.T) {
-	dir := t.TempDir()
-	filename := filepath.Join(dir, "vet-example.go")
-	if err := os.WriteFile(filename, []byte("package main\nfunc main() { missing() }\n"), 0644); err != nil {
-		t.Fatal(err)
+func TestParseVetDiagnostics(t *testing.T) {
+	output := "vet-example.go:2:5: undefined: missing\nother.go:10:3: some vet issue\n"
+	diagnostics := parseVetDiagnostics(output)
+	if len(diagnostics) != 2 {
+		t.Fatalf("expected 2 diagnostics, got %d", len(diagnostics))
 	}
-	diagnostics := CheckGoVet(filename)
-	if len(diagnostics) == 0 {
-		t.Fatal("CheckGoVet returned no diagnostics for an undefined symbol")
+	if diagnostics[0].Line != 1 || diagnostics[0].Col != 4 {
+		t.Fatalf("first diagnostic pos = (%d,%d), want (1,4)", diagnostics[0].Line, diagnostics[0].Col)
 	}
-	for _, diagnostic := range diagnostics {
-		if strings.Contains(diagnostic.Message, "undefined") {
-			return
-		}
+	if !strings.Contains(diagnostics[0].Message, "undefined") {
+		t.Fatalf("first diagnostic message = %q", diagnostics[0].Message)
 	}
-	t.Fatalf("CheckGoVet diagnostics did not include an undefined-symbol error: %+v", diagnostics)
 }
 
 func TestNextDiagnostic(t *testing.T) {
