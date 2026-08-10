@@ -8,7 +8,7 @@ Key bindings:
 	- Tab skip current match and move to the next match
 - Ctrl+. select
 	- Ctrl+D select word under cursor
-	- Ctrl+L select line
+	- Ctrl+L expand selection to line
 - Ctrl+C copy
 - Ctrl+X cut
 - Ctrl+V paste

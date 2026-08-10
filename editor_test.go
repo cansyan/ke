@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -24,13 +26,95 @@ func TestDisplayColumnAndRuneIndex(t *testing.T) {
 	}
 }
 
+func TestCheckGoSyntax(t *testing.T) {
+	diagnostics := CheckGoSyntax("example.go", []byte("package main\n\nfunc main( {\n"))
+	if len(diagnostics) == 0 {
+		t.Fatal("CheckGoSyntax returned no diagnostics for invalid Go")
+	}
+	if diagnostics[0].Line != 2 {
+		t.Errorf("diagnostic line = %d, want 2", diagnostics[0].Line)
+	}
+	if diagnostics[0].Message == "" {
+		t.Error("diagnostic message is empty")
+	}
+	if diagnostics := CheckGoSyntax("example.txt", []byte("func main( {\n")); diagnostics != nil {
+		t.Fatalf("CheckGoSyntax returned diagnostics for non-Go file: %+v", diagnostics)
+	}
+}
+
+func TestCheckGoVetFindsUndefinedSymbol(t *testing.T) {
+	dir := t.TempDir()
+	filename := filepath.Join(dir, "vet-example.go")
+	if err := os.WriteFile(filename, []byte("package main\nfunc main() { missing() }\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	diagnostics := CheckGoVet(filename)
+	if len(diagnostics) == 0 {
+		t.Fatal("CheckGoVet returned no diagnostics for an undefined symbol")
+	}
+	for _, diagnostic := range diagnostics {
+		if strings.Contains(diagnostic.Message, "undefined") {
+			return
+		}
+	}
+	t.Fatalf("CheckGoVet diagnostics did not include an undefined-symbol error: %+v", diagnostics)
+}
+
+func TestNextDiagnostic(t *testing.T) {
+	ed := &Editor{
+		buf:         NewBuffer("package main\nfunc main( {\n}\nvar x = ("),
+		cursor:      Position{Row: 0, Col: 0},
+		diagnostics: []Diagnostic{{Line: 1, Col: 10}, {Line: 3, Col: 8}},
+	}
+
+	ed.nextDiagnostic()
+	if ed.cursor != (Position{Row: 1, Col: 10}) {
+		t.Fatalf("first diagnostic cursor = %+v, want (1, 10)", ed.cursor)
+	}
+	ed.nextDiagnostic()
+	if ed.cursor != (Position{Row: 3, Col: 8}) {
+		t.Fatalf("second diagnostic cursor = %+v, want (3, 8)", ed.cursor)
+	}
+	ed.nextDiagnostic()
+	if ed.cursor != (Position{Row: 1, Col: 10}) {
+		t.Fatalf("wrapped diagnostic cursor = %+v, want (1, 10)", ed.cursor)
+	}
+}
+
+func TestGotoDiagnosticCommands(t *testing.T) {
+	ed := &Editor{
+		buf:         NewBuffer("package main\nfunc main( {\n}\nvar x = ("),
+		cursor:      Position{Row: 3, Col: 20},
+		diagnostics: []Diagnostic{{Line: 1, Col: 10}, {Line: 3, Col: 8}},
+	}
+
+	ed.gotoInput.Value = ">preverror"
+	ed.gotoMode = true
+	if err := ed.finishCommandPalette(); err != nil {
+		t.Fatal(err)
+	}
+	if ed.cursor != (Position{Row: 3, Col: 8}) {
+		t.Fatalf("prev-error cursor = %+v, want (3, 8)", ed.cursor)
+	}
+
+	ed.gotoInput.Value = ">nexterror"
+	ed.gotoMode = true
+	if err := ed.finishCommandPalette(); err != nil {
+		t.Fatal(err)
+	}
+	if ed.cursor != (Position{Row: 1, Col: 10}) {
+		t.Fatalf("next-error cursor = %+v, want (1, 10)", ed.cursor)
+	}
+
+}
+
 func TestEnsureCursorVisible_WithTabs(t *testing.T) {
 	ed := &Editor{
 		buf:    NewBuffer("\thello world"),
 		cursor: Position{Row: 0, Col: 0},
 	}
 
-	// Mock context with width = 10 (line number width = 1, space = 1, textW = 8)
+	// Mock context with width = 10 (marker + line number + space leaves textW = 7)
 	ctx := &kero.Context{Width: 10, Height: 10}
 
 	ed.ensureCursorVisible(ctx)
@@ -41,10 +125,10 @@ func TestEnsureCursorVisible_WithTabs(t *testing.T) {
 	// Move cursor to 'w' in "world" (rune index 7: '\t', h, e, l, l, o, ' ') -> display column 4 + 6 = 10
 	ed.cursor.Col = 7
 	ed.ensureCursorVisible(ctx)
-	// textW = 10 - 1 - 1 = 8. cursorDisplay = 10.
-	// 10 >= colOffset + 8 => colOffset = 10 - 8 + 1 = 3.
-	if ed.colOffset != 3 {
-		t.Fatalf("expected colOffset = 3, got %d", ed.colOffset)
+	// textW = 10 - 1 - 2 = 7. cursorDisplay = 10.
+	// 10 >= colOffset + 7 => colOffset = 10 - 7 + 1 = 4.
+	if ed.colOffset != 4 {
+		t.Fatalf("expected colOffset = 4, got %d", ed.colOffset)
 	}
 
 	// Move cursor back to index 0 ('\t', display column 0)
