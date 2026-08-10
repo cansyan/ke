@@ -13,12 +13,19 @@ Key bindings:
 - Ctrl+X cut
 - Ctrl+V paste
 - Ctrl+] smart jump
-- Ctrl+P goto anything
+- Ctrl+P command palette
 	- `:123` goto line 123
-	- `@filter symbol` goto symbol, filter can be keyword like Go's type/func/var, or Python's def, or empty
+	- `@filter symbol` goto symbol, for example `@func main`, `@type Editor`
+    - `>nexterror` goto next diagnostic error
+    - `>preverror` goto previous diagnostic error
 - Ctrl+Backspace delete to line start
 - Ctrl+K delete to line end
 - Ctrl+Enter insert line below
+- Home move cursor to the first non-whitespace character, double pressed to line start
+- End move cursor to line end
+- Alt+Left move cursor to start of current/previous word
+- Alt+Right move cursor to end of current/next word
+- Alt+Backspace delete word backwards
 - Esc cancel
 
 Early versions should keep things tiny.

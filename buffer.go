@@ -444,33 +444,68 @@ func runeMatches(left, right rune, ignoreCase bool) bool {
 	return left == right
 }
 
-// NextWord returns the start position of the next word after "from".
-func (b *Buffer) NextWord(from Position) Position {
-	if from.Row < 0 || from.Row >= len(b.lines) {
-		return from
+// MoveWordRight moves the cursor to the end of the current word,
+// or across whitespace/punctuation to the end of the next word.
+func (b *Buffer) MoveWordRight(p Position) Position {
+	if p.Row >= len(b.lines) {
+		return p
 	}
 
-	line := b.lines[from.Row]
-	col := from.Col
+	line := b.lines[p.Row]
 
-	// Move past current word if on a word character
-	for col < len(line) && isWordChar(line[col]) {
-		col++
+	// If at or past line end, wrap to the start of the next line
+	if p.Col >= len(line) {
+		if p.Row+1 < len(b.lines) {
+			return Position{Row: p.Row + 1, Col: 0}
+		}
+		return p // End of document
 	}
 
-	// Skip whitespace to next word
+	col := p.Col
+
+	// Skip leading non-word characters (whitespace, punctuation)
 	for col < len(line) && !isWordChar(line[col]) {
 		col++
 	}
 
-	if col < len(line) {
-		return Position{Row: from.Row, Col: col}
+	// Consume the word characters until the end of word
+	for col < len(line) && isWordChar(line[col]) {
+		col++
 	}
 
-	// Move to start of next line if available
-	if from.Row+1 < len(b.lines) {
-		return Position{Row: from.Row + 1, Col: 0}
+	return Position{Row: p.Row, Col: col}
+}
+
+// MoveWordLeft moves the cursor to the start of the current word,
+// or across whitespace/punctuation to the start of the previous word.
+func (b *Buffer) MoveWordLeft(p Position) Position {
+	if p.Row < 0 || p.Row >= len(b.lines) {
+		return p
 	}
 
-	return Position{Row: from.Row, Col: len(line)}
+	line := b.lines[p.Row]
+	col := p.Col
+	if col > len(line) {
+		col = len(line)
+	}
+
+	// If at start of line, move to end of previous line
+	if col == 0 {
+		if p.Row == 0 {
+			return Position{Row: 0, Col: 0}
+		}
+		prevLine := b.lines[p.Row-1]
+		return Position{Row: p.Row - 1, Col: len(prevLine)}
+	}
+
+	i := col
+	// skip non-word characters (whitespace/punctuation)
+	for i > 0 && !isWordChar(line[i-1]) {
+		i--
+	}
+	// skip word characters to the start of the word
+	for i > 0 && isWordChar(line[i-1]) {
+		i--
+	}
+	return Position{Row: p.Row, Col: i}
 }

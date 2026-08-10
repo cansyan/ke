@@ -159,9 +159,6 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 		case "ctrl+v":
 			e.paste()
 			return nil
-		case "ctrl+w":
-			e.cursor = e.buf.NextWord(e.cursor)
-			return nil
 		case "ctrl+d":
 			if e.hasSelect() {
 				// duplicate selection not implemented yet
@@ -232,12 +229,29 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 			e.deleteToLineStart()
 			break
 		}
+		// Alt+Backspace: delete previous word
+		if key.Mod&kero.ModAlt != 0 {
+			prev := e.buf.MoveWordLeft(e.cursor)
+			e.cursor = e.buf.DeleteRange(prev, e.cursor)
+			e.markDirty()
+			break
+		}
 		e.backspace()
 	case kero.KeyDelete:
 		e.delete()
 	case kero.KeyLeft:
+		// Alt+Left move cursor to start of current/previous word
+		if key.Mod&kero.ModAlt != 0 {
+			e.cursor = e.buf.MoveWordLeft(e.cursor)
+			break
+		}
 		e.moveLeft()
 	case kero.KeyRight:
+		// Alt+Right move cursor to end of current/next word
+		if key.Mod&kero.ModAlt != 0 {
+			e.cursor = e.buf.MoveWordRight(e.cursor)
+			break
+		}
 		e.moveRight()
 	case kero.KeyUp:
 		e.moveUp()
