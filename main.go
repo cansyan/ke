@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -45,9 +46,9 @@ type Editor struct {
 	findMatchStart Position
 	findMatchEnd   Position
 
-	// goto mode opens a input line at the message area
-	gotoMode  bool
-	gotoInput TextInput
+	// cmd mode opens a input line at the message area
+	cmdMode  bool
+	cmdInput TextInput
 
 	// selection state
 	selecting bool
@@ -61,7 +62,7 @@ type Editor struct {
 	diagnostics       []Diagnostic
 	diagnosticTimer   *time.Timer
 	diagnosticResult  chan diagnosticResult
-	diagnosticVersion uint64
+	diagnosticVersion atomic.Uint64
 }
 
 type diagnosticResult struct {
@@ -125,22 +126,20 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 	if e.finding {
 		return e.updateFind(key)
 	}
-	if e.gotoMode {
+	if e.cmdMode {
 		return e.updateCommandPalette(key)
 	}
 
 	switch key.Key {
 	case kero.KeyRune:
 		switch key.String() {
-		case "ctrl+]":
-			// similar to vim key "ctrl+]"
+		case "ctrl+g":
 			e.smartGoto()
 			return nil
 		case "ctrl+p":
-			// goto anything
 			e.startCommandPalette("")
 			return nil
-		case "ctrl+n":
+		case "ctrl+]":
 			e.nextDiagnostic()
 			return nil
 		case "ctrl+s":
@@ -172,25 +171,16 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 			// select the line under cursor
 			e.selectLine()
 			return nil
-		case "ctrl+.":
-			// toggle selection anchor at cursor (start selection mode)
-			if e.selecting {
-				e.clearSelect()
-			} else {
-				e.selecting = true
-				e.selAnchor = e.cursor
-			}
-			return nil
 		case "ctrl+k":
 			e.deleteToLineEnd()
 			return nil
 		case "ctrl+a":
-			if e.lastKey.String() == "ctrl+a" {
-				// double press goto the actually line start
+			p := e.buf.LineStartNonSpace(e.cursor)
+			if e.cursor == p {
 				e.cursor.Col = 0
 				return nil
 			}
-			e.cursor = e.buf.LineStartNonSpace(e.cursor)
+			e.cursor = p
 		case "ctrl+e":
 			e.cursor = e.buf.LineEnd(e.cursor)
 		}
@@ -232,7 +222,7 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 		}
 		e.insertRune('\t')
 	case kero.KeyBackspace:
-		if key.Mod&kero.ModCtrl != 0 {
+		if key.Mod&(kero.ModCtrl|kero.ModMeta) != 0 {
 			e.deleteToLineStart()
 			break
 		}
@@ -252,6 +242,22 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 			e.cursor = e.buf.MoveWordLeft(e.cursor)
 			break
 		}
+		if key.Mod&kero.ModMeta != 0 {
+			p := e.buf.LineStartNonSpace(e.cursor)
+			if e.cursor == p {
+				e.cursor.Col = 0
+			} else {
+				e.cursor = p
+			}
+			break
+		}
+		// start selection
+		if key.Mod&kero.ModShift != 0 {
+			if !e.selecting {
+				e.selecting = true
+				e.selAnchor = e.cursor
+			}
+		}
 		e.moveLeft()
 	case kero.KeyRight:
 		// Alt+Right move cursor to end of current/next word
@@ -259,10 +265,47 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 			e.cursor = e.buf.MoveWordRight(e.cursor)
 			break
 		}
+		if key.Mod&kero.ModMeta != 0 {
+			e.cursor = e.buf.LineEnd(e.cursor)
+			break
+		}
+		// start selection
+		if key.Mod&kero.ModShift != 0 {
+			if !e.selecting {
+				e.selecting = true
+				e.selAnchor = e.cursor
+			}
+		}
 		e.moveRight()
 	case kero.KeyUp:
+		if key.String() == "cmd+up" {
+			// file start
+			e.cursor.Row = 0
+			e.cursor.Col = 0
+			break
+		}
+		// start selection
+		if key.Mod&kero.ModShift != 0 {
+			if !e.selecting {
+				e.selecting = true
+				e.selAnchor = e.cursor
+			}
+		}
 		e.moveUp()
 	case kero.KeyDown:
+		if key.String() == "cmd+down" {
+			// file end
+			e.cursor.Row = e.buf.LenLines() - 1
+			e.cursor = e.buf.LineEnd(e.cursor)
+			break
+		}
+		// start selection
+		if key.Mod&kero.ModShift != 0 {
+			if !e.selecting {
+				e.selecting = true
+				e.selAnchor = e.cursor
+			}
+		}
 		e.moveDown()
 	case kero.KeyHome:
 		if e.lastKey.Key == kero.KeyHome {
@@ -321,11 +364,11 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 			f.Write(0, y, "!", kero.NewStyle().Foreground(kero.ColorRed))
 		}
 
-		origLine := e.buf.Line(lineIndex)
-		fullPadded := padTab(string(origLine), 4)
-		limit := ctx.Width - gutterW
-		limit = max(0, limit)
+		srcLine := e.buf.Line(lineIndex)
+		fullPadded := padTab(srcLine, 4)
+		limit := max(0, ctx.Width-gutterW)
 
+		// visual part of the padded line
 		var visPadded string
 		if e.colOffset < len(fullPadded) {
 			visPadded = fullPadded[e.colOffset:]
@@ -345,24 +388,23 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 		if e.selecting {
 			start, end := orderPos(e.selAnchor, e.cursor)
 			if lineIndex >= start.Row && lineIndex <= end.Row {
-				lineRunes := []rune(origLine)
 				var selStartCol, selEndCol int
 				if start.Row == end.Row {
 					selStartCol = start.Col
 					selEndCol = end.Col
 				} else if lineIndex == start.Row {
 					selStartCol = start.Col
-					selEndCol = len(lineRunes)
+					selEndCol = len(srcLine)
 				} else if lineIndex == end.Row {
 					selStartCol = 0
 					selEndCol = end.Col
 				} else {
 					selStartCol = 0
-					selEndCol = len(lineRunes)
+					selEndCol = len(srcLine)
 				}
 
-				startVisCol := runeIndexToDisplayColumn(origLine, selStartCol)
-				endVisCol := runeIndexToDisplayColumn(origLine, selEndCol)
+				startVisCol := runeIndexToDisplayColumn(srcLine, selStartCol)
+				endVisCol := runeIndexToDisplayColumn(srcLine, selEndCol)
 
 				startDisplay := max(0, min(startVisCol-e.colOffset, len(visPadded)))
 				endDisplay := max(0, min(endVisCol-e.colOffset, len(visPadded)))
@@ -373,6 +415,19 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 				}
 			}
 		}
+
+		if e.finding && e.findMatch && lineIndex == e.findMatchStart.Row && lineIndex == e.findMatchEnd.Row {
+			startVisCol := runeIndexToDisplayColumn(srcLine, e.findMatchStart.Col)
+			endVisCol := runeIndexToDisplayColumn(srcLine, e.findMatchEnd.Col)
+
+			startDisplay := max(0, min(startVisCol-e.colOffset, len(visPadded)))
+			endDisplay := max(0, min(endVisCol-e.colOffset, len(visPadded)))
+
+			for x := startDisplay; x < endDisplay; x++ {
+				ch := rune(visPadded[x])
+				f.Set(gutterW+x, y, ch, selectStyle)
+			}
+		}
 	}
 
 	line := e.buf.Line(e.cursor.Row)
@@ -380,7 +435,7 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 	cursorX := gutterW + cursorDisplayCol - e.colOffset
 	cursorY := 0 + e.cursor.Row - e.rowOffset
 	if cursorY >= 0 && cursorY < editorH && cursorX >= gutterW && cursorX < ctx.Width {
-		fullLinePadded := padTab(string(line), 4)
+		fullLinePadded := padTab(line, 4)
 		ch := ' '
 		if cursorDisplayCol < len(fullLinePadded) {
 			ch = rune(fullLinePadded[cursorDisplayCol])
@@ -397,21 +452,21 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 		}
 		f.Fill(kero.Rect{X: 0, Y: statusY, W: ctx.Width, H: 1}, ' ', statusStyle)
 		f.Write(0, statusY, trimToWidth(status, ctx.Width), statusStyle)
-		var dmsg string
+		var problem string
 		if len(e.diagnostics) > 0 {
-			dmsg = fmt.Sprintf("found %d error, press ctrl+n to jump", len(e.diagnostics))
+			problem = fmt.Sprintf("found %d error, press ctrl+] to jump", len(e.diagnostics))
 			if dd, ok := e.diagnosticForLine(e.cursor.Row); ok {
-				dmsg = dd.Message
+				problem = dd.Message
 			}
 		}
-		if dmsg != "" {
+		if problem != "" {
 			diagnosticStyle := kero.NewStyle().Foreground(kero.ColorRed).Reverse()
 			statusWidth := len([]rune(status))
 			f.Write(statusWidth+1, statusY, "| ", statusStyle)
 			keyWidth := len([]rune(e.lastKey.String()))
 			remainWidth := ctx.Width - statusWidth - keyWidth
 			if remainWidth > 0 {
-				f.Write(statusWidth+3, statusY, trimToWidth(dmsg, remainWidth), diagnosticStyle)
+				f.Write(statusWidth+3, statusY, trimToWidth(problem, remainWidth), diagnosticStyle)
 			}
 		}
 		if e.lastKey.Key != kero.KeyUnknown {
@@ -422,7 +477,7 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 
 	messageY := ctx.Height - 2
 	if messageY >= 0 {
-		if e.gotoMode {
+		if e.cmdMode {
 			e.drawCommandPalette(f, messageY, ctx.Width)
 			return
 		}
@@ -445,20 +500,12 @@ func (e *Editor) selectLine() {
 	if !e.selecting {
 		e.selecting = true
 		e.selAnchor = Position{Row: e.cursor.Row, Col: 0}
-		if e.cursor.Row < e.buf.LenLines()-1 {
-			e.cursor = Position{Row: e.cursor.Row + 1, Col: 0}
-		} else {
-			e.cursor = Position{Row: e.cursor.Row, Col: len(e.buf.Line(e.cursor.Row))}
-		}
-		return
 	}
-
-	// Already selecting: expand line selection to next line
 	if e.cursor.Row < e.buf.LenLines()-1 {
 		e.cursor.Row++
 		e.cursor.Col = 0
 	} else {
-		e.cursor.Col = len(e.buf.Line(e.cursor.Row))
+		e.cursor = e.buf.LineEnd(e.cursor)
 	}
 }
 
@@ -580,7 +627,7 @@ func (e *Editor) cut() {
 	}
 	// cut current line
 	p1 := Position{Row: e.cursor.Row}
-	e.clipboard = e.buf.GetRange(p1, Position{Row: e.cursor.Row, Col: len(e.buf.Line(e.cursor.Row))})
+	e.clipboard = e.buf.GetRange(p1, e.buf.LineEnd(e.cursor))
 	e.clipIsLine = true
 	e.cursor = e.buf.DeleteRange(p1, Position{Row: e.cursor.Row + 1})
 	e.markDirty()
@@ -608,7 +655,7 @@ func (e *Editor) paste() {
 	e.markDirty()
 }
 
-func padTab(s string, tabSize int) string {
+func padTab(s []rune, tabSize int) string {
 	var result strings.Builder
 	col := 0
 	for _, r := range s {
@@ -693,10 +740,10 @@ func (e *Editor) drawSaveAs(f *kero.Frame, y int, width int) {
 
 // startCommandPalette opens the command palette.
 func (e *Editor) startCommandPalette(prefix string) {
-	e.gotoMode = true
-	e.gotoInput = TextInput{Placeholder: " :line, @symbol, or >nexterror"}
-	e.gotoInput.Value = prefix
-	e.gotoInput.Cursor = len([]rune(prefix))
+	e.cmdMode = true
+	e.cmdInput = TextInput{Placeholder: " :line, @symbol, or >dnext"}
+	e.cmdInput.Value = prefix
+	e.cmdInput.Cursor = len([]rune(prefix))
 	e.message = ""
 }
 
@@ -705,11 +752,11 @@ func (e *Editor) updateCommandPalette(key kero.KeyEvent) error {
 	case kero.KeyEnter:
 		return e.finishCommandPalette()
 	case kero.KeyEsc:
-		e.gotoMode = false
+		e.cmdMode = false
 		return nil
 	}
 
-	e.gotoInput.Update(key)
+	e.cmdInput.Update(key)
 	return nil
 }
 
@@ -721,7 +768,7 @@ func (e *Editor) drawCommandPalette(f *kero.Frame, y int, width int) {
 	if inputX >= width {
 		return
 	}
-	e.gotoInput.Draw(f, kero.Rect{X: inputX, Y: y, W: width - inputX, H: 1}, style)
+	e.cmdInput.Draw(f, kero.Rect{X: inputX, Y: y, W: width - inputX, H: 1}, style)
 }
 
 // gotoQueries makes cursor jump to the first matching line, with loose string matching
@@ -822,8 +869,8 @@ func (e *Editor) smartGoto() error {
 }
 
 func (e *Editor) finishCommandPalette() error {
-	input := strings.TrimSpace(e.gotoInput.Value)
-	e.gotoMode = false
+	input := strings.TrimSpace(e.cmdInput.Value)
+	e.cmdMode = false
 	if input == "" {
 		e.message = ""
 		return nil
@@ -833,11 +880,11 @@ func (e *Editor) finishCommandPalette() error {
 	case '>':
 		// run commands
 		switch input {
-		case ">nexterror":
+		case ">dnext":
 			e.nextDiagnostic()
 			return nil
-		case ">preverror":
-			e.previousDiagnostic()
+		case ">dprev":
+			e.prevDiagnostic()
 			return nil
 		default:
 			e.message = "warn: unknown diagnostic command: " + input
@@ -993,6 +1040,8 @@ func (e *Editor) updateFind(ev kero.KeyEvent) error {
 
 	e.findMatch = false
 	e.findInput.Update(ev)
+	// this tidy editor hasn't implemented Go Back/Forward,
+	// don't jump to the first match on typing
 	return nil
 }
 
@@ -1062,7 +1111,8 @@ func (e *Editor) replaceCurrent() error {
 	e.markDirty()
 	e.cursor = replacedEnd
 	e.findMatch = false
-	if e.replaceInput.Value == query && replacedEnd.Col < len(e.buf.Line(replacedEnd.Row)) {
+	// if e.replaceInput.Value == query && replacedEnd.Col < len(e.buf.Line(replacedEnd.Row)) {
+	if e.replaceInput.Value == query && replacedEnd.Col < e.buf.LineEnd(replacedEnd).Col {
 		replacedEnd.Col++
 		e.cursor = replacedEnd
 	}
@@ -1103,13 +1153,7 @@ func (e *Editor) backspace() {
 		e.deleteSelect()
 		return
 	}
-	var p Position
-	if e.cursor.Col > 0 {
-		p = Position{Row: e.cursor.Row, Col: e.cursor.Col - 1}
-	} else if e.cursor.Row > 0 {
-		p = Position{Row: e.cursor.Row - 1, Col: len(e.buf.Line(e.cursor.Row - 1))}
-	}
-	e.cursor = e.buf.DeleteRange(p, e.cursor)
+	e.cursor = e.buf.DeleteRange(e.buf.PrevPos(e.cursor), e.cursor)
 	e.markDirty()
 }
 
@@ -1118,7 +1162,7 @@ func (e *Editor) delete() {
 		e.deleteSelect()
 		return
 	}
-	e.cursor = e.buf.DeleteRange(e.cursor, Position{Row: e.cursor.Row, Col: e.cursor.Col + 1})
+	e.cursor = e.buf.DeleteRange(e.cursor, e.buf.NextPos(e.cursor))
 	e.markDirty()
 }
 
@@ -1136,8 +1180,7 @@ func (e *Editor) deleteToLineEnd() {
 		e.deleteSelect()
 		return
 	}
-	lineEnd := Position{Row: e.cursor.Row, Col: len(e.buf.Line(e.cursor.Row))}
-	e.cursor = e.buf.DeleteRange(e.cursor, lineEnd)
+	e.cursor = e.buf.DeleteRange(e.cursor, e.buf.LineEnd(e.cursor))
 	e.markDirty()
 }
 
@@ -1180,7 +1223,7 @@ func (e *Editor) debounceSyntaxCheck() {
 		return
 	}
 	e.diagnostics = nil
-	version := atomic.AddUint64(&e.diagnosticVersion, 1)
+	version := e.diagnosticVersion.Add(1)
 	if e.diagnosticTimer != nil {
 		e.diagnosticTimer.Stop()
 	}
@@ -1217,7 +1260,7 @@ func (e *Editor) goVet() {
 	if e.diagnosticResult == nil {
 		e.diagnosticResult = make(chan diagnosticResult, 4)
 	}
-	version := atomic.AddUint64(&e.diagnosticVersion, 1)
+	version := e.diagnosticVersion.Add(1)
 	filename := e.path
 	go func() {
 		diagnostics := CheckGoVet(filename)
@@ -1240,7 +1283,7 @@ func (e *Editor) applyDiagnosticResults() {
 	for {
 		select {
 		case result := <-e.diagnosticResult:
-			if result.version == atomic.LoadUint64(&e.diagnosticVersion) {
+			if result.version == e.diagnosticVersion.Load() {
 				e.diagnostics = result.diagnostics
 			}
 		default:
@@ -1281,23 +1324,21 @@ func (e *Editor) nextDiagnostic() {
 	e.cursor = e.buf.ClampPos(Position{Row: diagnostic.Line, Col: diagnostic.Col})
 }
 
-func (e *Editor) previousDiagnostic() {
+func (e *Editor) prevDiagnostic() {
 	if len(e.diagnostics) == 0 {
 		e.message = "no diagnostics"
 		return
 	}
 
-	for i := len(e.diagnostics) - 1; i >= 0; i-- {
-		diagnostic := e.diagnostics[i]
-		if diagnostic.Line < e.cursor.Row ||
-			(diagnostic.Line == e.cursor.Row && diagnostic.Col < e.cursor.Col) {
-			e.cursor = e.buf.ClampPos(Position{Row: diagnostic.Line, Col: diagnostic.Col})
+	for _, d := range slices.Backward(e.diagnostics) {
+		if d.Line < e.cursor.Row || (d.Line == e.cursor.Row && d.Col < e.cursor.Col) {
+			e.cursor = e.buf.ClampPos(Position{Row: d.Line, Col: d.Col})
 			return
 		}
 	}
 
-	diagnostic := e.diagnostics[len(e.diagnostics)-1]
-	e.cursor = e.buf.ClampPos(Position{Row: diagnostic.Line, Col: diagnostic.Col})
+	d := e.diagnostics[len(e.diagnostics)-1]
+	e.cursor = e.buf.ClampPos(Position{Row: d.Line, Col: d.Col})
 }
 
 func isGoFile(path string) bool {
@@ -1521,7 +1562,8 @@ func main() {
 		app.path, app.cursor.Row, app.cursor.Col = parsePathArg(os.Args[1])
 	}
 
-	p := kero.New(app, kero.WithAltScreen(true), kero.WithKitty(true), kero.WithFPS(1))
+	// set FPS for refreshing diagnostic result
+	p := kero.New(app, kero.WithAltScreen(true), kero.WithKitty(true), kero.WithFPS(3))
 	if err := p.Run(); err != nil {
 		panic(err)
 	}

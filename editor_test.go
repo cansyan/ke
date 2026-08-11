@@ -82,8 +82,8 @@ func TestGotoDiagnosticCommands(t *testing.T) {
 		diagnostics: []Diagnostic{{Line: 1, Col: 10}, {Line: 3, Col: 8}},
 	}
 
-	ed.gotoInput.Value = ">preverror"
-	ed.gotoMode = true
+	ed.cmdInput.Value = ">preverror"
+	ed.cmdMode = true
 	if err := ed.finishCommandPalette(); err != nil {
 		t.Fatal(err)
 	}
@@ -91,8 +91,8 @@ func TestGotoDiagnosticCommands(t *testing.T) {
 		t.Fatalf("prev-error cursor = %+v, want (3, 8)", ed.cursor)
 	}
 
-	ed.gotoInput.Value = ">nexterror"
-	ed.gotoMode = true
+	ed.cmdInput.Value = ">nexterror"
+	ed.cmdMode = true
 	if err := ed.finishCommandPalette(); err != nil {
 		t.Fatal(err)
 	}

@@ -8,8 +8,8 @@ import (
 )
 
 type Position struct {
-	Row int
-	Col int
+	Row int // line index, starting at 0
+	Col int // column index, starting at 0
 }
 
 type Buffer struct {
@@ -511,43 +511,43 @@ func (b *Buffer) MoveWordLeft(p Position) Position {
 }
 
 // NextPos returns the Position after stepping one rune right, wrapping lines if needed.
-func (b *Buffer) NextPos(pos Position) Position {
-	lineLen := len(b.Line(pos.Row))
-	if pos.Col < lineLen {
-		return Position{Row: pos.Row, Col: pos.Col + 1}
+func (b *Buffer) NextPos(p Position) Position {
+	lineLen := len(b.Line(p.Row))
+	if p.Col < lineLen {
+		return Position{Row: p.Row, Col: p.Col + 1}
 	}
-	if pos.Row < b.LenLines()-1 {
-		return Position{Row: pos.Row + 1, Col: 0}
+	if p.Row < b.LenLines()-1 {
+		return Position{Row: p.Row + 1, Col: 0}
 	}
-	return pos
+	return p
 }
 
 // PrevPos returns the Position after stepping one rune left, wrapping lines if needed.
-func (b *Buffer) PrevPos(pos Position) Position {
-	if pos.Col > 0 {
-		return Position{Row: pos.Row, Col: pos.Col - 1}
+func (b *Buffer) PrevPos(p Position) Position {
+	if p.Col > 0 {
+		return Position{Row: p.Row, Col: p.Col - 1}
 	}
-	if pos.Row > 0 {
-		prevRow := pos.Row - 1
+	if p.Row > 0 {
+		prevRow := p.Row - 1
 		return Position{Row: prevRow, Col: len(b.Line(prevRow))}
 	}
-	return pos
+	return p
 }
 
 func (b *Buffer) LineStartNonSpace(p Position) Position {
-	if p.Row<0||p.Row>=len(b.lines) {
+	if p.Row < 0 || p.Row >= len(b.lines) {
 		return p
 	}
 	for i, char := range b.lines[p.Row] {
 		if !unicode.IsSpace(char) {
-			return Position{Row:p.Row, Col:i}
+			return Position{Row: p.Row, Col: i}
 		}
 	}
-	return Position{Row:p.Row, Col:0}
+	return Position{Row: p.Row, Col: 0}
 }
 
 func (b *Buffer) LineEnd(p Position) Position {
-	if p.Row<0||p.Row>=len(b.lines) {
+	if p.Row < 0 || p.Row >= len(b.lines) {
 		return p
 	}
 	return Position{Row: p.Row, Col: len(b.lines[p.Row])}
