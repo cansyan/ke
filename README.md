@@ -37,13 +37,6 @@ With Kitty keyboard protocol enabled, Kitty terminal reports Command key:
 - Cmd+Backspace delete to line start
 
 Design Choices:
-- ctrl+[ is identical to ESC in almost all terminal, can't use it for navigating diagnostic
 - future key chords, Ctrl+K or Ctrl+X as leader key are good, but both taken. 
-- Ctrl+Shift+K could a shortcut for deleting the whole line, but Ctrl+L then Delete do the same thing.
-- keep things tiny, avoid duplicate selection, mutilple cursor, undo/redo, jump back/forward.
-
-TODO:
-[ ] CheckGoSyntax generates AST, can help Goto Definition
-[ ] Since Buffer seperated, with a bit changes, Editor can deal with mutiple files.
-	[ ] Ctrl+P open files, Ctrl+Shift+P open command palette
-	[ ] jump to diagnostic error in other file
+- did consider Ctrl+Shift+P for command palette, but the key combo seems unreliable in practice
+- early version should keep things tiny, avoid duplicate selection, mutilple cursor, undo/redo, go back/forward, overlay

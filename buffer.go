@@ -1,10 +1,12 @@
 package main
 
 import (
+	"io"
 	"iter"
 	"slices"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 type Position struct {
@@ -60,13 +62,72 @@ func (b *Buffer) Lines() iter.Seq2[int, []rune] {
 	return slices.All(b.lines)
 }
 
-func (b *Buffer) String() string {
-	var sb strings.Builder
-	for i := 0; i < len(b.lines)-1; i++ {
-		sb.WriteString(string(b.lines[i]))
-		sb.WriteRune('\n')
+// Bytes returns the entire buffer content as a UTF-8 encoded byte slice.
+func (b *Buffer) Bytes() []byte {
+	linesCount := len(b.lines)
+	if linesCount == 0 {
+		return []byte{}
 	}
-	sb.WriteString(string(b.lines[len(b.lines)-1]))
+
+	// 1. Calculate total byte capacity upfront to do a single allocation
+	var totalBytes int
+	for _, line := range b.lines {
+		for _, r := range line {
+			totalBytes += utf8.RuneLen(r)
+		}
+	}
+	// Add room for newline characters ('\n' is 1 byte per line break)
+	totalBytes += (linesCount - 1)
+
+	// 2. Pre-allocate slice buffer
+	buf := make([]byte, 0, totalBytes)
+
+	// 3. Append UTF-8 encoded bytes line by line
+	var runeBuf [utf8.UTFMax]byte
+	for i, line := range b.lines {
+		if i > 0 {
+			buf = append(buf, '\n')
+		}
+		for _, r := range line {
+			n := utf8.EncodeRune(runeBuf[:], r)
+			buf = append(buf, runeBuf[:n]...)
+		}
+	}
+
+	return buf
+}
+
+// String returns the full buffer text as a string, joined by newlines.
+func (b *Buffer) String() string {
+	linesCount := len(b.lines)
+	if linesCount == 0 {
+		return ""
+	}
+
+	// 1. Calculate approximate total byte capacity to minimize allocations
+	var totalBytes int
+	for _, line := range b.lines {
+		for _, r := range line {
+			totalBytes += utf8.RuneLen(r)
+		}
+	}
+	// Add space for newline characters ('\n')
+	totalBytes += (linesCount - 1)
+
+	// 2. Pre-allocate strings.Builder buffer
+	var sb strings.Builder
+	sb.Grow(totalBytes)
+
+	// 3. Write lines joined by newlines
+	for i, line := range b.lines {
+		if i > 0 {
+			sb.WriteByte('\n')
+		}
+		for _, r := range line {
+			sb.WriteRune(r)
+		}
+	}
+
 	return sb.String()
 }
 
@@ -551,4 +612,58 @@ func (b *Buffer) LineEnd(p Position) Position {
 		return p
 	}
 	return Position{Row: p.Row, Col: len(b.lines[p.Row])}
+}
+
+// BufReader implements io.Reader over Buffer lines.
+type BufReader struct {
+	buf       *Buffer
+	lineIdx   int
+	colIdx    int
+	encoded   [utf8.UTFMax]byte
+	encLen    int
+	encOffset int
+}
+
+func (b *Buffer) NewReader() *BufReader {
+	return &BufReader{buf: b}
+}
+
+func (r *BufReader) Read(p []byte) (n int, err error) {
+	if r.lineIdx >= len(r.buf.lines) {
+		return 0, io.EOF
+	}
+
+	for n < len(p) {
+		// Flush remaining encoded bytes from current rune
+		if r.encOffset < r.encLen {
+			p[n] = r.encoded[r.encOffset]
+			n++
+			r.encOffset++
+			continue
+		}
+
+		line := r.buf.lines[r.lineIdx]
+
+		// At end of line, output newline character
+		if r.colIdx >= len(line) {
+			p[n] = '\n'
+			n++
+			r.lineIdx++
+			r.colIdx = 0
+			r.encLen = 0
+			r.encOffset = 0
+			if r.lineIdx >= len(r.buf.lines) {
+				break
+			}
+			continue
+		}
+
+		// Encode next rune
+		runeVal := line[r.colIdx]
+		r.colIdx++
+		r.encLen = utf8.EncodeRune(r.encoded[:], runeVal)
+		r.encOffset = 0
+	}
+
+	return n, nil
 }

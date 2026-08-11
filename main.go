@@ -109,7 +109,7 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 		e.ensureCursorVisible(ctx)
 	}()
 
-	// anytime can quit
+	// can quit at anytime, first priority
 	if key.String() == "ctrl+q" {
 		quitAgain := e.lastKey.String() == "ctrl+q"
 		if e.dirty && !quitAgain {
@@ -134,7 +134,7 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 	case kero.KeyRune:
 		switch key.String() {
 		case "ctrl+g":
-			e.smartGoto()
+			e.GotoDefinition()
 			return nil
 		case "ctrl+p":
 			e.startCommandPalette("")
@@ -222,98 +222,104 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 		}
 		e.insertRune('\t')
 	case kero.KeyBackspace:
-		if key.Mod&(kero.ModCtrl|kero.ModMeta) != 0 {
-			e.deleteToLineStart()
+		if e.hasSelect() {
+			e.deleteSelect()
 			break
 		}
-		// Alt+Backspace: delete previous word
-		if key.Mod&kero.ModAlt != 0 {
+		switch key.String() {
+		case "ctrl+backspace", "cmd+backspace":
+			// delete to line start
+			e.cursor = e.buf.DeleteRange(Position{Row: e.cursor.Row, Col: 0}, e.cursor)
+		case "alt+backspace":
+			// delete word backwards
 			prev := e.buf.MoveWordLeft(e.cursor)
 			e.cursor = e.buf.DeleteRange(prev, e.cursor)
-			e.markDirty()
-			break
+		case "cmd+shift+backspace":
+			// delete whole line
+			e.cursor = e.buf.DeleteRange(Position{Row: e.cursor.Row}, Position{Row: e.cursor.Row + 1})
+		default:
+			e.cursor = e.buf.DeleteRange(e.buf.PrevPos(e.cursor), e.cursor)
 		}
-		e.backspace()
+		e.markDirty()
 	case kero.KeyDelete:
-		e.delete()
+		e.cursor = e.buf.DeleteRange(e.cursor, e.buf.NextPos(e.cursor))
+		e.markDirty()
 	case kero.KeyLeft:
-		// Alt+Left move cursor to start of current/previous word
-		if key.Mod&kero.ModAlt != 0 {
+		switch key.String() {
+		case "alt+left":
 			e.cursor = e.buf.MoveWordLeft(e.cursor)
-			break
-		}
-		if key.Mod&kero.ModMeta != 0 {
+		case "cmd+left":
 			p := e.buf.LineStartNonSpace(e.cursor)
 			if e.cursor == p {
 				e.cursor.Col = 0
 			} else {
 				e.cursor = p
 			}
-			break
-		}
-		// start selection
-		if key.Mod&kero.ModShift != 0 {
+		case "shift+left":
+			// start selection
 			if !e.selecting {
 				e.selecting = true
 				e.selAnchor = e.cursor
 			}
+			e.moveLeft()
+		default:
+			e.moveLeft()
 		}
-		e.moveLeft()
 	case kero.KeyRight:
-		// Alt+Right move cursor to end of current/next word
-		if key.Mod&kero.ModAlt != 0 {
+		switch key.String() {
+		case "alt+right":
 			e.cursor = e.buf.MoveWordRight(e.cursor)
-			break
-		}
-		if key.Mod&kero.ModMeta != 0 {
+		case "cmd+right":
 			e.cursor = e.buf.LineEnd(e.cursor)
-			break
-		}
-		// start selection
-		if key.Mod&kero.ModShift != 0 {
+		case "shift+right":
+			// start selection
 			if !e.selecting {
 				e.selecting = true
 				e.selAnchor = e.cursor
 			}
+			e.moveRight()
+		default:
+			e.moveRight()
 		}
-		e.moveRight()
 	case kero.KeyUp:
-		if key.String() == "cmd+up" {
+		switch key.String() {
+		case "cmd+up":
 			// file start
 			e.cursor.Row = 0
 			e.cursor.Col = 0
-			break
-		}
-		// start selection
-		if key.Mod&kero.ModShift != 0 {
+		case "shift+up":
+			// start selection
 			if !e.selecting {
 				e.selecting = true
 				e.selAnchor = e.cursor
 			}
+			e.moveUp()
+		default:
+			e.moveUp()
 		}
-		e.moveUp()
 	case kero.KeyDown:
-		if key.String() == "cmd+down" {
+		switch key.String() {
+		case "cmd+down":
 			// file end
 			e.cursor.Row = e.buf.LenLines() - 1
 			e.cursor = e.buf.LineEnd(e.cursor)
-			break
-		}
-		// start selection
-		if key.Mod&kero.ModShift != 0 {
+		case "shift+down":
+			// start selection
 			if !e.selecting {
 				e.selecting = true
 				e.selAnchor = e.cursor
 			}
+			e.moveDown()
+		default:
+			e.moveDown()
 		}
-		e.moveDown()
 	case kero.KeyHome:
-		if e.lastKey.Key == kero.KeyHome {
-			// double press goto the actually line start
+		p := e.buf.LineStartNonSpace(e.cursor)
+		if e.cursor == p {
 			e.cursor.Col = 0
 			return nil
 		}
-		e.cursor = e.buf.LineStartNonSpace(e.cursor)
+		e.cursor = p
 	case kero.KeyEnd:
 		e.cursor = e.buf.LineEnd(e.cursor)
 	case kero.KeyPgUp:
@@ -677,7 +683,8 @@ func (e *Editor) save() error {
 		return nil
 	}
 
-	if err := os.WriteFile(e.path, []byte(e.buf.String()+"\n"), 0644); err != nil {
+	data := append(e.buf.Bytes(), '\n')
+	if err := os.WriteFile(e.path, data, 0644); err != nil {
 		e.message = "error: " + err.Error()
 		return nil
 	}
@@ -838,36 +845,6 @@ func (e *Editor) gotoQueries(queries []string) bool {
 	return false
 }
 
-func (e *Editor) smartGoto() error {
-	var target string
-	if e.hasSelect() {
-		target = strings.TrimSpace(e.buf.GetRange(e.selAnchor, e.cursor))
-	} else if start, end := e.buf.WordBounds(e.cursor); start != end {
-		target = strings.TrimSpace(e.buf.GetRange(start, end))
-	}
-
-	if target == "" {
-		e.message = "no word under cursor to goto"
-		return nil
-	}
-
-	defPrefixes := []string{"type", "func", "struct", "var", "const"}
-	for _, prefix := range defPrefixes {
-		if e.gotoQueries([]string{prefix, target}) {
-			// e.message = "goto: " + prefix + " " + target
-			return nil
-		}
-	}
-
-	if e.gotoQueries([]string{target}) {
-		// e.message = "goto: " + target
-		return nil
-	}
-
-	e.message = "no match found for: " + target
-	return nil
-}
-
 func (e *Editor) finishCommandPalette() error {
 	input := strings.TrimSpace(e.cmdInput.Value)
 	e.cmdMode = false
@@ -910,6 +887,7 @@ func (e *Editor) finishCommandPalette() error {
 			e.clearSelect()
 		}
 	case '@':
+		// FIXME: use GotoDefinition instead
 		// "@filter symbol" goto symbol,
 		// filter can be any keyword like Go's type/func/var, or Python's def.
 		if len(input) < 2 {
@@ -1148,33 +1126,6 @@ func (e *Editor) insertRune(r rune) {
 	e.markDirty()
 }
 
-func (e *Editor) backspace() {
-	if e.hasSelect() {
-		e.deleteSelect()
-		return
-	}
-	e.cursor = e.buf.DeleteRange(e.buf.PrevPos(e.cursor), e.cursor)
-	e.markDirty()
-}
-
-func (e *Editor) delete() {
-	if e.hasSelect() {
-		e.deleteSelect()
-		return
-	}
-	e.cursor = e.buf.DeleteRange(e.cursor, e.buf.NextPos(e.cursor))
-	e.markDirty()
-}
-
-func (e *Editor) deleteToLineStart() {
-	if e.hasSelect() {
-		e.deleteSelect()
-		return
-	}
-	e.cursor = e.buf.DeleteRange(Position{Row: e.cursor.Row, Col: 0}, e.cursor)
-	e.markDirty()
-}
-
 func (e *Editor) deleteToLineEnd() {
 	if e.hasSelect() {
 		e.deleteSelect()
@@ -1234,9 +1185,9 @@ func (e *Editor) debounceSyntaxCheck() {
 		e.diagnosticResult = make(chan diagnosticResult, 4)
 	}
 	filename := e.path
-	content := []byte(e.buf.String())
+	src := e.buf.NewReader()
 	e.diagnosticTimer = time.AfterFunc(300*time.Millisecond, func() {
-		diagnostics := CheckGoSyntax(filename, content)
+		diagnostics := CheckGoSyntax(filename, src)
 		result := diagnosticResult{version: version, diagnostics: diagnostics}
 		select {
 		case <-e.diagnosticResult:
@@ -1462,15 +1413,16 @@ type Diagnostic struct {
 	Message string
 }
 
-func CheckGoSyntax(filename string, content []byte) []Diagnostic {
+// CheckGoSyntax checks syntax for Go file.
+// The src parameter must be string, []byte, or [io.Reader].
+func CheckGoSyntax(filename string, src any) []Diagnostic {
 	if !isGoFile(filename) {
 		return nil
 	}
 	fset := token.NewFileSet()
 
 	// ParseHeader or ParseComments keeps it fast
-	// TODO: with the abstract syntax tree, maybe I can do something, like refactor the Goto Definition/Symbol
-	_, err := parser.ParseFile(fset, filename, content, parser.AllErrors)
+	_, err := parser.ParseFile(fset, filename, src, parser.AllErrors)
 	if err == nil {
 		return nil
 	}
@@ -1505,10 +1457,10 @@ func CheckGoVet(filename string) []Diagnostic {
 	cmd := exec.CommandContext(ctx, "go", "vet", dir)
 	cmd.Dir = dir
 	output, _ := cmd.CombinedOutput()
-	return parseVetDiagnostics(string(output))
+	return parseVetOutput(string(output))
 }
 
-func parseVetDiagnostics(output string) []Diagnostic {
+func parseVetOutput(output string) []Diagnostic {
 	var diagnostics []Diagnostic
 	for line := range strings.SplitSeq(output, "\n") {
 		matches := vetDiagnosticPattern.FindStringSubmatch(line)
@@ -1527,6 +1479,20 @@ func parseVetDiagnostics(output string) []Diagnostic {
 		})
 	}
 	return diagnostics
+}
+
+func (e *Editor) GotoDefinition() {
+	reader := e.buf.NewReader()
+
+	// Convert internal 0-based cursor to 1-based for go/token
+	res := FindDefinitionLoc(reader, e.cursor.Row+1, e.cursor.Col+1)
+	if !res.Found {
+		return // Symbol definition not found in current file
+	}
+
+	// Jump editor cursor (converting back to 0-based)
+	e.cursor.Row = res.Line - 1
+	e.cursor.Col = res.Column - 1
 }
 
 // parsePathArg parses an argument of the form "path", "path:row", or

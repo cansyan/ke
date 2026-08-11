@@ -42,7 +42,7 @@ func TestCheckGoSyntax(t *testing.T) {
 
 func TestParseVetDiagnostics(t *testing.T) {
 	output := "vet-example.go:2:5: undefined: missing\nother.go:10:3: some vet issue\n"
-	diagnostics := parseVetDiagnostics(output)
+	diagnostics := parseVetOutput(output)
 	if len(diagnostics) != 2 {
 		t.Fatalf("expected 2 diagnostics, got %d", len(diagnostics))
 	}
@@ -82,7 +82,7 @@ func TestGotoDiagnosticCommands(t *testing.T) {
 		diagnostics: []Diagnostic{{Line: 1, Col: 10}, {Line: 3, Col: 8}},
 	}
 
-	ed.cmdInput.Value = ">preverror"
+	ed.cmdInput.Value = ">dprev"
 	ed.cmdMode = true
 	if err := ed.finishCommandPalette(); err != nil {
 		t.Fatal(err)
@@ -91,7 +91,7 @@ func TestGotoDiagnosticCommands(t *testing.T) {
 		t.Fatalf("prev-error cursor = %+v, want (3, 8)", ed.cursor)
 	}
 
-	ed.cmdInput.Value = ">nexterror"
+	ed.cmdInput.Value = ">dnext"
 	ed.cmdMode = true
 	if err := ed.finishCommandPalette(); err != nil {
 		t.Fatal(err)
@@ -323,7 +323,7 @@ func TestWordUnderCursor(t *testing.T) {
 	}
 }
 
-func TestSmartGoto(t *testing.T) {
+func TestGotoDefinition(t *testing.T) {
 	ed := &Editor{
 		buf: NewBuffer(strings.Join([]string{
 			"package main",
@@ -345,8 +345,7 @@ func TestSmartGoto(t *testing.T) {
 
 	ctx := &kero.Context{Width: 80, Height: 24}
 
-	// Press Ctrl+]
-	ev := kero.KeyEvent{Key: kero.KeyRune, Rune: ']', Mod: kero.ModCtrl}
+	ev := kero.KeyEvent{Key: kero.KeyRune, Rune: 'g', Mod: kero.ModCtrl}
 	if err := ed.Update(ctx, ev); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
