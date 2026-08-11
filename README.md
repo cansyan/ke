@@ -21,8 +21,8 @@ Key bindings:
 - Ctrl+Backspace delete to line start
 - Ctrl+K delete to line end
 - Ctrl+Enter insert line below
-- Home move cursor to the first non-whitespace character, double pressed to line start
-- End move cursor to line end
+- Ctrl+A or Home move cursor to line start
+- Ctrl+E or End move cursor to line end
 - Alt+Left move cursor to start of current/previous word
 - Alt+Right move cursor to end of current/next word
 - Alt+Backspace delete word backwards

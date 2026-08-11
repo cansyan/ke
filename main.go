@@ -74,7 +74,6 @@ func (e *Editor) Init(ctx *kero.Context) error {
 		e.buf = NewBuffer("")
 		e.cursor.Row, e.cursor.Col = 0, 0
 		e.message = "new buffer"
-		e.debounceSyntaxCheck()
 		return nil
 	}
 
@@ -84,7 +83,6 @@ func (e *Editor) Init(ctx *kero.Context) error {
 			e.buf = NewBuffer("")
 			e.cursor.Row, e.cursor.Col = 0, 0
 			e.message = "new file"
-			e.debounceSyntaxCheck()
 			return nil
 		}
 		return err
@@ -95,7 +93,7 @@ func (e *Editor) Init(ctx *kero.Context) error {
 	e.buf = NewBuffer(text)
 	e.cursor = e.buf.ClampPos(e.cursor)
 	e.ensureCursorVisible(ctx)
-	e.debounceSyntaxCheck()
+	e.goVet()
 	return nil
 }
 
@@ -186,6 +184,15 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 		case "ctrl+k":
 			e.deleteToLineEnd()
 			return nil
+		case "ctrl+a":
+			if e.lastKey.String() == "ctrl+a" {
+				// double press goto the actually line start
+				e.cursor.Col = 0
+				return nil
+			}
+			e.cursor = e.buf.LineStartNonSpace(e.cursor)
+		case "ctrl+e":
+			e.cursor = e.buf.LineEnd(e.cursor)
 		}
 		if key.Mod != 0 {
 			break
@@ -259,18 +266,13 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 		e.moveDown()
 	case kero.KeyHome:
 		if e.lastKey.Key == kero.KeyHome {
+			// double press goto the actually line start
 			e.cursor.Col = 0
 			return nil
 		}
-		for i, char := range e.buf.Line(e.cursor.Row) {
-			if !unicode.IsSpace(char) {
-				e.cursor.Col = i
-				return nil
-			}
-		}
-		e.cursor.Col = 0
+		e.cursor = e.buf.LineStartNonSpace(e.cursor)
 	case kero.KeyEnd:
-		e.cursor.Col = len(e.buf.Line(e.cursor.Row))
+		e.cursor = e.buf.LineEnd(e.cursor)
 	case kero.KeyPgUp:
 		e.cursor.Row -= editorHeight(ctx)
 		e.cursor = e.buf.ClampPos(e.cursor)
@@ -403,13 +405,13 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 			}
 		}
 		if dmsg != "" {
-			dmsg = "| " + dmsg
 			diagnosticStyle := kero.NewStyle().Foreground(kero.ColorRed).Reverse()
 			statusWidth := len([]rune(status))
+			f.Write(statusWidth+1, statusY, "| ", statusStyle)
 			keyWidth := len([]rune(e.lastKey.String()))
 			remainWidth := ctx.Width - statusWidth - keyWidth
 			if remainWidth > 0 {
-				f.Write(statusWidth+1, statusY, trimToWidth(dmsg, remainWidth), diagnosticStyle)
+				f.Write(statusWidth+3, statusY, trimToWidth(dmsg, remainWidth), diagnosticStyle)
 			}
 		}
 		if e.lastKey.Key != kero.KeyUnknown {
@@ -635,7 +637,7 @@ func (e *Editor) save() error {
 
 	e.dirty = false
 	e.message = fmt.Sprintf("saved %s", filepath.Base(e.path))
-	e.scheduleVetOnSave()
+	e.goVet()
 	return nil
 }
 
@@ -1204,9 +1206,8 @@ func (e *Editor) debounceSyntaxCheck() {
 	})
 }
 
-// scheduleVetOnSave run external go vet process, triggered on save.
-// To keep it predictable, align the names by Execution Phase
-func (e *Editor) scheduleVetOnSave() {
+// goVet run external go vet process, triggered on app launch or save.
+func (e *Editor) goVet() {
 	if e.buf == nil || !isGoFile(e.path) {
 		return
 	}

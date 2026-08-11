@@ -533,3 +533,22 @@ func (b *Buffer) PrevPos(pos Position) Position {
 	}
 	return pos
 }
+
+func (b *Buffer) LineStartNonSpace(p Position) Position {
+	if p.Row<0||p.Row>=len(b.lines) {
+		return p
+	}
+	for i, char := range b.lines[p.Row] {
+		if !unicode.IsSpace(char) {
+			return Position{Row:p.Row, Col:i}
+		}
+	}
+	return Position{Row:p.Row, Col:0}
+}
+
+func (b *Buffer) LineEnd(p Position) Position {
+	if p.Row<0||p.Row>=len(b.lines) {
+		return p
+	}
+	return Position{Row: p.Row, Col: len(b.lines[p.Row])}
+}
