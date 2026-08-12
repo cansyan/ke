@@ -18,8 +18,8 @@ Key bindings:
 - Ctrl+G goto definition
 - Ctrl+P command palette
 	- `:123` goto line 123
-    - `>dnext` goto next diagnostic error
-    - `>dprev` goto previous diagnostic error
+    - `/dnext` goto next diagnostic error
+    - `/dprev` goto previous diagnostic error
 - Ctrl+Backspace delete to line start
 - Ctrl+K delete to line end
 - Ctrl+Enter insert line below
@@ -42,3 +42,4 @@ Design Choices:
 - future key chords, Ctrl+K or Ctrl+X as leader key are good, but both taken. 
 - did consider Ctrl+Shift+P for command palette, but the key combo seems unreliable in practice
 - early version should keep things tiny, avoid duplicate selection, mutilple cursor, undo/redo, go back/forward
+- using / as command prefix is more convenient than > (shift+.)

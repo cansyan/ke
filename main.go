@@ -60,17 +60,17 @@ type Editor struct {
 
 	lastKey kero.KeyEvent
 
-	diagnostics       []Diagnostic
-	diagnosticTimer   *time.Timer
-	diagnosticResult  chan diagnosticResult
-	diagnosticVersion atomic.Uint64
+	vets       []vet
+	vetTimer   *time.Timer
+	vetResult  chan vetResult
+	vetVersion atomic.Uint64
 
 	picker SymbolPicker
 }
 
-type diagnosticResult struct {
+type vetResult struct {
 	version     uint64
-	diagnostics []Diagnostic
+	vets []vet
 }
 
 func (e *Editor) Init(ctx *kero.Context) error {
@@ -102,7 +102,7 @@ func (e *Editor) Init(ctx *kero.Context) error {
 }
 
 func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
-	e.applyDiagnosticResults()
+	e.applyVetResults()
 	key, ok := ev.(kero.KeyEvent)
 	if !ok {
 		return nil
@@ -149,7 +149,7 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 			e.startCmdPalette("")
 			return nil
 		case "ctrl+]":
-			e.nextDiagnostic()
+			e.nextVet()
 			return nil
 		case "ctrl+s":
 			return e.save()
@@ -201,7 +201,7 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 		if e.hasSelect() {
 			e.deleteSelect()
 		}
-		// FIXME: must distinct the Enter from typing and pasting, otherwise pasting mess up indentation
+		// FIXME: must distinguish the Enter from manual keypress and a pasted block of text, otherwise pasting mess up indentation
 		var n int
 		line := e.buf.Line(e.cursor.Row)
 		for _, b := range line {
@@ -376,7 +376,7 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 		}
 
 		f.Write(1, y, fmt.Sprintf("%*d ", lineNoW, lineIndex+1), lineNoStyle)
-		if e.hasDiagnostic(lineIndex) {
+		if e.hasvet(lineIndex) {
 			f.Write(0, y, "!", kero.NewStyle().Foreground(kero.ColorRed))
 		}
 
@@ -468,21 +468,18 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 		}
 		f.Fill(kero.Rect{X: 0, Y: statusY, W: ctx.Width, H: 1}, ' ', statusStyle)
 		f.Write(0, statusY, trimToWidth(status, ctx.Width), statusStyle)
-		var problem string
-		if len(e.diagnostics) > 0 {
-			problem = fmt.Sprintf("found %d error, press ctrl+] to jump", len(e.diagnostics))
-			if dd, ok := e.diagnosticForLine(e.cursor.Row); ok {
-				problem = dd.Message
+		if len(e.vets) > 0 {
+			warn := fmt.Sprintf("found %d error, press ctrl+] to jump", len(e.vets))
+			if dd, ok := e.vetForLine(e.cursor.Row); ok {
+				warn = dd.Message
 			}
-		}
-		if problem != "" {
-			diagnosticStyle := kero.NewStyle().Foreground(kero.ColorRed).Reverse()
+			vetStyle := kero.NewStyle().Foreground(kero.ColorRed).Reverse()
 			statusWidth := len([]rune(status))
 			f.Write(statusWidth+1, statusY, "| ", statusStyle)
 			keyWidth := len([]rune(e.lastKey.String()))
 			remainWidth := ctx.Width - statusWidth - keyWidth
 			if remainWidth > 0 {
-				f.Write(statusWidth+3, statusY, trimToWidth(problem, remainWidth), diagnosticStyle)
+				f.Write(statusWidth+3, statusY, trimToWidth(warn, remainWidth), vetStyle)
 			}
 		}
 		if e.lastKey.Key != kero.KeyUnknown {
@@ -510,7 +507,7 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 			return
 		}
 		if e.message == "" {
-			e.message = "^S save | ^Q quit | ^F find | ^. select| ^C copy | ^X Cut | ^V paste | ^P goto | ^N next diagnostic"
+			e.message = "^S save | ^Q quit | ^F find | ^G definition | ^R symbols"
 		}
 		f.Write(0, messageY, trimToWidth(" "+e.message, ctx.Width), messageStyle)
 	}
@@ -806,13 +803,13 @@ func (e *Editor) finishCmdPalette() error {
 		// run commands
 		switch input {
 		case "/dnext":
-			e.nextDiagnostic()
+			e.nextVet()
 			return nil
 		case "/dprev":
-			e.prevDiagnostic()
+			e.prevvet()
 			return nil
 		default:
-			return errors.New("warn: unknown diagnostic command: " + input)
+			return errors.New("warn: unknown command: " + input)
 		}
 	case ':':
 		// goto line, for example :123
@@ -1101,28 +1098,28 @@ func (e *Editor) debounceSyntaxCheck() {
 	if e.buf == nil {
 		return
 	}
-	e.diagnostics = nil
-	version := e.diagnosticVersion.Add(1)
-	if e.diagnosticTimer != nil {
-		e.diagnosticTimer.Stop()
+	e.vets = nil
+	version := e.vetVersion.Add(1)
+	if e.vetTimer != nil {
+		e.vetTimer.Stop()
 	}
 	if !isGoFile(e.path) {
 		return
 	}
-	if e.diagnosticResult == nil {
-		e.diagnosticResult = make(chan diagnosticResult, 4)
+	if e.vetResult == nil {
+		e.vetResult = make(chan vetResult, 4)
 	}
 	filename := e.path
 	src := e.buf.NewReader()
-	e.diagnosticTimer = time.AfterFunc(300*time.Millisecond, func() {
-		diagnostics := CheckGoSyntax(filename, src)
-		result := diagnosticResult{version: version, diagnostics: diagnostics}
+	e.vetTimer = time.AfterFunc(300*time.Millisecond, func() {
+		vets := CheckGoSyntax(filename, src)
+		result := vetResult{version: version, vets: vets}
 		select {
-		case <-e.diagnosticResult:
+		case <-e.vetResult:
 		default:
 		}
 		select {
-		case e.diagnosticResult <- result:
+		case e.vetResult <- result:
 		default:
 		}
 	})
@@ -1133,37 +1130,37 @@ func (e *Editor) goVet() {
 	if e.buf == nil || !isGoFile(e.path) {
 		return
 	}
-	if e.diagnosticTimer != nil {
-		e.diagnosticTimer.Stop()
+	if e.vetTimer != nil {
+		e.vetTimer.Stop()
 	}
-	if e.diagnosticResult == nil {
-		e.diagnosticResult = make(chan diagnosticResult, 4)
+	if e.vetResult == nil {
+		e.vetResult = make(chan vetResult, 4)
 	}
-	version := e.diagnosticVersion.Add(1)
+	version := e.vetVersion.Add(1)
 	filename := e.path
 	go func() {
-		diagnostics := CheckGoVet(filename)
-		result := diagnosticResult{version: version, diagnostics: diagnostics}
+		vets := CheckGoVet(filename)
+		result := vetResult{version: version, vets: vets}
 		select {
-		case <-e.diagnosticResult:
+		case <-e.vetResult:
 		default:
 		}
 		select {
-		case e.diagnosticResult <- result:
+		case e.vetResult <- result:
 		default:
 		}
 	}()
 }
 
-func (e *Editor) applyDiagnosticResults() {
-	if e.diagnosticResult == nil {
+func (e *Editor) applyVetResults() {
+	if e.vetResult == nil {
 		return
 	}
 	for {
 		select {
-		case result := <-e.diagnosticResult:
-			if result.version == e.diagnosticVersion.Load() {
-				e.diagnostics = result.diagnostics
+		case result := <-e.vetResult:
+			if result.version == e.vetVersion.Load() {
+				e.vets = result.vets
 			}
 		default:
 			return
@@ -1171,52 +1168,52 @@ func (e *Editor) applyDiagnosticResults() {
 	}
 }
 
-func (e *Editor) hasDiagnostic(row int) bool {
-	_, ok := e.diagnosticForLine(row)
+func (e *Editor) hasvet(row int) bool {
+	_, ok := e.vetForLine(row)
 	return ok
 }
 
-func (e *Editor) diagnosticForLine(row int) (Diagnostic, bool) {
-	for _, diagnostic := range e.diagnostics {
-		if diagnostic.Line == row {
-			return diagnostic, true
+func (e *Editor) vetForLine(row int) (vet, bool) {
+	for _, vet := range e.vets {
+		if vet.Line == row {
+			return vet, true
 		}
 	}
-	return Diagnostic{}, false
+	return vet{}, false
 }
 
-func (e *Editor) nextDiagnostic() {
-	if len(e.diagnostics) == 0 {
-		e.message = "no diagnostics"
+func (e *Editor) nextVet() {
+	if len(e.vets) == 0 {
+		e.message = "no vets"
 		return
 	}
 
-	for _, diagnostic := range e.diagnostics {
-		if diagnostic.Line > e.cursor.Row ||
-			(diagnostic.Line == e.cursor.Row && diagnostic.Col > e.cursor.Col) {
-			e.cursor = e.buf.ClampPos(Position{Row: diagnostic.Line, Col: diagnostic.Col})
+	for _, vet := range e.vets {
+		if vet.Line > e.cursor.Row ||
+			(vet.Line == e.cursor.Row && vet.Col > e.cursor.Col) {
+			e.cursor = e.buf.ClampPos(Position{Row: vet.Line, Col: vet.Col})
 			return
 		}
 	}
 
-	diagnostic := e.diagnostics[0]
-	e.cursor = e.buf.ClampPos(Position{Row: diagnostic.Line, Col: diagnostic.Col})
+	vet := e.vets[0]
+	e.cursor = e.buf.ClampPos(Position{Row: vet.Line, Col: vet.Col})
 }
 
-func (e *Editor) prevDiagnostic() {
-	if len(e.diagnostics) == 0 {
-		e.message = "no diagnostics"
+func (e *Editor) prevvet() {
+	if len(e.vets) == 0 {
+		e.message = "no vets"
 		return
 	}
 
-	for _, d := range slices.Backward(e.diagnostics) {
+	for _, d := range slices.Backward(e.vets) {
 		if d.Line < e.cursor.Row || (d.Line == e.cursor.Row && d.Col < e.cursor.Col) {
 			e.cursor = e.buf.ClampPos(Position{Row: d.Line, Col: d.Col})
 			return
 		}
 	}
 
-	d := e.diagnostics[len(e.diagnostics)-1]
+	d := e.vets[len(e.vets)-1]
 	e.cursor = e.buf.ClampPos(Position{Row: d.Line, Col: d.Col})
 }
 
@@ -1335,7 +1332,7 @@ func trimToWidth(s string, width int) string {
 	return string(runes[:width])
 }
 
-type Diagnostic struct {
+type vet struct {
 	Line    int
 	Col     int
 	Message string
@@ -1343,7 +1340,7 @@ type Diagnostic struct {
 
 // CheckGoSyntax checks syntax for Go file.
 // The src parameter must be string, []byte, or [io.Reader].
-func CheckGoSyntax(filename string, src any) []Diagnostic {
+func CheckGoSyntax(filename string, src any) []vet {
 	if !isGoFile(filename) {
 		return nil
 	}
@@ -1355,10 +1352,10 @@ func CheckGoSyntax(filename string, src any) []Diagnostic {
 		return nil
 	}
 
-	var diagnostics []Diagnostic
+	var vets []vet
 	if scannerErr, ok := err.(scanner.ErrorList); ok {
 		for _, e := range scannerErr {
-			diagnostics = append(diagnostics, Diagnostic{
+			vets = append(vets, vet{
 				Line:    e.Pos.Line - 1,
 				Col:     e.Pos.Column - 1,
 				Message: e.Msg,
@@ -1366,12 +1363,12 @@ func CheckGoSyntax(filename string, src any) []Diagnostic {
 		}
 	}
 
-	return diagnostics
+	return vets
 }
 
-var vetDiagnosticPattern = regexp.MustCompile(`^.*:([0-9]+):([0-9]+): (.*)$`)
+var vetvetPattern = regexp.MustCompile(`^.*:([0-9]+):([0-9]+): (.*)$`)
 
-func CheckGoVet(filename string) []Diagnostic {
+func CheckGoVet(filename string) []vet {
 	if !isGoFile(filename) {
 		return nil
 	}
@@ -1388,10 +1385,10 @@ func CheckGoVet(filename string) []Diagnostic {
 	return parseVetOutput(string(output))
 }
 
-func parseVetOutput(output string) []Diagnostic {
-	var diagnostics []Diagnostic
+func parseVetOutput(output string) []vet {
+	var vets []vet
 	for line := range strings.SplitSeq(output, "\n") {
-		matches := vetDiagnosticPattern.FindStringSubmatch(line)
+		matches := vetvetPattern.FindStringSubmatch(line)
 		if len(matches) != 4 {
 			continue
 		}
@@ -1400,13 +1397,13 @@ func parseVetOutput(output string) []Diagnostic {
 		if errLine != nil || errColumn != nil {
 			continue
 		}
-		diagnostics = append(diagnostics, Diagnostic{
+		vets = append(vets, vet{
 			Line:    lineNumber - 1,
 			Col:     column - 1,
 			Message: matches[3],
 		})
 	}
-	return diagnostics
+	return vets
 }
 
 func (e *Editor) GotoDefinition() {
@@ -1535,7 +1532,7 @@ func main() {
 		app.path, app.cursor.Row, app.cursor.Col = parsePathArg(os.Args[1])
 	}
 
-	// set FPS for refreshing diagnostic result
+	// set FPS for refreshing vet result
 	p := kero.New(app, kero.WithAltScreen(true), kero.WithKitty(true), kero.WithFPS(3))
 	if err := p.Run(); err != nil {
 		panic(err)

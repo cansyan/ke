@@ -25,61 +25,61 @@ func TestDisplayColumnAndRuneIndex(t *testing.T) {
 }
 
 func TestCheckGoSyntax(t *testing.T) {
-	diagnostics := CheckGoSyntax("example.go", []byte("package main\n\nfunc main( {\n"))
-	if len(diagnostics) == 0 {
-		t.Fatal("CheckGoSyntax returned no diagnostics for invalid Go")
+	vets := CheckGoSyntax("example.go", []byte("package main\n\nfunc main( {\n"))
+	if len(vets) == 0 {
+		t.Fatal("CheckGoSyntax returned no vets for invalid Go")
 	}
-	if diagnostics[0].Line != 2 {
-		t.Errorf("diagnostic line = %d, want 2", diagnostics[0].Line)
+	if vets[0].Line != 2 {
+		t.Errorf("vet line = %d, want 2", vets[0].Line)
 	}
-	if diagnostics[0].Message == "" {
-		t.Error("diagnostic message is empty")
+	if vets[0].Message == "" {
+		t.Error("vet message is empty")
 	}
-	if diagnostics := CheckGoSyntax("example.txt", []byte("func main( {\n")); diagnostics != nil {
-		t.Fatalf("CheckGoSyntax returned diagnostics for non-Go file: %+v", diagnostics)
+	if vets := CheckGoSyntax("example.txt", []byte("func main( {\n")); vets != nil {
+		t.Fatalf("CheckGoSyntax returned vets for non-Go file: %+v", vets)
 	}
 }
 
-func TestParseVetDiagnostics(t *testing.T) {
+func TestParseVetvets(t *testing.T) {
 	output := "vet-example.go:2:5: undefined: missing\nother.go:10:3: some vet issue\n"
-	diagnostics := parseVetOutput(output)
-	if len(diagnostics) != 2 {
-		t.Fatalf("expected 2 diagnostics, got %d", len(diagnostics))
+	vets := parseVetOutput(output)
+	if len(vets) != 2 {
+		t.Fatalf("expected 2 vets, got %d", len(vets))
 	}
-	if diagnostics[0].Line != 1 || diagnostics[0].Col != 4 {
-		t.Fatalf("first diagnostic pos = (%d,%d), want (1,4)", diagnostics[0].Line, diagnostics[0].Col)
+	if vets[0].Line != 1 || vets[0].Col != 4 {
+		t.Fatalf("first vet pos = (%d,%d), want (1,4)", vets[0].Line, vets[0].Col)
 	}
-	if !strings.Contains(diagnostics[0].Message, "undefined") {
-		t.Fatalf("first diagnostic message = %q", diagnostics[0].Message)
+	if !strings.Contains(vets[0].Message, "undefined") {
+		t.Fatalf("first vet message = %q", vets[0].Message)
 	}
 }
 
-func TestNextDiagnostic(t *testing.T) {
+func TestNextvet(t *testing.T) {
 	ed := &Editor{
 		buf:         NewBuffer("package main\nfunc main( {\n}\nvar x = ("),
 		cursor:      Position{Row: 0, Col: 0},
-		diagnostics: []Diagnostic{{Line: 1, Col: 10}, {Line: 3, Col: 8}},
+		vets: []vet{{Line: 1, Col: 10}, {Line: 3, Col: 8}},
 	}
 
-	ed.nextDiagnostic()
+	ed.nextVet()
 	if ed.cursor != (Position{Row: 1, Col: 10}) {
-		t.Fatalf("first diagnostic cursor = %+v, want (1, 10)", ed.cursor)
+		t.Fatalf("first vet cursor = %+v, want (1, 10)", ed.cursor)
 	}
-	ed.nextDiagnostic()
+	ed.nextVet()
 	if ed.cursor != (Position{Row: 3, Col: 8}) {
-		t.Fatalf("second diagnostic cursor = %+v, want (3, 8)", ed.cursor)
+		t.Fatalf("second vet cursor = %+v, want (3, 8)", ed.cursor)
 	}
-	ed.nextDiagnostic()
+	ed.nextVet()
 	if ed.cursor != (Position{Row: 1, Col: 10}) {
-		t.Fatalf("wrapped diagnostic cursor = %+v, want (1, 10)", ed.cursor)
+		t.Fatalf("wrapped vet cursor = %+v, want (1, 10)", ed.cursor)
 	}
 }
 
-func TestGotoDiagnosticCommands(t *testing.T) {
+func TestGotovetCommands(t *testing.T) {
 	ed := &Editor{
 		buf:         NewBuffer("package main\nfunc main( {\n}\nvar x = ("),
 		cursor:      Position{Row: 3, Col: 20},
-		diagnostics: []Diagnostic{{Line: 1, Col: 10}, {Line: 3, Col: 8}},
+		vets: []vet{{Line: 1, Col: 10}, {Line: 3, Col: 8}},
 	}
 
 	ed.cmdInput.Value = "/dprev"
