@@ -4,6 +4,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"strings"
 )
 
 // DefinitionResult holds the target location for a definition jump.
@@ -249,4 +250,22 @@ func ExtractAllSymbols(src any) []SymbolLocation {
 	}
 
 	return results
+}
+
+// FilterSymbols returns top-level symbols whose names contain query (case-insensitive).
+func FilterSymbols(src []SymbolLocation, query string) []SymbolLocation {
+	if query == "" {
+		return src
+	}
+
+	queryLower := strings.ToLower(query)
+	var matches []SymbolLocation
+
+	for _, sym := range src {
+		if strings.Contains(strings.ToLower(sym.Name), queryLower) {
+			matches = append(matches, sym)
+		}
+	}
+
+	return matches
 }

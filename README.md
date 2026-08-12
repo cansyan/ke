@@ -2,10 +2,13 @@ Key bindings:
 - Ctrl+S save
 - Ctrl+Q quit
 - Ctrl+F find
-- Ctrl+R toggle replace while finding
-	- Enter replace current match and move to the next match
-	- Ctrl+Enter replace all matches
-	- Tab skip current match and move to the next match
+	- Enter next match
+	- Shift+Enter previous match
+	- Ctrl+R toggle replace while finding
+		- Enter replace current match and move to the next match
+		- Ctrl+Enter replace all matches
+		- Tab skip current match and move to the next match
+- Ctrl+R start symbol picker
 - Shift+Up/Down/Left/Right start selection
 	- Ctrl+D select word under cursor
 	- Ctrl+L expand selection to line
@@ -15,7 +18,6 @@ Key bindings:
 - Ctrl+G goto definition
 - Ctrl+P command palette
 	- `:123` goto line 123
-	- `@symbol` goto symbol
     - `>dnext` goto next diagnostic error
     - `>dprev` goto previous diagnostic error
 - Ctrl+Backspace delete to line start
@@ -29,7 +31,7 @@ Key bindings:
 - Alt+Backspace delete word backwards
 - Esc cancel
 
-With Kitty keyboard protocol enabled, Kitty terminal reports Command key:
+Command keys are supported in Kitty terminal:
 - Cmd+Up move cursor to file start
 - Cmd+Down move cursor to find end
 - Cmd+Left move cursor to line start
@@ -39,4 +41,4 @@ With Kitty keyboard protocol enabled, Kitty terminal reports Command key:
 Design Choices:
 - future key chords, Ctrl+K or Ctrl+X as leader key are good, but both taken. 
 - did consider Ctrl+Shift+P for command palette, but the key combo seems unreliable in practice
-- early version should keep things tiny, avoid duplicate selection, mutilple cursor, undo/redo, go back/forward, overlay
+- early version should keep things tiny, avoid duplicate selection, mutilple cursor, undo/redo, go back/forward

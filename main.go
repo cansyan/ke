@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"go/parser"
 	"go/scanner"
@@ -63,6 +64,8 @@ type Editor struct {
 	diagnosticTimer   *time.Timer
 	diagnosticResult  chan diagnosticResult
 	diagnosticVersion atomic.Uint64
+
+	picker SymbolPicker
 }
 
 type diagnosticResult struct {
@@ -129,10 +132,16 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 	if e.cmdMode {
 		return e.updateCmdPalette(key)
 	}
+	if e.picker.Active {
+		e.updateSymbolPicker(key)
+		return nil
+	}
 
 	switch key.Key {
 	case kero.KeyRune:
 		switch key.String() {
+		case "ctrl+r":
+			e.OpenSymbolPicker()
 		case "ctrl+g":
 			e.GotoDefinition()
 			return nil
@@ -192,6 +201,7 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 		if e.hasSelect() {
 			e.deleteSelect()
 		}
+		// FIXME: must distinct the Enter from typing and pasting, otherwise pasting mess up indentation
 		var n int
 		line := e.buf.Line(e.cursor.Row)
 		for _, b := range line {
@@ -495,6 +505,10 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 			e.drawFind(f, messageY, ctx.Width)
 			return
 		}
+		if e.picker.Active {
+			e.drawSymbolPicker(f, messageY, ctx.Width)
+			return
+		}
 		if e.message == "" {
 			e.message = "^S save | ^Q quit | ^F find | ^. select| ^C copy | ^X Cut | ^V paste | ^P goto | ^N next diagnostic"
 		}
@@ -748,7 +762,7 @@ func (e *Editor) drawSaveAs(f *kero.Frame, y int, width int) {
 // startCmdPalette opens the command palette.
 func (e *Editor) startCmdPalette(prefix string) {
 	e.cmdMode = true
-	e.cmdInput = TextInput{Placeholder: " :line, @symbol, or >dnext"}
+	e.cmdInput = TextInput{Placeholder: " >command or :line"}
 	e.cmdInput.Value = prefix
 	e.cmdInput.Cursor = len([]rune(prefix))
 	e.message = ""
@@ -757,13 +771,15 @@ func (e *Editor) startCmdPalette(prefix string) {
 func (e *Editor) updateCmdPalette(key kero.KeyEvent) error {
 	switch key.Key {
 	case kero.KeyEnter:
-		return e.finishCmdPalette()
+		err := e.finishCmdPalette()
+		if err != nil {
+			e.message = err.Error()
+		}
 	case kero.KeyEsc:
 		e.cmdMode = false
-		return nil
+	default:
+		e.cmdInput.Update(key)
 	}
-
-	e.cmdInput.Update(key)
 	return nil
 }
 
@@ -782,22 +798,21 @@ func (e *Editor) finishCmdPalette() error {
 	input := strings.TrimSpace(e.cmdInput.Value)
 	e.cmdMode = false
 	if input == "" {
-		e.message = ""
 		return nil
 	}
 
 	switch input[0] {
-	case '>':
+	case '/':
 		// run commands
 		switch input {
-		case ">dnext":
+		case "/dnext":
 			e.nextDiagnostic()
 			return nil
-		case ">dprev":
+		case "/dprev":
 			e.prevDiagnostic()
 			return nil
 		default:
-			e.message = "warn: unknown diagnostic command: " + input
+			return errors.New("warn: unknown diagnostic command: " + input)
 		}
 	case ':':
 		// goto line, for example :123
@@ -807,37 +822,18 @@ func (e *Editor) finishCmdPalette() error {
 		lineStr := strings.TrimSpace(input[1:])
 		lineNum, err := strconv.Atoi(lineStr)
 		if err != nil {
-			e.message = "invalid line number: " + lineStr
-			return nil
+			return errors.New("invalid line number: " + lineStr)
 		}
 		if lineNum < 1 || lineNum > e.buf.LenLines() {
-			e.message = "line number out of range"
-			return nil
+			return errors.New("line number out of range")
 		}
 		e.cursor.Row = lineNum - 1
 		e.cursor.Col = 0
 		if e.hasSelect() {
 			e.clearSelect()
 		}
-	case '@':
-		// TODO: fuzzy match, or symbol picker overlay
-		// goto symbol, for example @main
-		if len(input) < 2 {
-			return nil
-		}
-		query := input[1:]
-		if len(query) == 0 {
-			e.message = "symbol required after @"
-			return nil
-		}
-		e.GotoSymbol(query)
-		if e.hasSelect() {
-			e.clearSelect()
-		}
-	default:
-		e.message = "warn: goto-anything must start with : or @"
 	}
-	return nil
+	return errors.New("warn: command must start with / or :")
 }
 
 func (e *Editor) startFind() {
@@ -1436,6 +1432,74 @@ func (e *Editor) GotoSymbol(name string) {
 	// Move cursor (converting 1-based line/col to 0-based)
 	e.cursor.Row = loc.Line - 1
 	e.cursor.Col = loc.Column - 1
+}
+
+type SymbolPicker struct {
+	Active   bool
+	Input    TextInput
+	Symbols  []SymbolLocation
+	Filtered []SymbolLocation
+	Index    int // selected index
+}
+
+func (e *Editor) updateSymbolPicker(ev kero.KeyEvent) {
+	prevQuery := e.picker.Input.Value
+	switch ev.String() {
+	case "esc":
+		// Close overlay
+		e.picker.Active = false
+	case "enter":
+		if len(e.picker.Filtered) == 0 {
+			return
+		}
+		picked := e.picker.Filtered[e.picker.Index]
+		e.cursor.Row = picked.Line - 1
+		e.cursor.Col = picked.Column - 1
+		e.picker.Active = false
+	case "up", "ctrl+p":
+		e.picker.Index = (e.picker.Index - 1 + len(e.picker.Filtered)) % len(e.picker.Filtered)
+	case "down", "ctrl+n":
+		e.picker.Index = (e.picker.Index + 1) % len(e.picker.Filtered)
+	default:
+		e.picker.Input.Update(ev)
+	}
+	if q := e.picker.Input.Value; q != prevQuery {
+		e.picker.Filtered = FilterSymbols(e.picker.Symbols, q)
+		e.picker.Index = 0
+	}
+}
+
+func (e *Editor) drawSymbolPicker(f *kero.Frame, y, width int) {
+	normal := kero.NewStyle()
+	prompt := "Goto Symbol: "
+	f.Write(0, y, prompt, normal.Foreground(kero.ColorYellow))
+
+	p := e.picker
+	inputX := len([]rune(prompt))
+	p.Input.Draw(f, kero.Rect{X: inputX, Y: y, W: width, H: 1}, normal.Foreground(kero.ColorYellow))
+
+	// render the symbol list above the editor buffer
+	n := min(len(p.Filtered), 8)
+	rect := kero.Rect{X: inputX, Y: y - n, W: width, H: n}
+	f.Fill(rect, ' ', normal.Reverse())
+	// TODO: ensure the selected item visible
+	for i := range rect.H {
+		if i == p.Index {
+			f.Write(rect.X, rect.Y+i, " > "+p.Filtered[i].Name, normal.Reverse().Bold())
+		} else {
+			f.Write(rect.X, rect.Y+i, "   "+p.Filtered[i].Name, normal.Reverse())
+		}
+	}
+}
+
+func (e *Editor) OpenSymbolPicker() {
+	symbols := ExtractAllSymbols(e.buf.String())
+	e.picker = SymbolPicker{
+		Active:   true,
+		Symbols:  symbols,
+		Filtered: FilterSymbols(symbols, ""),
+		Index:    0,
+	}
 }
 
 // parsePathArg parses an argument of the form "path", "path:row", or

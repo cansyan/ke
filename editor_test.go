@@ -82,7 +82,7 @@ func TestGotoDiagnosticCommands(t *testing.T) {
 		diagnostics: []Diagnostic{{Line: 1, Col: 10}, {Line: 3, Col: 8}},
 	}
 
-	ed.cmdInput.Value = ">dprev"
+	ed.cmdInput.Value = "/dprev"
 	ed.cmdMode = true
 	if err := ed.finishCmdPalette(); err != nil {
 		t.Fatal(err)
@@ -91,7 +91,7 @@ func TestGotoDiagnosticCommands(t *testing.T) {
 		t.Fatalf("prev-error cursor = %+v, want (3, 8)", ed.cursor)
 	}
 
-	ed.cmdInput.Value = ">dnext"
+	ed.cmdInput.Value = "/dnext"
 	ed.cmdMode = true
 	if err := ed.finishCmdPalette(); err != nil {
 		t.Fatal(err)
