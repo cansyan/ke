@@ -165,3 +165,88 @@ func positionToPos(fset *token.FileSet, file *ast.File, line, col int) token.Pos
 	}
 	return tf.LineStart(line) + token.Pos(col-1)
 }
+
+type SymbolLocation struct {
+	Name   string
+	Kind   string // "func", "type", "struct", "var", "const"
+	Line   int    // 1-based
+	Column int    // 1-based
+}
+
+// FindSymbolLoc finds the location of a top-level symbol matching exactName.
+// src can be string, []byte, or io.Reader.
+func FindSymbolLoc(src any, exactName string) (SymbolLocation, bool) {
+	symbols := ExtractAllSymbols(src)
+	for _, sym := range symbols {
+		if sym.Name == exactName {
+			return sym, true
+		}
+	}
+	return SymbolLocation{}, false
+}
+
+// ExtractAllSymbols collects all top-level symbols in the file.
+// Useful for fuzzy finding or symbol pickers (e.g. Ctrl+P / Cmd+Shift+O).
+func ExtractAllSymbols(src any) []SymbolLocation {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "buffer.go", src, 0)
+	if err != nil && file == nil {
+		return nil
+	}
+
+	var results []SymbolLocation
+
+	for _, decl := range file.Decls {
+		switch d := decl.(type) {
+		case *ast.FuncDecl:
+			pos := fset.Position(d.Name.Pos())
+			kind := "func"
+			if d.Recv != nil {
+				kind = "method"
+			}
+			results = append(results, SymbolLocation{
+				Name:   d.Name.Name,
+				Kind:   kind,
+				Line:   pos.Line,
+				Column: pos.Column,
+			})
+
+		case *ast.GenDecl:
+			for _, spec := range d.Specs {
+				switch s := spec.(type) {
+				case *ast.TypeSpec:
+					pos := fset.Position(s.Name.Pos())
+					kind := "type"
+					if _, ok := s.Type.(*ast.StructType); ok {
+						kind = "struct"
+					} else if _, ok := s.Type.(*ast.InterfaceType); ok {
+						kind = "interface"
+					}
+					results = append(results, SymbolLocation{
+						Name:   s.Name.Name,
+						Kind:   kind,
+						Line:   pos.Line,
+						Column: pos.Column,
+					})
+
+				case *ast.ValueSpec:
+					kind := "var"
+					if d.Tok == token.CONST {
+						kind = "const"
+					}
+					for _, name := range s.Names {
+						pos := fset.Position(name.Pos())
+						results = append(results, SymbolLocation{
+							Name:   name.Name,
+							Kind:   kind,
+							Line:   pos.Line,
+							Column: pos.Column,
+						})
+					}
+				}
+			}
+		}
+	}
+
+	return results
+}

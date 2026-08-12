@@ -15,7 +15,7 @@ Key bindings:
 - Ctrl+G goto definition
 - Ctrl+P command palette
 	- `:123` goto line 123
-	- `@filter symbol` goto symbol, for example `@func main`, `@type Editor`
+	- `@symbol` goto symbol
     - `>dnext` goto next diagnostic error
     - `>dprev` goto previous diagnostic error
 - Ctrl+Backspace delete to line start

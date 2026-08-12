@@ -127,7 +127,7 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 		return e.updateFind(key)
 	}
 	if e.cmdMode {
-		return e.updateCommandPalette(key)
+		return e.updateCmdPalette(key)
 	}
 
 	switch key.Key {
@@ -137,7 +137,7 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 			e.GotoDefinition()
 			return nil
 		case "ctrl+p":
-			e.startCommandPalette("")
+			e.startCmdPalette("")
 			return nil
 		case "ctrl+]":
 			e.nextDiagnostic()
@@ -484,7 +484,7 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 	messageY := ctx.Height - 2
 	if messageY >= 0 {
 		if e.cmdMode {
-			e.drawCommandPalette(f, messageY, ctx.Width)
+			e.drawCmdPalette(f, messageY, ctx.Width)
 			return
 		}
 		if e.saveAs {
@@ -745,8 +745,8 @@ func (e *Editor) drawSaveAs(f *kero.Frame, y int, width int) {
 	e.saveInput.Draw(f, kero.Rect{X: inputX, Y: y, W: width - inputX, H: 1}, style)
 }
 
-// startCommandPalette opens the command palette.
-func (e *Editor) startCommandPalette(prefix string) {
+// startCmdPalette opens the command palette.
+func (e *Editor) startCmdPalette(prefix string) {
 	e.cmdMode = true
 	e.cmdInput = TextInput{Placeholder: " :line, @symbol, or >dnext"}
 	e.cmdInput.Value = prefix
@@ -754,10 +754,10 @@ func (e *Editor) startCommandPalette(prefix string) {
 	e.message = ""
 }
 
-func (e *Editor) updateCommandPalette(key kero.KeyEvent) error {
+func (e *Editor) updateCmdPalette(key kero.KeyEvent) error {
 	switch key.Key {
 	case kero.KeyEnter:
-		return e.finishCommandPalette()
+		return e.finishCmdPalette()
 	case kero.KeyEsc:
 		e.cmdMode = false
 		return nil
@@ -767,7 +767,7 @@ func (e *Editor) updateCommandPalette(key kero.KeyEvent) error {
 	return nil
 }
 
-func (e *Editor) drawCommandPalette(f *kero.Frame, y int, width int) {
+func (e *Editor) drawCmdPalette(f *kero.Frame, y int, width int) {
 	style := kero.NewStyle()
 	prompt := " Command "
 	f.Write(0, y, trimToWidth(prompt, width), style.Foreground(kero.ColorYellow))
@@ -778,74 +778,7 @@ func (e *Editor) drawCommandPalette(f *kero.Frame, y int, width int) {
 	e.cmdInput.Draw(f, kero.Rect{X: inputX, Y: y, W: width - inputX, H: 1}, style)
 }
 
-// gotoQueries makes cursor jump to the first matching line, with loose string matching
-func (e *Editor) gotoQueries(queries []string) bool {
-	if len(queries) == 0 {
-		return false
-	}
-	type qSpec struct {
-		q          string
-		ignoreCase bool
-	}
-	var specs []qSpec
-	for _, q := range queries {
-		q = strings.TrimSpace(q)
-		if q == "" {
-			continue
-		}
-		ignore := true
-		for _, r := range q {
-			if unicode.IsUpper(r) {
-				ignore = false
-				break
-			}
-		}
-		specs = append(specs, qSpec{q: q, ignoreCase: ignore})
-	}
-	if len(specs) == 0 {
-		return false
-	}
-	for row, line := range e.buf.Lines() {
-		lineStr := string(line)
-		// prepare lowercased line only if needed
-		needLower := false
-		for _, s := range specs {
-			if s.ignoreCase {
-				needLower = true
-				break
-			}
-		}
-		var lineLower string
-		if needLower {
-			lineLower = strings.ToLower(lineStr)
-		}
-
-		match := true
-		for _, s := range specs {
-			if s.ignoreCase {
-				if !strings.Contains(lineLower, strings.ToLower(s.q)) {
-					match = false
-					break
-				}
-			} else {
-				if !strings.Contains(lineStr, s.q) {
-					match = false
-					break
-				}
-			}
-		}
-		if match {
-			e.cursor = Position{Row: row, Col: 0}
-			if e.hasSelect() {
-				e.clearSelect()
-			}
-			return true
-		}
-	}
-	return false
-}
-
-func (e *Editor) finishCommandPalette() error {
+func (e *Editor) finishCmdPalette() error {
 	input := strings.TrimSpace(e.cmdInput.Value)
 	e.cmdMode = false
 	if input == "" {
@@ -887,21 +820,20 @@ func (e *Editor) finishCommandPalette() error {
 			e.clearSelect()
 		}
 	case '@':
-		// FIXME: use GotoDefinition instead
-		// "@filter symbol" goto symbol,
-		// filter can be any keyword like Go's type/func/var, or Python's def.
+		// TODO: fuzzy match, or symbol picker overlay
+		// goto symbol, for example @main
 		if len(input) < 2 {
 			return nil
 		}
-		parts := strings.Fields(input[1:])
-		if len(parts) == 0 {
+		query := input[1:]
+		if len(query) == 0 {
 			e.message = "symbol required after @"
 			return nil
 		}
-		if e.gotoQueries(parts) {
-			return nil
+		e.GotoSymbol(query)
+		if e.hasSelect() {
+			e.clearSelect()
 		}
-		e.message = "no match found for symbol: " + input[1:]
 	default:
 		e.message = "warn: goto-anything must start with : or @"
 	}
@@ -926,7 +858,7 @@ func (e *Editor) startFind() {
 	}
 }
 
-func (e *Editor) findQueryIgnoreCase(query string) bool {
+func findQueryIgnoreCase(query string) bool {
 	for _, r := range query {
 		if unicode.IsUpper(r) {
 			return false
@@ -971,7 +903,7 @@ func (e *Editor) updateFind(ev kero.KeyEvent) error {
 		if query == "" {
 			return nil
 		}
-		ignoreCase := e.findQueryIgnoreCase(query)
+		ignoreCase := findQueryIgnoreCase(query)
 
 		if ev.Mod&kero.ModShift != 0 {
 			if ignoreCase {
@@ -1052,7 +984,7 @@ func (e *Editor) skipFindMatch() {
 	if e.findMatch {
 		from = e.findMatchEnd
 	}
-	ignoreCase := e.findQueryIgnoreCase(query)
+	ignoreCase := findQueryIgnoreCase(query)
 	var start, end Position
 	var ok bool
 	if ignoreCase {
@@ -1103,7 +1035,7 @@ func (e *Editor) replaceAll() error {
 	if query == "" {
 		return nil
 	}
-	ignoreCase := e.findQueryIgnoreCase(query)
+	ignoreCase := findQueryIgnoreCase(query)
 	var count int
 	if ignoreCase {
 		count = e.buf.ReplaceAllIgnoreCase(query, e.replaceInput.Value)
@@ -1493,6 +1425,17 @@ func (e *Editor) GotoDefinition() {
 	// Jump editor cursor (converting back to 0-based)
 	e.cursor.Row = res.Line - 1
 	e.cursor.Col = res.Column - 1
+}
+
+func (e *Editor) GotoSymbol(name string) {
+	loc, found := FindSymbolLoc(e.buf.String(), name)
+	if !found {
+		return
+	}
+
+	// Move cursor (converting 1-based line/col to 0-based)
+	e.cursor.Row = loc.Line - 1
+	e.cursor.Col = loc.Column - 1
 }
 
 // parsePathArg parses an argument of the form "path", "path:row", or
