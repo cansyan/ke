@@ -29,8 +29,8 @@ func TestCheckGoSyntax(t *testing.T) {
 	if len(vets) == 0 {
 		t.Fatal("CheckGoSyntax returned no vets for invalid Go")
 	}
-	if vets[0].Line != 2 {
-		t.Errorf("vet line = %d, want 2", vets[0].Line)
+	if vets[0].Row != 2 {
+		t.Errorf("vet line = %d, want 2", vets[0].Row)
 	}
 	if vets[0].Message == "" {
 		t.Error("vet message is empty")
@@ -46,60 +46,12 @@ func TestParseVetvets(t *testing.T) {
 	if len(vets) != 2 {
 		t.Fatalf("expected 2 vets, got %d", len(vets))
 	}
-	if vets[0].Line != 1 || vets[0].Col != 4 {
-		t.Fatalf("first vet pos = (%d,%d), want (1,4)", vets[0].Line, vets[0].Col)
+	if vets[0].Row != 1 || vets[0].Col != 4 {
+		t.Fatalf("first vet pos = (%d,%d), want (1,4)", vets[0].Row, vets[0].Col)
 	}
 	if !strings.Contains(vets[0].Message, "undefined") {
 		t.Fatalf("first vet message = %q", vets[0].Message)
 	}
-}
-
-func TestNextvet(t *testing.T) {
-	ed := &Editor{
-		buf:         NewBuffer("package main\nfunc main( {\n}\nvar x = ("),
-		cursor:      Position{Row: 0, Col: 0},
-		vets: []vet{{Line: 1, Col: 10}, {Line: 3, Col: 8}},
-	}
-
-	ed.nextVet()
-	if ed.cursor != (Position{Row: 1, Col: 10}) {
-		t.Fatalf("first vet cursor = %+v, want (1, 10)", ed.cursor)
-	}
-	ed.nextVet()
-	if ed.cursor != (Position{Row: 3, Col: 8}) {
-		t.Fatalf("second vet cursor = %+v, want (3, 8)", ed.cursor)
-	}
-	ed.nextVet()
-	if ed.cursor != (Position{Row: 1, Col: 10}) {
-		t.Fatalf("wrapped vet cursor = %+v, want (1, 10)", ed.cursor)
-	}
-}
-
-func TestGotovetCommands(t *testing.T) {
-	ed := &Editor{
-		buf:         NewBuffer("package main\nfunc main( {\n}\nvar x = ("),
-		cursor:      Position{Row: 3, Col: 20},
-		vets: []vet{{Line: 1, Col: 10}, {Line: 3, Col: 8}},
-	}
-
-	ed.cmdInput.Value = "/dprev"
-	ed.cmdMode = true
-	if err := ed.finishCmdPalette(); err != nil {
-		t.Fatal(err)
-	}
-	if ed.cursor != (Position{Row: 3, Col: 8}) {
-		t.Fatalf("prev-error cursor = %+v, want (3, 8)", ed.cursor)
-	}
-
-	ed.cmdInput.Value = "/dnext"
-	ed.cmdMode = true
-	if err := ed.finishCmdPalette(); err != nil {
-		t.Fatal(err)
-	}
-	if ed.cursor != (Position{Row: 1, Col: 10}) {
-		t.Fatalf("next-error cursor = %+v, want (1, 10)", ed.cursor)
-	}
-
 }
 
 func TestEnsureCursorVisible_WithTabs(t *testing.T) {

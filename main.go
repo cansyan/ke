@@ -7,11 +7,11 @@ import (
 	"go/parser"
 	"go/scanner"
 	"go/token"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -69,8 +69,8 @@ type Editor struct {
 }
 
 type vetResult struct {
-	version     uint64
-	vets []vet
+	version uint64
+	vets    []vet
 }
 
 func (e *Editor) Init(ctx *kero.Context) error {
@@ -149,7 +149,9 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 			e.startCmdPalette("")
 			return nil
 		case "ctrl+]":
-			e.nextVet()
+			if v := e.nextVet(); v.Message != "" {
+				e.cursor = e.buf.ClampPos(Position{Row: v.Row, Col: v.Col})
+			}
 			return nil
 		case "ctrl+s":
 			return e.save()
@@ -352,9 +354,6 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 	cursorStyle := textStyle.Reverse()
 	selectStyle := kero.NewStyle().Foreground(kero.ColorBlack).Background(kero.ColorYellow)
 	messageStyle := kero.NewStyle()
-	if strings.HasPrefix(e.message, "error:") || strings.HasPrefix(e.message, "warn:") {
-		messageStyle = kero.NewStyle().Foreground(kero.ColorRed)
-	}
 
 	name := "[No Name]"
 	if e.path != "" {
@@ -377,7 +376,7 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 
 		f.Write(1, y, fmt.Sprintf("%*d ", lineNoW, lineIndex+1), lineNoStyle)
 		if e.hasvet(lineIndex) {
-			f.Write(0, y, "!", kero.NewStyle().Foreground(kero.ColorRed))
+			f.Write(0, y, "x", kero.NewStyle().Foreground(kero.ColorRed))
 		}
 
 		srcLine := e.buf.Line(lineIndex)
@@ -469,7 +468,7 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 		f.Fill(kero.Rect{X: 0, Y: statusY, W: ctx.Width, H: 1}, ' ', statusStyle)
 		f.Write(0, statusY, trimToWidth(status, ctx.Width), statusStyle)
 		if len(e.vets) > 0 {
-			warn := fmt.Sprintf("found %d error, press ctrl+] to jump", len(e.vets))
+			warn := fmt.Sprintf("%d error", len(e.vets))
 			if dd, ok := e.vetForLine(e.cursor.Row); ok {
 				warn = dd.Message
 			}
@@ -507,7 +506,10 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 			return
 		}
 		if e.message == "" {
-			e.message = "^S save | ^Q quit | ^F find | ^G definition | ^R symbols"
+			e.message = "^S save | ^Q quit | ^F find | ^G definition | ^R symbols | ^] diagnostic"
+		}
+		if strings.HasPrefix(e.message, "error:") || strings.HasPrefix(e.message, "warn:") {
+			messageStyle = messageStyle.Foreground(kero.ColorRed)
 		}
 		f.Write(0, messageY, trimToWidth(" "+e.message, ctx.Width), messageStyle)
 	}
@@ -759,7 +761,7 @@ func (e *Editor) drawSaveAs(f *kero.Frame, y int, width int) {
 // startCmdPalette opens the command palette.
 func (e *Editor) startCmdPalette(prefix string) {
 	e.cmdMode = true
-	e.cmdInput = TextInput{Placeholder: " >command or :line"}
+	e.cmdInput = TextInput{Placeholder: "/command or :line"}
 	e.cmdInput.Value = prefix
 	e.cmdInput.Cursor = len([]rune(prefix))
 	e.message = ""
@@ -770,7 +772,7 @@ func (e *Editor) updateCmdPalette(key kero.KeyEvent) error {
 	case kero.KeyEnter:
 		err := e.finishCmdPalette()
 		if err != nil {
-			e.message = err.Error()
+			e.message = "warn: " + err.Error()
 		}
 	case kero.KeyEsc:
 		e.cmdMode = false
@@ -783,7 +785,7 @@ func (e *Editor) updateCmdPalette(key kero.KeyEvent) error {
 func (e *Editor) drawCmdPalette(f *kero.Frame, y int, width int) {
 	style := kero.NewStyle()
 	prompt := " Command "
-	f.Write(0, y, trimToWidth(prompt, width), style.Foreground(kero.ColorYellow))
+	f.Write(0, y, trimToWidth(prompt, width), style)
 	inputX := len([]rune(prompt))
 	if inputX >= width {
 		return
@@ -801,16 +803,6 @@ func (e *Editor) finishCmdPalette() error {
 	switch input[0] {
 	case '/':
 		// run commands
-		switch input {
-		case "/dnext":
-			e.nextVet()
-			return nil
-		case "/dprev":
-			e.prevvet()
-			return nil
-		default:
-			return errors.New("warn: unknown command: " + input)
-		}
 	case ':':
 		// goto line, for example :123
 		if len(input) < 2 {
@@ -829,8 +821,9 @@ func (e *Editor) finishCmdPalette() error {
 		if e.hasSelect() {
 			e.clearSelect()
 		}
+		return nil
 	}
-	return errors.New("warn: command must start with / or :")
+	return errors.New("command must start with / or :")
 }
 
 func (e *Editor) startFind() {
@@ -1100,6 +1093,7 @@ func (e *Editor) debounceSyntaxCheck() {
 	}
 	e.vets = nil
 	version := e.vetVersion.Add(1)
+	// cancel previous check
 	if e.vetTimer != nil {
 		e.vetTimer.Stop()
 	}
@@ -1175,46 +1169,26 @@ func (e *Editor) hasvet(row int) bool {
 
 func (e *Editor) vetForLine(row int) (vet, bool) {
 	for _, vet := range e.vets {
-		if vet.Line == row {
+		if vet.Row == row {
 			return vet, true
 		}
 	}
 	return vet{}, false
 }
 
-func (e *Editor) nextVet() {
+func (e *Editor) nextVet() vet {
 	if len(e.vets) == 0 {
-		e.message = "no vets"
-		return
+		return vet{}
 	}
 
 	for _, vet := range e.vets {
-		if vet.Line > e.cursor.Row ||
-			(vet.Line == e.cursor.Row && vet.Col > e.cursor.Col) {
-			e.cursor = e.buf.ClampPos(Position{Row: vet.Line, Col: vet.Col})
-			return
+		if vet.Row > e.cursor.Row ||
+			(vet.Row == e.cursor.Row && vet.Col > e.cursor.Col) {
+			return vet
 		}
 	}
 
-	vet := e.vets[0]
-	e.cursor = e.buf.ClampPos(Position{Row: vet.Line, Col: vet.Col})
-}
-
-func (e *Editor) prevvet() {
-	if len(e.vets) == 0 {
-		e.message = "no vets"
-		return
-	}
-
-	for _, d := range slices.Backward(e.vets) {
-		if d.Line < e.cursor.Row || (d.Line == e.cursor.Row && d.Col < e.cursor.Col) {
-			e.cursor = e.buf.ClampPos(Position{Row: d.Line, Col: d.Col})
-			return
-		}
-	}
-
-	d := e.vets[len(e.vets)-1]
-	e.cursor = e.buf.ClampPos(Position{Row: d.Line, Col: d.Col})
+	return e.vets[0]
 }
 
 func isGoFile(path string) bool {
@@ -1333,8 +1307,9 @@ func trimToWidth(s string, width int) string {
 }
 
 type vet struct {
-	Line    int
-	Col     int
+	File    string
+	Row     int // start from 0
+	Col     int // start from 0
 	Message string
 }
 
@@ -1356,7 +1331,7 @@ func CheckGoSyntax(filename string, src any) []vet {
 	if scannerErr, ok := err.(scanner.ErrorList); ok {
 		for _, e := range scannerErr {
 			vets = append(vets, vet{
-				Line:    e.Pos.Line - 1,
+				Row:     e.Pos.Line - 1,
 				Col:     e.Pos.Column - 1,
 				Message: e.Msg,
 			})
@@ -1366,7 +1341,9 @@ func CheckGoSyntax(filename string, src any) []vet {
 	return vets
 }
 
-var vetvetPattern = regexp.MustCompile(`^.*:([0-9]+):([0-9]+): (.*)$`)
+// vetPattern matches: <optional_prefix><filename>:<line>:<col>: <message>
+// Uses non-greedy matching to swallow leading package header info.
+var vetPattern = regexp.MustCompile(`^(?:.*?\s)?([^\s:]+\.go):([0-9]+):([0-9]+):\s*(.*)$`)
 
 func CheckGoVet(filename string) []vet {
 	if !isGoFile(filename) {
@@ -1377,30 +1354,53 @@ func CheckGoVet(filename string) []vet {
 	if dir == "" {
 		dir = "."
 	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "go", "vet", dir)
+
+	cmd := exec.CommandContext(ctx, "go", "vet")
 	cmd.Dir = dir
 	output, _ := cmd.CombinedOutput()
-	return parseVetOutput(string(output))
+	//log.Printf("vet output:\n%s", string(output))
+
+	// filter out noise from other files
+	vets := parseVetOutput(string(output))
+	filtered := make([]vet, 0, len(vets))
+	for _, v := range vets {
+		if v.File == filename {
+			filtered = append(filtered, v)
+		}
+	}
+	return filtered
 }
 
 func parseVetOutput(output string) []vet {
 	var vets []vet
 	for line := range strings.SplitSeq(output, "\n") {
-		matches := vetvetPattern.FindStringSubmatch(line)
-		if len(matches) != 4 {
+		line = strings.TrimSpace(line)
+		if line == "" {
 			continue
 		}
-		lineNumber, errLine := strconv.Atoi(matches[1])
-		column, errColumn := strconv.Atoi(matches[2])
-		if errLine != nil || errColumn != nil {
+
+		matches := vetPattern.FindStringSubmatch(line)
+		if len(matches) != 5 {
 			continue
 		}
+
+		// Clean up path (e.g. "./main.go" -> "main.go")
+		parsedFile := filepath.Base(filepath.Clean(matches[1]))
+		lineNumber, errLine := strconv.Atoi(matches[2])
+		column, errColumn := strconv.Atoi(matches[3])
+
+		if errLine != nil || errColumn != nil || parsedFile == "" {
+			continue
+		}
+
 		vets = append(vets, vet{
-			Line:    lineNumber - 1,
+			File:    parsedFile,
+			Row:     lineNumber - 1,
 			Col:     column - 1,
-			Message: matches[3],
+			Message: matches[4],
 		})
 	}
 	return vets
@@ -1432,11 +1432,13 @@ func (e *Editor) GotoSymbol(name string) {
 }
 
 type SymbolPicker struct {
-	Active   bool
-	Input    TextInput
-	Symbols  []SymbolLocation
-	Filtered []SymbolLocation
-	Index    int // selected index
+	Active    bool
+	Input     TextInput
+	Symbols   []SymbolLocation
+	Filtered  []SymbolLocation
+	Index     int // selected index
+	RowOffset int // scroll
+	Limit     int // max number of symbols to display
 }
 
 func (e *Editor) updateSymbolPicker(ev kero.KeyEvent) {
@@ -1464,27 +1466,33 @@ func (e *Editor) updateSymbolPicker(ev kero.KeyEvent) {
 		e.picker.Filtered = FilterSymbols(e.picker.Symbols, q)
 		e.picker.Index = 0
 	}
+	if e.picker.Index < e.picker.RowOffset {
+		e.picker.RowOffset = e.picker.Index
+	}
+	if e.picker.Index > e.picker.RowOffset+e.picker.Limit-1 {
+		e.picker.RowOffset = e.picker.Index - (e.picker.Limit - 1)
+	}
 }
 
 func (e *Editor) drawSymbolPicker(f *kero.Frame, y, width int) {
 	normal := kero.NewStyle()
-	prompt := "Goto Symbol: "
-	f.Write(0, y, prompt, normal.Foreground(kero.ColorYellow))
+	prompt := "Symbol: "
+	f.Write(0, y, prompt, normal)
 
 	p := e.picker
 	inputX := len([]rune(prompt))
-	p.Input.Draw(f, kero.Rect{X: inputX, Y: y, W: width, H: 1}, normal.Foreground(kero.ColorYellow))
+	p.Input.Draw(f, kero.Rect{X: inputX, Y: y, W: width, H: 1}, normal)
 
 	// render the symbol list above the editor buffer
-	n := min(len(p.Filtered), 8)
+	n := min(len(p.Filtered), p.Limit)
 	rect := kero.Rect{X: inputX, Y: y - n, W: width, H: n}
 	f.Fill(rect, ' ', normal.Reverse())
-	// TODO: ensure the selected item visible
-	for i := range rect.H {
-		if i == p.Index {
-			f.Write(rect.X, rect.Y+i, " > "+p.Filtered[i].Name, normal.Reverse().Bold())
+	for i := range n {
+		j := i + p.RowOffset
+		if j == p.Index {
+			f.Write(rect.X, rect.Y+i, " > "+p.Filtered[j].Name, normal.Reverse().Bold())
 		} else {
-			f.Write(rect.X, rect.Y+i, "   "+p.Filtered[i].Name, normal.Reverse())
+			f.Write(rect.X, rect.Y+i, "   "+p.Filtered[j].Name, normal.Reverse())
 		}
 	}
 }
@@ -1496,6 +1504,7 @@ func (e *Editor) OpenSymbolPicker() {
 		Symbols:  symbols,
 		Filtered: FilterSymbols(symbols, ""),
 		Index:    0,
+		Limit:    8,
 	}
 }
 
@@ -1527,6 +1536,14 @@ func parsePathArg(arg string) (path string, row, col int) {
 }
 
 func main() {
+	f, err := os.OpenFile("/tmp/ke.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer f.Close()
+	log.SetOutput(f)
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
+
 	app := &Editor{}
 	if len(os.Args) > 1 {
 		app.path, app.cursor.Row, app.cursor.Col = parsePathArg(os.Args[1])

@@ -18,8 +18,6 @@ Key bindings:
 - Ctrl+G goto definition
 - Ctrl+P command palette
 	- `:123` goto line 123
-    - `/dnext` goto next diagnostic error
-    - `/dprev` goto previous diagnostic error
 - Ctrl+Backspace delete to line start
 - Ctrl+K delete to line end
 - Ctrl+Enter insert line below
