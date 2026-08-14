@@ -1377,7 +1377,7 @@ func CheckGoVet(filename string) []vet {
 
 func parseVetOutput(output string) []vet {
 	var vets []vet
-	for line := range strings.SplitSeq(output, "\n") {
+	for _, line := range strings.Split(output, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue

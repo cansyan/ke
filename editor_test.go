@@ -132,9 +132,9 @@ func TestTab_MultiLineSelection(t *testing.T) {
 		"third line",
 	}
 
-	for i, line := range ed.buf.Lines() {
-		if string(line) != expectedLines[i] {
-			t.Errorf("line %d = %q, want %q", i, string(line), expectedLines[i])
+	for i := range ed.buf.LenLines() {
+		if line := string(ed.buf.Line(i)); line != expectedLines[i] {
+			t.Errorf("line %d = %q, want %q", i, line, expectedLines[i])
 		}
 	}
 
@@ -193,9 +193,9 @@ func TestShiftTab_UnindentSelection(t *testing.T) {
 		"third line",
 	}
 
-	for i, line := range ed.buf.Lines() {
-		if string(line) != expectedLines[i] {
-			t.Errorf("line %d = %q, want %q", i, string(line), expectedLines[i])
+	for i := range ed.buf.LenLines() {
+		if line := string(ed.buf.Line(i)); line != expectedLines[i] {
+			t.Errorf("line %d = %q, want %q", i, line, expectedLines[i])
 		}
 	}
 

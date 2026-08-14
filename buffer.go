@@ -2,8 +2,6 @@ package main
 
 import (
 	"io"
-	"iter"
-	"slices"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -56,10 +54,6 @@ func (b *Buffer) SetLine(row int, line []rune) {
 
 func (b *Buffer) LenLines() int {
 	return len(b.lines)
-}
-
-func (b *Buffer) Lines() iter.Seq2[int, []rune] {
-	return slices.All(b.lines)
 }
 
 // Bytes returns the entire buffer content as a UTF-8 encoded byte slice.
