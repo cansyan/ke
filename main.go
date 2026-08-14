@@ -376,9 +376,6 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 		}
 
 		f.Write(1, y, fmt.Sprintf("%*d ", lineNoW, lineIndex+1), lineNoStyle)
-		if e.hasVet(lineIndex) {
-			f.Write(0, y, "x", kero.NewStyle().Foreground(kero.ColorRed))
-		}
 
 		srcLine := e.buf.Line(lineIndex)
 		fullPadded := padTab(srcLine, 4)
@@ -399,6 +396,12 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 			style = style.Underline()
 		}
 		f.Write(gutterW, y, visPadded, style)
+
+		if v, ok := e.vetForLine(lineIndex); ok {
+			red := kero.NewStyle().Foreground(kero.ColorRed)
+			f.Write(0, y, "x", red)
+			f.Write(gutterW+len(visPadded)+2, y, v.Message, red)
+		}
 
 		// highlight selection if any
 		if e.selecting {
@@ -469,10 +472,7 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 		f.Fill(kero.Rect{X: 0, Y: statusY, W: ctx.Width, H: 1}, ' ', statusStyle)
 		f.Write(0, statusY, trimToWidth(status, ctx.Width), statusStyle)
 		if len(e.vets) > 0 {
-			warn := fmt.Sprintf("%d error", len(e.vets))
-			if dd, ok := e.vetForLine(e.cursor.Row); ok {
-				warn = dd.Message
-			}
+			warn := fmt.Sprintf("ctrl+] goto diagnostic")
 			vetStyle := kero.NewStyle().Foreground(kero.ColorRed).Reverse()
 			statusWidth := len([]rune(status))
 			f.Write(statusWidth+1, statusY, "| ", statusStyle)
@@ -1163,11 +1163,6 @@ func (e *Editor) applyVetResults() {
 	}
 }
 
-func (e *Editor) hasVet(row int) bool {
-	_, ok := e.vetForLine(row)
-	return ok
-}
-
 func (e *Editor) vetForLine(row int) (vet, bool) {
 	for _, vet := range e.vets {
 		if vet.Row == row {
@@ -1205,7 +1200,7 @@ func runeIndexToDisplayColumn(runes []rune, pos int) int {
 	}
 
 	col := 0
-	for i := 0; i < pos; i++ {
+	for i := range pos {
 		if runes[i] == '\t' {
 			col += 4 - (col % 4)
 			continue
