@@ -41,3 +41,4 @@ Design Choices:
 - did consider Ctrl+Shift+P for command palette, but the key combo seems unreliable in practice
 - early version should keep things tiny, avoid duplicate selection, mutilple cursor, undo/redo, go back/forward
 - using / as command prefix is more convenient than > (shift+.)
+- in-process semantics checking ignore external module, benefits instant feedback

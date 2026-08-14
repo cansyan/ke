@@ -9,8 +9,6 @@ Important symbols in file `main.go`:
 - method `Editor.Update` receives events and update app state
 - method `Editor.View` draws the current state
 
-The imported module `kero` lives in local path `/Users/cse/code/kero`.
-
 ## Build, Test, and Development Commands
 
 - `go test ./...`: run all tests.

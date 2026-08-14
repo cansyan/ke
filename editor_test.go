@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"kero"
+	"github.com/cansyan/kero"
 )
 
 func TestDisplayColumnAndRuneIndex(t *testing.T) {
@@ -24,33 +24,16 @@ func TestDisplayColumnAndRuneIndex(t *testing.T) {
 	}
 }
 
-func TestCheckGoSyntax(t *testing.T) {
-	vets := CheckGoSyntax("example.go", []byte("package main\n\nfunc main( {\n"))
-	if len(vets) == 0 {
-		t.Fatal("CheckGoSyntax returned no vets for invalid Go")
+func TestCheckGoSemantics(t *testing.T) {
+	diagnostics := CheckSemantics("example.go", []byte("package main\n\nfunc main( {\n"))
+	if len(diagnostics) == 0 {
+		t.Fatal("CheckSemantics returned no diagnostic for invalid Go")
 	}
-	if vets[0].Row != 2 {
-		t.Errorf("vet line = %d, want 2", vets[0].Row)
+	if diagnostics[0].Row != 2 {
+		t.Errorf("vet line = %d, want 2", diagnostics[0].Row)
 	}
-	if vets[0].Message == "" {
+	if diagnostics[0].Message == "" {
 		t.Error("vet message is empty")
-	}
-	if vets := CheckGoSyntax("example.txt", []byte("func main( {\n")); vets != nil {
-		t.Fatalf("CheckGoSyntax returned vets for non-Go file: %+v", vets)
-	}
-}
-
-func TestParseVetvets(t *testing.T) {
-	output := "vet-example.go:2:5: undefined: missing\nother.go:10:3: some vet issue\n"
-	vets := parseVetOutput(output)
-	if len(vets) != 2 {
-		t.Fatalf("expected 2 vets, got %d", len(vets))
-	}
-	if vets[0].Row != 1 || vets[0].Col != 4 {
-		t.Fatalf("first vet pos = (%d,%d), want (1,4)", vets[0].Row, vets[0].Col)
-	}
-	if !strings.Contains(vets[0].Message, "undefined") {
-		t.Fatalf("first vet message = %q", vets[0].Message)
 	}
 }
 

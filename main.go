@@ -1,25 +1,75 @@
 package main
 
 import (
-	"context"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/importer"
 	"go/parser"
 	"go/scanner"
 	"go/token"
+	"go/types"
+	"io"
 	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
-	"kero"
+	"github.com/cansyan/kero"
 )
+
+// parsePathArg parses an argument of the form "path", "path:row", or
+// "path:row:col". row and col are 1-based and converted to 0-based.
+func parsePathArg(arg string) (path string, row, col int) {
+	parts := strings.Split(arg, ":")
+	if len(parts) <= 1 {
+		return arg, 0, 0
+	}
+
+	path = parts[0]
+	if len(parts) > 1 {
+		var errRow error
+		row, errRow = strconv.Atoi(parts[1])
+		if errRow != nil || row < 1 {
+			return path, 0, 0
+		}
+	}
+
+	if len(parts) > 2 {
+		var errCol error
+		col, errCol = strconv.Atoi(parts[2])
+		if errCol != nil || col < 1 {
+			return path, row - 1, 0
+		}
+	}
+	return path, row - 1, col - 1
+}
+
+func main() {
+	f, err := os.OpenFile("/tmp/ke.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer f.Close()
+	log.SetOutput(f)
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
+
+	app := &Editor{}
+	if len(os.Args) > 1 {
+		app.path, app.cursor.Row, app.cursor.Col = parsePathArg(os.Args[1])
+	}
+
+	// set FPS for refreshing diagnostic
+	p := kero.New(app, kero.WithAltScreen(true), kero.WithKitty(true), kero.WithFPS(3))
+	if err := p.Run(); err != nil {
+		panic(err)
+	}
+}
 
 // Editor implements kero.App interface
 type Editor struct {
@@ -60,18 +110,18 @@ type Editor struct {
 
 	lastKey kero.KeyEvent
 
-	vets       []vet
-	vetTimer   *time.Timer
-	vetResult  chan vetResult
-	vetVersion atomic.Uint64
+	diags       []Diagnostic
+	diagTimer   *time.Timer
+	diagChan    chan diagResult
+	diagVersion atomic.Uint64
 
 	symbolPicker SymbolPicker
 	symbolInput  TextInput
 }
 
-type vetResult struct {
+type diagResult struct {
 	version uint64
-	vets    []vet
+	vets    []Diagnostic
 }
 
 func (e *Editor) Init(ctx *kero.Context) error {
@@ -98,7 +148,9 @@ func (e *Editor) Init(ctx *kero.Context) error {
 	e.buf = NewBuffer(text)
 	e.cursor = e.buf.ClampPos(e.cursor)
 	e.ensureCursorVisible(ctx)
-	e.goVet()
+	if isGoFile(e.path) {
+		e.debounceCheckSemantic()
+	}
 	return nil
 }
 
@@ -471,7 +523,7 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 		}
 		f.Fill(kero.Rect{X: 0, Y: statusY, W: ctx.Width, H: 1}, ' ', statusStyle)
 		f.Write(0, statusY, trimToWidth(status, ctx.Width), statusStyle)
-		if len(e.vets) > 0 {
+		if len(e.diags) > 0 {
 			warn := fmt.Sprintf("ctrl+] goto diagnostic")
 			vetStyle := kero.NewStyle().Foreground(kero.ColorRed).Reverse()
 			statusWidth := len([]rune(status))
@@ -705,7 +757,6 @@ func (e *Editor) save() error {
 
 	e.dirty = false
 	e.message = fmt.Sprintf("saved %s", filepath.Base(e.path))
-	e.goVet()
 	return nil
 }
 
@@ -1083,79 +1134,51 @@ func (e *Editor) moveDown() {
 func (e *Editor) markDirty() {
 	e.dirty = true
 	e.message = ""
-	e.debounceSyntaxCheck()
+	if isGoFile(e.path) {
+		e.debounceCheckSemantic()
+	}
 }
 
-// debounceSyntaxCheck is In-memory, fast syntax check on current buffer, debounced on keypress
-// To keep it predictable, align the names by Execution Phase
-func (e *Editor) debounceSyntaxCheck() {
+// debounceCheckSemantic is In-memory, fast syntax and type checking
+// on current buffer, debounced 300ms on keypress
+func (e *Editor) debounceCheckSemantic() {
 	if e.buf == nil {
 		return
 	}
-	e.vets = nil
-	version := e.vetVersion.Add(1)
+
+	version := e.diagVersion.Add(1)
 	// cancel previous check
-	if e.vetTimer != nil {
-		e.vetTimer.Stop()
+	if e.diagTimer != nil {
+		e.diagTimer.Stop()
 	}
-	if !isGoFile(e.path) {
-		return
-	}
-	if e.vetResult == nil {
-		e.vetResult = make(chan vetResult, 4)
+	if e.diagChan == nil {
+		e.diagChan = make(chan diagResult, 4)
 	}
 	filename := e.path
 	src := e.buf.NewReader()
-	e.vetTimer = time.AfterFunc(300*time.Millisecond, func() {
-		vets := CheckGoSyntax(filename, src)
-		result := vetResult{version: version, vets: vets}
+	e.diagTimer = time.AfterFunc(300*time.Millisecond, func() {
+		vets := CheckSemantics(filename, src)
+		result := diagResult{version: version, vets: vets}
 		select {
-		case <-e.vetResult:
+		case <-e.diagChan:
 		default:
 		}
 		select {
-		case e.vetResult <- result:
+		case e.diagChan <- result:
 		default:
 		}
 	})
 }
 
-// goVet run external go vet process, triggered on app launch or save.
-func (e *Editor) goVet() {
-	if e.buf == nil || !isGoFile(e.path) {
-		return
-	}
-	if e.vetTimer != nil {
-		e.vetTimer.Stop()
-	}
-	if e.vetResult == nil {
-		e.vetResult = make(chan vetResult, 4)
-	}
-	version := e.vetVersion.Add(1)
-	filename := e.path
-	go func() {
-		vets := CheckGoVet(filename)
-		result := vetResult{version: version, vets: vets}
-		select {
-		case <-e.vetResult:
-		default:
-		}
-		select {
-		case e.vetResult <- result:
-		default:
-		}
-	}()
-}
-
 func (e *Editor) applyVetResults() {
-	if e.vetResult == nil {
+	if e.diagChan == nil {
 		return
 	}
 	for {
 		select {
-		case result := <-e.vetResult:
-			if result.version == e.vetVersion.Load() {
-				e.vets = result.vets
+		case result := <-e.diagChan:
+			if result.version == e.diagVersion.Load() {
+				e.diags = result.vets
 			}
 		default:
 			return
@@ -1163,28 +1186,28 @@ func (e *Editor) applyVetResults() {
 	}
 }
 
-func (e *Editor) vetForLine(row int) (vet, bool) {
-	for _, vet := range e.vets {
+func (e *Editor) vetForLine(row int) (Diagnostic, bool) {
+	for _, vet := range e.diags {
 		if vet.Row == row {
 			return vet, true
 		}
 	}
-	return vet{}, false
+	return Diagnostic{}, false
 }
 
-func (e *Editor) nextVet() vet {
-	if len(e.vets) == 0 {
-		return vet{}
+func (e *Editor) nextVet() Diagnostic {
+	if len(e.diags) == 0 {
+		return Diagnostic{}
 	}
 
-	for _, vet := range e.vets {
+	for _, vet := range e.diags {
 		if vet.Row > e.cursor.Row ||
 			(vet.Row == e.cursor.Row && vet.Col > e.cursor.Col) {
 			return vet
 		}
 	}
 
-	return e.vets[0]
+	return e.diags[0]
 }
 
 func isGoFile(path string) bool {
@@ -1302,106 +1325,6 @@ func trimToWidth(s string, width int) string {
 	return string(runes[:width])
 }
 
-type vet struct {
-	File    string
-	Row     int // start from 0
-	Col     int // start from 0
-	Message string
-}
-
-// CheckGoSyntax checks syntax for Go file.
-// The src parameter must be string, []byte, or [io.Reader].
-func CheckGoSyntax(filename string, src any) []vet {
-	if !isGoFile(filename) {
-		return nil
-	}
-	fset := token.NewFileSet()
-
-	// ParseHeader or ParseComments keeps it fast
-	_, err := parser.ParseFile(fset, filename, src, parser.AllErrors)
-	if err == nil {
-		return nil
-	}
-
-	var vets []vet
-	if scannerErr, ok := err.(scanner.ErrorList); ok {
-		for _, e := range scannerErr {
-			vets = append(vets, vet{
-				Row:     e.Pos.Line - 1,
-				Col:     e.Pos.Column - 1,
-				Message: e.Msg,
-			})
-		}
-	}
-
-	return vets
-}
-
-// vetPattern matches: <optional_prefix><filename>:<line>:<col>: <message>
-// Uses non-greedy matching to swallow leading package header info.
-var vetPattern = regexp.MustCompile(`^(?:.*?\s)?([^\s:]+\.go):([0-9]+):([0-9]+):\s*(.*)$`)
-
-func CheckGoVet(filename string) []vet {
-	if !isGoFile(filename) {
-		return nil
-	}
-
-	dir := filepath.Dir(filename)
-	if dir == "" {
-		dir = "."
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, "go", "vet")
-	cmd.Dir = dir
-	output, _ := cmd.CombinedOutput()
-	//log.Printf("vet output:\n%s", string(output))
-
-	// filter out noise from other files
-	vets := parseVetOutput(string(output))
-	filtered := make([]vet, 0, len(vets))
-	for _, v := range vets {
-		if v.File == filename {
-			filtered = append(filtered, v)
-		}
-	}
-	return filtered
-}
-
-func parseVetOutput(output string) []vet {
-	var vets []vet
-	for _, line := range strings.Split(output, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-
-		matches := vetPattern.FindStringSubmatch(line)
-		if len(matches) != 5 {
-			continue
-		}
-
-		// Clean up path (e.g. "./main.go" -> "main.go")
-		parsedFile := filepath.Base(filepath.Clean(matches[1]))
-		lineNumber, errLine := strconv.Atoi(matches[2])
-		column, errColumn := strconv.Atoi(matches[3])
-
-		if errLine != nil || errColumn != nil || parsedFile == "" {
-			continue
-		}
-
-		vets = append(vets, vet{
-			File:    parsedFile,
-			Row:     lineNumber - 1,
-			Col:     column - 1,
-			Message: matches[4],
-		})
-	}
-	return vets
-}
-
 func (e *Editor) GotoDefinition() {
 	reader := e.buf.NewReader()
 
@@ -1504,50 +1427,1168 @@ func (e *Editor) OpenSymbolPicker() {
 	e.symbolInput = TextInput{}
 }
 
-// parsePathArg parses an argument of the form "path", "path:row", or
-// "path:row:col". row and col are 1-based and converted to 0-based.
-func parsePathArg(arg string) (path string, row, col int) {
-	parts := strings.Split(arg, ":")
-	if len(parts) <= 1 {
-		return arg, 0, 0
-	}
-
-	path = parts[0]
-	if len(parts) > 1 {
-		var errRow error
-		row, errRow = strconv.Atoi(parts[1])
-		if errRow != nil || row < 1 {
-			return path, 0, 0
-		}
-	}
-
-	if len(parts) > 2 {
-		var errCol error
-		col, errCol = strconv.Atoi(parts[2])
-		if errCol != nil || col < 1 {
-			return path, row - 1, 0
-		}
-	}
-	return path, row - 1, col - 1
+// TextInput is a small editable single-line text widget.
+type TextInput struct {
+	Value       string
+	Cursor      int
+	SelStart    int // selection start
+	SelEnd      int
+	Placeholder string // displayed when Value is empty
 }
 
-func main() {
-	f, err := os.OpenFile("/tmp/ke.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+func (t *TextInput) adjustSelect() (int, int) {
+	runes := []rune(t.Value)
+	start, end := t.SelStart, t.SelEnd
+	if start > end {
+		start, end = end, start
+	}
+	if start < 0 {
+		start = 0
+	}
+	if end < 0 {
+		end = 0
+	}
+	if start > len(runes) {
+		start = len(runes)
+	}
+	if end > len(runes) {
+		end = len(runes)
+	}
+	return start, end
+}
+
+func (t *TextInput) clearSelect() {
+	t.SelStart = t.Cursor
+	t.SelEnd = t.Cursor
+}
+
+// Update applies keyboard input to the text input.
+func (t *TextInput) Update(ev kero.Event) {
+	e, ok := ev.(kero.KeyEvent)
+	if !ok {
+		return
+	}
+
+	runes := []rune(t.Value)
+	if t.Cursor < 0 {
+		t.Cursor = 0
+	}
+	if t.Cursor > len(runes) {
+		t.Cursor = len(runes)
+	}
+
+	switch e.Key {
+	case kero.KeyRune:
+		if e.Mod&kero.ModCtrl != 0 {
+			return
+		}
+		start, end := t.adjustSelect()
+		if start != end {
+			runes = append(runes[:start], runes[end:]...)
+			t.Cursor = start
+			t.SelStart = start
+			t.SelEnd = start
+		}
+
+		runes = append(runes, 0)
+		copy(runes[t.Cursor+1:], runes[t.Cursor:])
+		runes[t.Cursor] = e.Rune
+		t.Cursor++
+		t.clearSelect()
+	case kero.KeyBackspace:
+		start, end := t.adjustSelect()
+		if start != end {
+			runes = append(runes[:start], runes[end:]...)
+			t.Cursor = start
+			t.clearSelect()
+			break
+		}
+		if t.Cursor > 0 {
+			runes = append(runes[:t.Cursor-1], runes[t.Cursor:]...)
+			t.Cursor--
+		}
+	case kero.KeyDelete:
+		start, end := t.adjustSelect()
+		if start != end {
+			runes = append(runes[:start], runes[end:]...)
+			t.Cursor = start
+			t.clearSelect()
+			break
+		}
+		if t.Cursor < len(runes) {
+			runes = append(runes[:t.Cursor], runes[t.Cursor+1:]...)
+		}
+	case kero.KeyLeft:
+		if t.Cursor > 0 {
+			t.Cursor--
+		}
+	case kero.KeyRight:
+		if t.Cursor < len(runes) {
+			t.Cursor++
+		}
+	case kero.KeyHome:
+		t.Cursor = 0
+	case kero.KeyEnd:
+		t.Cursor = len(runes)
+	}
+
+	t.Value = string(runes)
+}
+
+// Draw renders the text input and its cursor.
+func (t TextInput) Draw(f *kero.Frame, r kero.Rect, s kero.Style) {
+	selectStyle := s.Foreground(kero.ColorBlack).Background(kero.ColorYellow)
+	cursorStyle := s.Reverse()
+	runes := []rune(t.Value)
+
+	if t.Cursor < 0 {
+		t.Cursor = 0
+	}
+	if t.Cursor > len(runes) {
+		t.Cursor = len(runes)
+	}
+
+	start, end := t.adjustSelect()
+
+	for i, ch := range runes {
+		x := r.X + i
+		y := r.Y
+
+		if x >= r.Right() {
+			break
+		}
+
+		if i >= start && i < end {
+			f.Set(x, y, ch, selectStyle)
+			continue
+		}
+
+		if i == t.Cursor {
+			f.Set(x, y, ch, cursorStyle)
+			continue
+		}
+
+		f.Set(x, y, ch, s)
+	}
+
+	if t.Cursor == len(runes) {
+		x := r.X + t.Cursor
+		if x < r.Right() {
+			f.Set(x, r.Y, ' ', cursorStyle)
+		}
+	}
+
+	if t.Value == "" && t.Placeholder != "" {
+		for i, ch := range []rune(t.Placeholder) {
+			if i == 0 {
+				f.Set(r.X+i, r.Y, ch, cursorStyle)
+			} else {
+				f.Set(r.X+i, r.Y, ch, s.Dim())
+			}
+		}
+	}
+}
+
+type Position struct {
+	Row int // line index, starting at 0
+	Col int // column index, starting at 0
+}
+
+type Buffer struct {
+	lines [][]rune // Using [][]rune handles multi-byte UTF-8 correctly
+}
+
+func NewBuffer(content string) *Buffer {
+	rawLines := strings.Split(content, "\n")
+	lines := make([][]rune, len(rawLines))
+	for i, l := range rawLines {
+		lines[i] = []rune(l)
+	}
+	return &Buffer{lines: lines}
+}
+
+// Line returns a copy of the line at the specified row.
+// Returns nil if the row index is out of bounds.
+func (b *Buffer) Line(row int) []rune {
+	if row < 0 || row >= len(b.lines) {
+		return nil
+	}
+	src := b.lines[row]
+	if src == nil {
+		return nil
+	}
+
+	dst := make([]rune, len(src))
+	copy(dst, src)
+	return dst
+}
+
+func (b *Buffer) SetLine(row int, line []rune) {
+	if row < 0 || row >= len(b.lines) {
+		return
+	}
+
+	// Copy input slice to prevent external modification
+	dst := make([]rune, len(line))
+	copy(dst, line)
+	b.lines[row] = dst
+}
+
+func (b *Buffer) LenLines() int {
+	return len(b.lines)
+}
+
+// Bytes returns the entire buffer content as a UTF-8 encoded byte slice.
+func (b *Buffer) Bytes() []byte {
+	linesCount := len(b.lines)
+	if linesCount == 0 {
+		return []byte{}
+	}
+
+	// 1. Calculate total byte capacity upfront to do a single allocation
+	var totalBytes int
+	for _, line := range b.lines {
+		for _, r := range line {
+			totalBytes += utf8.RuneLen(r)
+		}
+	}
+	// Add room for newline characters ('\n' is 1 byte per line break)
+	totalBytes += (linesCount - 1)
+
+	// 2. Pre-allocate slice buffer
+	buf := make([]byte, 0, totalBytes)
+
+	// 3. Append UTF-8 encoded bytes line by line
+	var runeBuf [utf8.UTFMax]byte
+	for i, line := range b.lines {
+		if i > 0 {
+			buf = append(buf, '\n')
+		}
+		for _, r := range line {
+			n := utf8.EncodeRune(runeBuf[:], r)
+			buf = append(buf, runeBuf[:n]...)
+		}
+	}
+
+	return buf
+}
+
+// String returns the full buffer text as a string, joined by newlines.
+func (b *Buffer) String() string {
+	linesCount := len(b.lines)
+	if linesCount == 0 {
+		return ""
+	}
+
+	// 1. Calculate approximate total byte capacity to minimize allocations
+	var totalBytes int
+	for _, line := range b.lines {
+		for _, r := range line {
+			totalBytes += utf8.RuneLen(r)
+		}
+	}
+	// Add space for newline characters ('\n')
+	totalBytes += (linesCount - 1)
+
+	// 2. Pre-allocate strings.Builder buffer
+	var sb strings.Builder
+	sb.Grow(totalBytes)
+
+	// 3. Write lines joined by newlines
+	for i, line := range b.lines {
+		if i > 0 {
+			sb.WriteByte('\n')
+		}
+		for _, r := range line {
+			sb.WriteRune(r)
+		}
+	}
+
+	return sb.String()
+}
+
+// InsertAt inserts text at the given position and returns the new cursor position.
+func (b *Buffer) Insert(p Position, text string) Position {
+	if p.Row < 0 || p.Row >= len(b.lines) {
+		return p
+	}
+
+	line := b.lines[p.Row]
+	if p.Col < 0 {
+		p.Col = 0
+	}
+	if p.Col > len(line) {
+		p.Col = len(line)
+	}
+
+	insertLines := strings.Split(text, "\n")
+
+	// Single-line insertion fast path
+	if len(insertLines) == 1 {
+		runesToInsert := []rune(insertLines[0])
+		newLine := make([]rune, 0, len(line)+len(runesToInsert))
+		newLine = append(newLine, line[:p.Col]...)
+		newLine = append(newLine, runesToInsert...)
+		newLine = append(newLine, line[p.Col:]...)
+
+		b.lines[p.Row] = newLine
+
+		return Position{
+			Row: p.Row,
+			Col: p.Col + len(runesToInsert),
+		}
+	}
+
+	// Multi-line insertion path
+	prefix := line[:p.Col]
+	suffix := line[p.Col:]
+
+	firstInsert := []rune(insertLines[0])
+	lastInsert := []rune(insertLines[len(insertLines)-1])
+
+	// First line gets prefix + first line of inserted text
+	firstLine := append([]rune{}, prefix...)
+	firstLine = append(firstLine, firstInsert...)
+
+	// Last line gets last line of inserted text + suffix
+	lastLine := append([]rune{}, lastInsert...)
+	lastLine = append(lastLine, suffix...)
+
+	// Prepare middle lines (if any)
+	newSegment := make([][]rune, 0, len(insertLines))
+	newSegment = append(newSegment, firstLine)
+
+	for i := 1; i < len(insertLines)-1; i++ {
+		newSegment = append(newSegment, []rune(insertLines[i]))
+	}
+	newSegment = append(newSegment, lastLine)
+
+	// Replace target line with the expanded multi-line segment
+	finalLines := make([][]rune, 0, len(b.lines)+len(insertLines)-1)
+	finalLines = append(finalLines, b.lines[:p.Row]...)
+	finalLines = append(finalLines, newSegment...)
+	finalLines = append(finalLines, b.lines[p.Row+1:]...)
+
+	b.lines = finalLines
+
+	return Position{
+		Row: p.Row + len(insertLines) - 1,
+		Col: len(lastInsert),
+	}
+}
+
+// orderPos guarantees start <= end (top-to-bottom, left-to-right)
+func orderPos(p1, p2 Position) (start, end Position) {
+	if p1.Row < p2.Row || (p1.Row == p2.Row && p1.Col <= p2.Col) {
+		return p1, p2
+	}
+	return p2, p1
+}
+
+// ClampPos ensures p falls within valid buffer bounds.
+func (b *Buffer) ClampPos(p Position) Position {
+	if len(b.lines) == 0 {
+		return Position{Row: 0, Col: 0}
+	}
+
+	// Clamp Row
+	row := p.Row
+	if row < 0 {
+		row = 0
+	} else if row >= len(b.lines) {
+		row = len(b.lines) - 1
+	}
+
+	// Clamp Col within the valid row
+	lineLen := len(b.lines[row])
+	col := p.Col
+	if col < 0 {
+		col = 0
+	} else if col > lineLen {
+		col = lineLen
+	}
+
+	return Position{Row: row, Col: col}
+}
+
+// GetRange extracts the text between two positions (inclusive start, exclusive end).
+func (b *Buffer) GetRange(p1, p2 Position) string {
+	start, end := orderPos(b.ClampPos(p1), b.ClampPos(p2))
+
+	if start == end {
+		return ""
+	}
+
+	// Single-line range fast path
+	if start.Row == end.Row {
+		return string(b.lines[start.Row][start.Col:end.Col])
+	}
+
+	// Multi-line range path
+	var sb strings.Builder
+
+	// First line fragment
+	sb.WriteString(string(b.lines[start.Row][start.Col:]))
+	sb.WriteRune('\n')
+
+	// Intermediate full lines
+	for l := start.Row + 1; l < end.Row; l++ {
+		sb.WriteString(string(b.lines[l]))
+		sb.WriteRune('\n')
+	}
+
+	// Final line fragment
+	sb.WriteString(string(b.lines[end.Row][:end.Col]))
+
+	return sb.String()
+}
+
+// DeleteRange removes text between two positions [p1, p2) and returns the new cursor position.
+func (b *Buffer) DeleteRange(p1, p2 Position) Position {
+	start, end := orderPos(b.ClampPos(p1), b.ClampPos(p2))
+
+	if start == end {
+		return start
+	}
+
+	// Single-line deletion fast path
+	if start.Row == end.Row {
+		line := b.lines[start.Row]
+		newLine := make([]rune, 0, len(line)-(end.Col-start.Col))
+		newLine = append(newLine, line[:start.Col]...)
+		newLine = append(newLine, line[end.Col:]...)
+
+		b.lines[start.Row] = newLine
+		return start
+	}
+
+	// Multi-line deletion path
+	startLinePrefix := b.lines[start.Row][:start.Col]
+	endLineSuffix := b.lines[end.Row][end.Col:]
+
+	// Stitch start prefix and end suffix into one merged line
+	mergedLine := make([]rune, 0, len(startLinePrefix)+len(endLineSuffix))
+	mergedLine = append(mergedLine, startLinePrefix...)
+	mergedLine = append(mergedLine, endLineSuffix...)
+
+	// Rebuild line slice removing deleted lines
+	newLines := make([][]rune, 0, len(b.lines)-(end.Row-start.Row))
+	newLines = append(newLines, b.lines[:start.Row]...)
+	newLines = append(newLines, mergedLine)
+	newLines = append(newLines, b.lines[end.Row+1:]...)
+
+	b.lines = newLines
+
+	return start
+}
+
+// WordBounds finds the start and end of the word surrounding pos on its line.
+func (b *Buffer) WordBounds(p Position) (start, end Position) {
+	if p.Row < 0 || p.Row >= len(b.lines) {
+		return
+	}
+
+	line := b.lines[p.Row]
+	if len(line) == 0 {
+		return
+	}
+
+	col := p.Col
+	if col >= len(line) {
+		col = len(line) - 1
+	}
+
+	// Determine matching mode based on target character under cursor
+	targetIsWord := isWordChar(line[col])
+
+	// Scan left for start
+	startCol := col
+	for startCol > 0 && isWordChar(line[startCol-1]) == targetIsWord {
+		startCol--
+	}
+
+	// Scan right for end
+	endCol := col
+	for endCol < len(line) && isWordChar(line[endCol]) == targetIsWord {
+		endCol++
+	}
+
+	start = Position{Row: p.Row, Col: startCol}
+	end = Position{Row: p.Row, Col: endCol}
+	return start, end
+}
+
+// FindNext searches forward starting after "from" for an exact query.
+// Returns the position matching query, and true if found.
+func (b *Buffer) FindNext(query string, from Position) (start, end Position, ok bool) {
+	return b.findNext(query, from, false)
+}
+
+// FindNextIgnoreCase searches forward starting after "from" for query text,
+// ignoring case.
+func (b *Buffer) FindNextIgnoreCase(query string, from Position) (start, end Position, ok bool) {
+	return b.findNext(query, from, true)
+}
+
+func (b *Buffer) findNext(query string, from Position, ignoreCase bool) (start, end Position, ok bool) {
+	if query == "" || len(b.lines) == 0 {
+		return Position{}, Position{}, false
+	}
+
+	queryRunes := []rune(query)
+	if len(queryRunes) == 0 {
+		return Position{}, Position{}, false
+	}
+
+	row := from.Row
+	col := from.Col
+	for rowsSearched := 0; rowsSearched <= len(b.lines); rowsSearched++ {
+		line := b.lines[row]
+		for i := col; i <= len(line)-len(queryRunes); i++ {
+			match := true
+			for j := range queryRunes {
+				if !runeMatches(line[i+j], queryRunes[j], ignoreCase) {
+					match = false
+					break
+				}
+			}
+			if match {
+				start = Position{Row: row, Col: i}
+				end = Position{Row: row, Col: i + len(queryRunes)}
+				return start, end, true
+			}
+		}
+
+		if row+1 < len(b.lines) {
+			row++
+		} else {
+			row = 0
+		}
+		col = 0
+	}
+
+	return Position{}, Position{}, false
+}
+
+// FindPrev searches backward starting before fromPos for an exact query.
+// Returns the start and end positions matching query, and true if found.
+func (b *Buffer) FindPrev(query string, from Position) (start, end Position, ok bool) {
+	return b.findPrev(query, from, false)
+}
+
+// FindPrevIgnoreCase searches backward starting before fromPos for query text,
+// ignoring case.
+func (b *Buffer) FindPrevIgnoreCase(query string, from Position) (start, end Position, ok bool) {
+	return b.findPrev(query, from, true)
+}
+
+func (b *Buffer) findPrev(query string, from Position, ignoreCase bool) (start, end Position, ok bool) {
+	if query == "" || len(b.lines) == 0 {
+		return Position{}, Position{}, false
+	}
+
+	queryRunes := []rune(query)
+	if len(queryRunes) == 0 {
+		return Position{}, Position{}, false
+	}
+	qLen := len(queryRunes)
+
+	row := from.Row
+	for rowsSearched := 0; rowsSearched <= len(b.lines); rowsSearched++ {
+		line := b.lines[row]
+		// Determine the rightmost starting column index for search on this row
+		maxCol := len(line) - qLen
+		if row == from.Row {
+			maxCol = from.Col - qLen
+		}
+
+		// Search backward within current line
+		if maxCol >= 0 {
+			for c := maxCol; c >= 0; c-- {
+				matched := true
+				for i := range queryRunes {
+					if !runeMatches(line[c+i], queryRunes[i], ignoreCase) {
+						matched = false
+						break
+					}
+				}
+				if matched {
+					start = Position{Row: row, Col: c}
+					end = Position{Row: row, Col: c + qLen}
+					return start, end, true
+				}
+			}
+		}
+
+		if row > 0 {
+			row--
+		} else {
+			row = len(b.lines) - 1
+		}
+	}
+
+	return Position{}, Position{}, false
+}
+
+// ReplaceAll replaces every exact occurrence of query in the buffer.
+func (b *Buffer) ReplaceAll(query, replacement string) (count int) {
+	return b.replaceAll(query, replacement, false)
+}
+
+// ReplaceAllIgnoreCase replaces every case-insensitive occurrence of query.
+func (b *Buffer) ReplaceAllIgnoreCase(query, replacement string) (count int) {
+	return b.replaceAll(query, replacement, true)
+}
+
+func (b *Buffer) replaceAll(query, replacement string, ignoreCase bool) (count int) {
+	queryRunes := []rune(query)
+	if len(queryRunes) == 0 {
+		return 0
+	}
+
+	for row, line := range b.lines {
+		result := make([]rune, 0, len(line))
+		for col := 0; col < len(line); {
+			if col+len(queryRunes) <= len(line) {
+				matched := true
+				for i, queryRune := range queryRunes {
+					if !runeMatches(line[col+i], queryRune, ignoreCase) {
+						matched = false
+						break
+					}
+				}
+				if matched {
+					result = append(result, []rune(replacement)...)
+					count++
+					col += len(queryRunes)
+					continue
+				}
+			}
+			result = append(result, line[col])
+			col++
+		}
+		if count > 0 {
+			b.lines[row] = result
+		}
+	}
+	return count
+}
+
+func runeMatches(left, right rune, ignoreCase bool) bool {
+	if ignoreCase {
+		return unicode.ToLower(left) == unicode.ToLower(right)
+	}
+	return left == right
+}
+
+// MoveWordRight moves the cursor to the end of the current word,
+// or across whitespace/punctuation to the end of the next word.
+func (b *Buffer) MoveWordRight(p Position) Position {
+	if p.Row >= len(b.lines) {
+		return p
+	}
+
+	line := b.lines[p.Row]
+
+	// If at or past line end, wrap to the start of the next line
+	if p.Col >= len(line) {
+		if p.Row+1 < len(b.lines) {
+			return Position{Row: p.Row + 1, Col: 0}
+		}
+		return p // End of document
+	}
+
+	col := p.Col
+
+	// Skip leading non-word characters (whitespace, punctuation)
+	for col < len(line) && !isWordChar(line[col]) {
+		col++
+	}
+
+	// Consume the word characters until the end of word
+	for col < len(line) && isWordChar(line[col]) {
+		col++
+	}
+
+	return Position{Row: p.Row, Col: col}
+}
+
+// MoveWordLeft moves the cursor to the start of the current word,
+// or across whitespace/punctuation to the start of the previous word.
+func (b *Buffer) MoveWordLeft(p Position) Position {
+	if p.Row < 0 || p.Row >= len(b.lines) {
+		return p
+	}
+
+	line := b.lines[p.Row]
+	col := p.Col
+	if col > len(line) {
+		col = len(line)
+	}
+
+	// If at start of line, move to end of previous line
+	if col == 0 {
+		if p.Row == 0 {
+			return Position{Row: 0, Col: 0}
+		}
+		prevLine := b.lines[p.Row-1]
+		return Position{Row: p.Row - 1, Col: len(prevLine)}
+	}
+
+	i := col
+	// skip non-word characters (whitespace/punctuation)
+	for i > 0 && !isWordChar(line[i-1]) {
+		i--
+	}
+	// skip word characters to the start of the word
+	for i > 0 && isWordChar(line[i-1]) {
+		i--
+	}
+	return Position{Row: p.Row, Col: i}
+}
+
+// NextPos returns the Position after stepping one rune right, wrapping lines if needed.
+func (b *Buffer) NextPos(p Position) Position {
+	lineLen := len(b.Line(p.Row))
+	if p.Col < lineLen {
+		return Position{Row: p.Row, Col: p.Col + 1}
+	}
+	if p.Row < b.LenLines()-1 {
+		return Position{Row: p.Row + 1, Col: 0}
+	}
+	return p
+}
+
+// PrevPos returns the Position after stepping one rune left, wrapping lines if needed.
+func (b *Buffer) PrevPos(p Position) Position {
+	if p.Col > 0 {
+		return Position{Row: p.Row, Col: p.Col - 1}
+	}
+	if p.Row > 0 {
+		prevRow := p.Row - 1
+		return Position{Row: prevRow, Col: len(b.Line(prevRow))}
+	}
+	return p
+}
+
+func (b *Buffer) LineStartNonSpace(p Position) Position {
+	if p.Row < 0 || p.Row >= len(b.lines) {
+		return p
+	}
+	for i, char := range b.lines[p.Row] {
+		if !unicode.IsSpace(char) {
+			return Position{Row: p.Row, Col: i}
+		}
+	}
+	return Position{Row: p.Row, Col: 0}
+}
+
+func (b *Buffer) LineEnd(p Position) Position {
+	if p.Row < 0 || p.Row >= len(b.lines) {
+		return p
+	}
+	return Position{Row: p.Row, Col: len(b.lines[p.Row])}
+}
+
+// BufReader implements io.Reader over Buffer lines.
+type BufReader struct {
+	buf       *Buffer
+	lineIdx   int
+	colIdx    int
+	encoded   [utf8.UTFMax]byte
+	encLen    int
+	encOffset int
+}
+
+func (b *Buffer) NewReader() *BufReader {
+	return &BufReader{buf: b}
+}
+
+func (r *BufReader) Read(p []byte) (n int, err error) {
+	if r.lineIdx >= len(r.buf.lines) {
+		return 0, io.EOF
+	}
+
+	for n < len(p) {
+		// Flush remaining encoded bytes from current rune
+		if r.encOffset < r.encLen {
+			p[n] = r.encoded[r.encOffset]
+			n++
+			r.encOffset++
+			continue
+		}
+
+		line := r.buf.lines[r.lineIdx]
+
+		// At end of line, output newline character
+		if r.colIdx >= len(line) {
+			p[n] = '\n'
+			n++
+			r.lineIdx++
+			r.colIdx = 0
+			r.encLen = 0
+			r.encOffset = 0
+			if r.lineIdx >= len(r.buf.lines) {
+				break
+			}
+			continue
+		}
+
+		// Encode next rune
+		runeVal := line[r.colIdx]
+		r.colIdx++
+		r.encLen = utf8.EncodeRune(r.encoded[:], runeVal)
+		r.encOffset = 0
+	}
+
+	return n, nil
+}
+
+type Diagnostic struct {
+	Row     int // start from 0
+	Col     int // start from 0
+	Message string
+}
+
+// CheckSemantics checks syntax and type error.
+// filename is used for position resolution (e.g., "main.go").
+// src can be a string, []byte, or io.Reader.
+//
+// It responds instantly (~5–20ms), as a tradeoff,
+// external module imports are not resolved and are filtered out.
+func CheckSemantics(filename string, src any) []Diagnostic {
+	fset := token.NewFileSet()
+	// 1. Parse AST with comments and full error reporting
+	file, err := parser.ParseFile(fset, filename, src, parser.AllErrors)
+
+	var diags []Diagnostic
+
+	// 2. Collect syntax errors first
 	if err != nil {
-		log.Fatal(err)
+		if scannerErrs, ok := err.(scanner.ErrorList); ok {
+			for _, e := range scannerErrs {
+				diags = append(diags, Diagnostic{
+					Row:     e.Pos.Line - 1,
+					Col:     e.Pos.Column - 1,
+					Message: e.Msg,
+				})
+			}
+		}
+		// If syntax is broken, return early (type checking invalid AST causes redundant noise)
+		return diags
 	}
-	defer f.Close()
-	log.SetOutput(f)
-	log.SetFlags(log.LstdFlags | log.Lshortfile)
 
-	app := &Editor{}
-	if len(os.Args) > 1 {
-		app.path, app.cursor.Row, app.cursor.Col = parsePathArg(os.Args[1])
+	// 3. Configure type checker for semantic validation
+	pkgName := file.Name.Name
+	if pkgName == "" {
+		pkgName = "main"
 	}
 
-	// set FPS for refreshing vet result
-	p := kero.New(app, kero.WithAltScreen(true), kero.WithKitty(true), kero.WithFPS(3))
-	if err := p.Run(); err != nil {
-		panic(err)
+	conf := types.Config{
+		// only resolve standard library imports, ignores third-party or local module
+		Importer: importer.Default(),
+
+		// Custom error handler to collect semantic diagnostics
+		Error: func(err error) {
+			if typeErr, ok := err.(types.Error); ok {
+				// Suppress import resolution errors for external modules during real-time typing
+				if strings.Contains(typeErr.Msg, "could not import") ||
+					strings.Contains(typeErr.Msg, "cannot find package") {
+					return
+				}
+
+				pos := fset.Position(typeErr.Pos)
+				diags = append(diags, Diagnostic{
+					Row:     pos.Line - 1,
+					Col:     pos.Column - 1,
+					Message: typeErr.Msg,
+				})
+			}
+		},
 	}
+
+	// Optional: Pass an empty Info struct to trigger full type resolution
+	info := &types.Info{
+		Types:      make(map[ast.Expr]types.TypeAndValue),
+		Defs:       make(map[*ast.Ident]types.Object),
+		Uses:       make(map[*ast.Ident]types.Object),
+		Implicits:  make(map[ast.Node]types.Object),
+		Selections: make(map[*ast.SelectorExpr]*types.Selection),
+	}
+
+	// 4. Run type checker on the AST
+	_, _ = conf.Check(pkgName, fset, []*ast.File{file}, info)
+	// Optional: Multi-file package type checking
+	/*
+		If your file references types or functions declared in another file in the same package,
+		go/types will report them as undefined if only a single file AST is passed.
+		To handle multi-file packages in your editor,
+		simply pass all parsed AST files in the same directory to conf.Check:
+		_, _ = conf.Check(pkgName, fset, []*ast.File{currentFileAST, otherFileAST1, otherFileAST2}, info)
+	*/
+
+	return diags
+}
+
+// DefinitionResult holds the target location for a definition jump.
+type DefinitionResult struct {
+	Found  bool
+	Line   int // 1-based
+	Column int // 1-based
+}
+
+// FindDefinitionLoc returns the target definition line/col for the identifier
+// at the given cursor position (1-based line, 1-based col).
+func FindDefinitionLoc(src any, cursorLine, cursorCol int) DefinitionResult {
+	fset := token.NewFileSet()
+	// src can be string, []byte, or io.Reader
+	file, err := parser.ParseFile(fset, "buffer.go", src, parser.SkipObjectResolution)
+	if err != nil && file == nil {
+		return DefinitionResult{}
+	}
+
+	targetPos := positionToPos(fset, file, cursorLine, cursorCol)
+	if !targetPos.IsValid() {
+		return DefinitionResult{}
+	}
+
+	// 1. Find the *ast.Ident under the cursor
+	var targetIdent *ast.Ident
+	ast.Inspect(file, func(n ast.Node) bool {
+		if n == nil {
+			return true
+		}
+		if n.Pos() <= targetPos && targetPos <= n.End() {
+			if ident, ok := n.(*ast.Ident); ok {
+				targetIdent = ident
+			}
+			return true
+		}
+		return false
+	})
+
+	if targetIdent == nil {
+		return DefinitionResult{}
+	}
+
+	// 2. Find declaration by inspecting the AST scopes explicitly
+	declPos := findDeclarationPos(file, targetIdent)
+	if !declPos.IsValid() {
+		return DefinitionResult{}
+	}
+
+	pos := fset.Position(declPos)
+	return DefinitionResult{
+		Found:  true,
+		Line:   pos.Line,
+		Column: pos.Column,
+	}
+}
+
+// findDeclarationPos replaces the deprecated Ident.Obj lookup by walking
+// local function scopes and top-level declarations in the file.
+func findDeclarationPos(file *ast.File, target *ast.Ident) token.Pos {
+	name := target.Name
+	var match token.Pos
+
+	// Step A: Search for local variables / parameters inside the enclosing function
+	ast.Inspect(file, func(n ast.Node) bool {
+		fn, ok := n.(*ast.FuncDecl)
+		if !ok {
+			return true
+		}
+
+		// Check if target is inside this function body
+		if fn.Pos() <= target.Pos() && target.Pos() <= fn.End() {
+			// Check function parameters and return values
+			if fn.Type != nil && fn.Type.Params != nil {
+				for _, param := range fn.Type.Params.List {
+					for _, id := range param.Names {
+						if id.Name == name {
+							match = id.Pos()
+							return false
+						}
+					}
+				}
+			}
+
+			// Check local variable assignments inside function body
+			ast.Inspect(fn.Body, func(bodyNode ast.Node) bool {
+				switch stmt := bodyNode.(type) {
+				case *ast.AssignStmt: // e.g. x := 10 or x, y := 1, 2
+					for _, lh := range stmt.Lhs {
+						if id, ok := lh.(*ast.Ident); ok && id.Name == name {
+							if id.Pos() <= target.Pos() { // Defined before or at target
+								match = id.Pos()
+								return false
+							}
+						}
+					}
+				case *ast.ValueSpec: // e.g. var x int
+					for _, id := range stmt.Names {
+						if id.Name == name {
+							match = id.Pos()
+							return false
+						}
+					}
+				}
+				return match == token.NoPos
+			})
+
+			return false
+		}
+		return true
+	})
+
+	if match.IsValid() {
+		return match
+	}
+
+	// Step B: Search top-level file declarations (funcs, structs, types, consts, vars)
+	for _, decl := range file.Decls {
+		switch d := decl.(type) {
+		case *ast.FuncDecl:
+			if d.Name.Name == name {
+				return d.Name.Pos()
+			}
+		case *ast.GenDecl:
+			for _, spec := range d.Specs {
+				switch s := spec.(type) {
+				case *ast.TypeSpec:
+					if s.Name.Name == name {
+						return s.Name.Pos()
+					}
+					// If searching for a struct field name
+					if st, ok := s.Type.(*ast.StructType); ok {
+						for _, field := range st.Fields.List {
+							for _, id := range field.Names {
+								if id.Name == name {
+									return id.Pos()
+								}
+							}
+						}
+					}
+				case *ast.ValueSpec:
+					for _, id := range s.Names {
+						if id.Name == name {
+							return id.Pos()
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return token.NoPos
+}
+
+func positionToPos(fset *token.FileSet, file *ast.File, line, col int) token.Pos {
+	tf := fset.File(file.Pos())
+	if tf == nil || line < 1 || line > tf.LineCount() {
+		return token.NoPos
+	}
+	return tf.LineStart(line) + token.Pos(col-1)
+}
+
+type SymbolLocation struct {
+	Name   string
+	Kind   string // "func", "type", "struct", "var", "const"
+	Line   int    // 1-based
+	Column int    // 1-based
+}
+
+// FindSymbolLoc finds the location of a top-level symbol matching exactName.
+// src can be string, []byte, or io.Reader.
+func FindSymbolLoc(src any, exactName string) (SymbolLocation, bool) {
+	symbols := ExtractAllSymbols(src)
+	for _, sym := range symbols {
+		if sym.Name == exactName {
+			return sym, true
+		}
+	}
+	return SymbolLocation{}, false
+}
+
+// ExtractAllSymbols collects all top-level symbols in the file.
+// Useful for fuzzy finding or symbol pickers (e.g. Ctrl+P / Cmd+Shift+O).
+func ExtractAllSymbols(src any) []SymbolLocation {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "buffer.go", src, 0)
+	if err != nil && file == nil {
+		return nil
+	}
+
+	var results []SymbolLocation
+
+	for _, decl := range file.Decls {
+		switch d := decl.(type) {
+		case *ast.FuncDecl:
+			pos := fset.Position(d.Name.Pos())
+			kind := "func"
+			if d.Recv != nil {
+				kind = "method"
+			}
+			results = append(results, SymbolLocation{
+				Name:   d.Name.Name,
+				Kind:   kind,
+				Line:   pos.Line,
+				Column: pos.Column,
+			})
+
+		case *ast.GenDecl:
+			for _, spec := range d.Specs {
+				switch s := spec.(type) {
+				case *ast.TypeSpec:
+					pos := fset.Position(s.Name.Pos())
+					kind := "type"
+					if _, ok := s.Type.(*ast.StructType); ok {
+						kind = "struct"
+					} else if _, ok := s.Type.(*ast.InterfaceType); ok {
+						kind = "interface"
+					}
+					results = append(results, SymbolLocation{
+						Name:   s.Name.Name,
+						Kind:   kind,
+						Line:   pos.Line,
+						Column: pos.Column,
+					})
+
+				case *ast.ValueSpec:
+					kind := "var"
+					if d.Tok == token.CONST {
+						kind = "const"
+					}
+					for _, name := range s.Names {
+						pos := fset.Position(name.Pos())
+						results = append(results, SymbolLocation{
+							Name:   name.Name,
+							Kind:   kind,
+							Line:   pos.Line,
+							Column: pos.Column,
+						})
+					}
+				}
+			}
+		}
+	}
+
+	return results
+}
+
+// FilterSymbols returns top-level symbols whose names contain query (case-insensitive).
+func FilterSymbols(src []SymbolLocation, query string) []SymbolLocation {
+	if query == "" {
+		return src
+	}
+
+	queryLower := strings.ToLower(query)
+	var matches []SymbolLocation
+
+	for _, sym := range src {
+		if strings.Contains(strings.ToLower(sym.Name), queryLower) {
+			matches = append(matches, sym)
+		}
+	}
+
+	return matches
 }

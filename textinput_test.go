@@ -1,7 +1,7 @@
 package main
 
 import (
-	"kero"
+	"github.com/cansyan/kero"
 	"testing"
 )
 
