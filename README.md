@@ -8,7 +8,7 @@ Key bindings:
 		- Enter replace current match and move to the next match
 		- Ctrl+Enter replace all matches
 		- Tab skip current match and move to the next match
-- Ctrl+R start symbol picker
+- Ctrl+R symbol picker
 - Shift+Up/Down/Left/Right start selection
 	- Ctrl+D select word under cursor
 	- Ctrl+L expand selection to line

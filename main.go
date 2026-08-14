@@ -65,7 +65,8 @@ type Editor struct {
 	vetResult  chan vetResult
 	vetVersion atomic.Uint64
 
-	picker SymbolPicker
+	symbolPicker SymbolPicker
+	symbolInput  TextInput
 }
 
 type vetResult struct {
@@ -132,7 +133,7 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 	if e.cmdMode {
 		return e.updateCmdPalette(key)
 	}
-	if e.picker.Active {
+	if e.symbolPicker.Active {
 		e.updateSymbolPicker(key)
 		return nil
 	}
@@ -375,7 +376,7 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 		}
 
 		f.Write(1, y, fmt.Sprintf("%*d ", lineNoW, lineIndex+1), lineNoStyle)
-		if e.hasvet(lineIndex) {
+		if e.hasVet(lineIndex) {
 			f.Write(0, y, "x", kero.NewStyle().Foreground(kero.ColorRed))
 		}
 
@@ -501,7 +502,7 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 			e.drawFind(f, messageY, ctx.Width)
 			return
 		}
-		if e.picker.Active {
+		if e.symbolPicker.Active {
 			e.drawSymbolPicker(f, messageY, ctx.Width)
 			return
 		}
@@ -1162,7 +1163,7 @@ func (e *Editor) applyVetResults() {
 	}
 }
 
-func (e *Editor) hasvet(row int) bool {
+func (e *Editor) hasVet(row int) bool {
 	_, ok := e.vetForLine(row)
 	return ok
 }
@@ -1432,63 +1433,63 @@ func (e *Editor) GotoSymbol(name string) {
 }
 
 type SymbolPicker struct {
-	Active    bool
-	Input     TextInput
-	Symbols   []SymbolLocation
-	Filtered  []SymbolLocation
-	Index     int // selected index
-	RowOffset int // scroll
-	Limit     int // max number of symbols to display
+	Active   bool
+	All      []SymbolLocation
+	Filtered []SymbolLocation
+	Index    int
+	Offset   int // scrolling offset
+	Limit    int // max number of symbols to display
 }
 
 func (e *Editor) updateSymbolPicker(ev kero.KeyEvent) {
-	prevQuery := e.picker.Input.Value
+	prevQuery := e.symbolInput.Value
 	switch ev.String() {
 	case "esc":
 		// Close overlay
-		e.picker.Active = false
+		e.symbolPicker.Active = false
 	case "enter":
-		if len(e.picker.Filtered) == 0 {
+		if len(e.symbolPicker.Filtered) == 0 {
 			return
 		}
-		picked := e.picker.Filtered[e.picker.Index]
+		picked := e.symbolPicker.Filtered[e.symbolPicker.Index]
 		e.cursor.Row = picked.Line - 1
 		e.cursor.Col = picked.Column - 1
-		e.picker.Active = false
+		e.symbolPicker.Active = false
 	case "up", "ctrl+p":
-		e.picker.Index = (e.picker.Index - 1 + len(e.picker.Filtered)) % len(e.picker.Filtered)
+		e.symbolPicker.Index = (e.symbolPicker.Index - 1 + len(e.symbolPicker.Filtered)) % len(e.symbolPicker.Filtered)
 	case "down", "ctrl+n":
-		e.picker.Index = (e.picker.Index + 1) % len(e.picker.Filtered)
+		e.symbolPicker.Index = (e.symbolPicker.Index + 1) % len(e.symbolPicker.Filtered)
 	default:
-		e.picker.Input.Update(ev)
+		e.symbolInput.Update(ev)
 	}
-	if q := e.picker.Input.Value; q != prevQuery {
-		e.picker.Filtered = FilterSymbols(e.picker.Symbols, q)
-		e.picker.Index = 0
+	if q := e.symbolInput.Value; q != prevQuery {
+		e.symbolPicker.Filtered = FilterSymbols(e.symbolPicker.All, q)
+		e.symbolPicker.Index = 0
 	}
-	if e.picker.Index < e.picker.RowOffset {
-		e.picker.RowOffset = e.picker.Index
+	if e.symbolPicker.Index < e.symbolPicker.Offset {
+		e.symbolPicker.Offset = e.symbolPicker.Index
 	}
-	if e.picker.Index > e.picker.RowOffset+e.picker.Limit-1 {
-		e.picker.RowOffset = e.picker.Index - (e.picker.Limit - 1)
+	if e.symbolPicker.Index > e.symbolPicker.Offset+e.symbolPicker.Limit-1 {
+		e.symbolPicker.Offset = e.symbolPicker.Index - (e.symbolPicker.Limit - 1)
 	}
 }
 
+// draws symbol list and TextInput
 func (e *Editor) drawSymbolPicker(f *kero.Frame, y, width int) {
 	normal := kero.NewStyle()
 	prompt := "Symbol: "
 	f.Write(0, y, prompt, normal)
 
-	p := e.picker
+	p := e.symbolPicker
 	inputX := len([]rune(prompt))
-	p.Input.Draw(f, kero.Rect{X: inputX, Y: y, W: width, H: 1}, normal)
+	e.symbolInput.Draw(f, kero.Rect{X: inputX, Y: y, W: width, H: 1}, normal)
 
 	// render the symbol list above the editor buffer
 	n := min(len(p.Filtered), p.Limit)
 	rect := kero.Rect{X: inputX, Y: y - n, W: width, H: n}
 	f.Fill(rect, ' ', normal.Reverse())
 	for i := range n {
-		j := i + p.RowOffset
+		j := i + p.Offset
 		if j == p.Index {
 			f.Write(rect.X, rect.Y+i, " > "+p.Filtered[j].Name, normal.Reverse().Bold())
 		} else {
@@ -1499,13 +1500,13 @@ func (e *Editor) drawSymbolPicker(f *kero.Frame, y, width int) {
 
 func (e *Editor) OpenSymbolPicker() {
 	symbols := ExtractAllSymbols(e.buf.String())
-	e.picker = SymbolPicker{
+	e.symbolPicker = SymbolPicker{
 		Active:   true,
-		Symbols:  symbols,
+		All:      symbols,
 		Filtered: FilterSymbols(symbols, ""),
-		Index:    0,
 		Limit:    8,
 	}
+	e.symbolInput = TextInput{}
 }
 
 // parsePathArg parses an argument of the form "path", "path:row", or
