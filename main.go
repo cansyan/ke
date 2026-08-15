@@ -117,11 +117,15 @@ type Editor struct {
 
 	symbolPicker SymbolPicker
 	symbolInput  TextInput
+
+	// reports whether the key comes from a paste action,
+	// to distinguish the manual KeyEnter or a pasted \n
+	pasting bool
 }
 
 type diagResult struct {
-	version uint64
-	vets    []Diagnostic
+	version     uint64
+	diagnostics []Diagnostic
 }
 
 func (e *Editor) Init(ctx *kero.Context) error {
@@ -155,7 +159,15 @@ func (e *Editor) Init(ctx *kero.Context) error {
 }
 
 func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
-	e.applyVetResults()
+	switch ev.(type) {
+	case kero.PasteStartEvent:
+		e.pasting = true
+	case kero.PasteEndEvent:
+		e.pasting = false
+	}
+
+	// refresh diagnostic as soon as possible, no matter what event is
+	e.applyDiagnosticResults()
 	key, ok := ev.(kero.KeyEvent)
 	if !ok {
 		return nil
@@ -202,7 +214,7 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 			e.startCmdPalette("")
 			return nil
 		case "ctrl+]":
-			if v := e.nextVet(); v.Message != "" {
+			if v := e.nextDiagnostic(); v.Message != "" {
 				e.cursor = e.buf.ClampPos(Position{Row: v.Row, Col: v.Col})
 			}
 			return nil
@@ -256,7 +268,13 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 		if e.hasSelect() {
 			e.deleteSelect()
 		}
-		// FIXME: must distinguish the Enter from manual keypress and a pasted block of text, otherwise pasting mess up indentation
+		// insert raw newline
+		if e.pasting {
+			e.cursor = e.buf.Insert(e.cursor, "\n")
+			return nil
+		}
+
+		// insert newline with auto-indent
 		var n int
 		line := e.buf.Line(e.cursor.Row)
 		for _, b := range line {
@@ -449,7 +467,7 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 		}
 		f.Write(gutterW, y, visPadded, style)
 
-		if v, ok := e.vetForLine(lineIndex); ok {
+		if v, ok := e.diagnosticForLine(lineIndex); ok {
 			red := kero.NewStyle().Foreground(kero.ColorRed)
 			f.Write(0, y, "x", red)
 			f.Write(gutterW+len(visPadded)+2, y, v.Message, red)
@@ -525,13 +543,12 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 		f.Write(0, statusY, trimToWidth(status, ctx.Width), statusStyle)
 		if len(e.diags) > 0 {
 			warn := fmt.Sprintf("ctrl+] goto diagnostic")
-			vetStyle := kero.NewStyle().Foreground(kero.ColorRed).Reverse()
 			statusWidth := len([]rune(status))
 			f.Write(statusWidth+1, statusY, "| ", statusStyle)
 			keyWidth := len([]rune(e.lastKey.String()))
 			remainWidth := ctx.Width - statusWidth - keyWidth
 			if remainWidth > 0 {
-				f.Write(statusWidth+3, statusY, trimToWidth(warn, remainWidth), vetStyle)
+				f.Write(statusWidth+3, statusY, trimToWidth(warn, remainWidth), statusStyle.Background(kero.ColorRed))
 			}
 		}
 		if e.lastKey.Key != kero.KeyUnknown {
@@ -1157,8 +1174,8 @@ func (e *Editor) debounceCheckSemantic() {
 	filename := e.path
 	src := e.buf.NewReader()
 	e.diagTimer = time.AfterFunc(300*time.Millisecond, func() {
-		vets := CheckSemantics(filename, src)
-		result := diagResult{version: version, vets: vets}
+		diags := CheckSemantics(filename, src)
+		result := diagResult{version: version, diagnostics: diags}
 		select {
 		case <-e.diagChan:
 		default:
@@ -1170,7 +1187,7 @@ func (e *Editor) debounceCheckSemantic() {
 	})
 }
 
-func (e *Editor) applyVetResults() {
+func (e *Editor) applyDiagnosticResults() {
 	if e.diagChan == nil {
 		return
 	}
@@ -1178,7 +1195,7 @@ func (e *Editor) applyVetResults() {
 		select {
 		case result := <-e.diagChan:
 			if result.version == e.diagVersion.Load() {
-				e.diags = result.vets
+				e.diags = result.diagnostics
 			}
 		default:
 			return
@@ -1186,24 +1203,24 @@ func (e *Editor) applyVetResults() {
 	}
 }
 
-func (e *Editor) vetForLine(row int) (Diagnostic, bool) {
-	for _, vet := range e.diags {
-		if vet.Row == row {
-			return vet, true
+func (e *Editor) diagnosticForLine(row int) (Diagnostic, bool) {
+	for _, d := range e.diags {
+		if d.Row == row {
+			return d, true
 		}
 	}
 	return Diagnostic{}, false
 }
 
-func (e *Editor) nextVet() Diagnostic {
+func (e *Editor) nextDiagnostic() Diagnostic {
 	if len(e.diags) == 0 {
 		return Diagnostic{}
 	}
 
-	for _, vet := range e.diags {
-		if vet.Row > e.cursor.Row ||
-			(vet.Row == e.cursor.Row && vet.Col > e.cursor.Col) {
-			return vet
+	for _, d := range e.diags {
+		if d.Row > e.cursor.Row ||
+			(d.Row == e.cursor.Row && d.Col > e.cursor.Col) {
+			return d
 		}
 	}
 
