@@ -285,6 +285,10 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 		}
 		indent := line[:n]
 		if key.Mod&kero.ModCtrl != 0 {
+			// add indentation on block start
+			if line[len(line)-1] == '{' {
+				indent= append(indent, '\t')
+			}
 			p := Position{Row: e.cursor.Row, Col: len(line)}
 			e.cursor = e.buf.Insert(p, "\n"+string(indent))
 		} else {
