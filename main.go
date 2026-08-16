@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
 	"go/ast"
@@ -51,21 +52,29 @@ func parsePathArg(arg string) (path string, row, col int) {
 }
 
 func main() {
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
+
+	e := &Editor{}
+	var path string
+	var row, col int
+	if len(os.Args) > 1 {
+		path, row, col = parsePathArg(os.Args[1])
+	}
+	err := e.OpenFile(path)
+	if err != nil {
+		log.Fatal(err)
+	}
+	e.Buffer.Cursor = e.Buffer.ClampPos(Position{Row: row, Col: col})
+
 	f, err := os.OpenFile("/tmp/ke.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer f.Close()
 	log.SetOutput(f)
-	log.SetFlags(log.LstdFlags | log.Lshortfile)
-
-	app := &Editor{}
-	if len(os.Args) > 1 {
-		app.path, app.cursor.Row, app.cursor.Col = parsePathArg(os.Args[1])
-	}
 
 	// set FPS for refreshing diagnostic
-	p := kero.New(app, kero.WithAltScreen(true), kero.WithKitty(true), kero.WithFPS(3))
+	p := kero.New(e, kero.WithAltScreen(true), kero.WithKitty(true), kero.WithFPS(3))
 	if err := p.Run(); err != nil {
 		panic(err)
 	}
@@ -73,15 +82,10 @@ func main() {
 
 // Editor implements kero.App interface
 type Editor struct {
-	path string
+	*Buffer // alias to the buffers[active], make refactor easier
+	buffers []*Buffer
+	active  int // index of currently active buffer
 
-	buf    *Buffer
-	cursor Position
-
-	rowOffset int // Scroll offsets for the view viewport
-	colOffset int // visual display column offset (0-based horizontal scroll position)
-
-	dirty   bool
 	message string
 
 	// prompt for saving
@@ -101,14 +105,11 @@ type Editor struct {
 	cmdMode  bool
 	cmdInput TextInput
 
-	// selection state
-	selecting bool
-	selAnchor Position // selection at [e.selAnchor, e.pos)
-
 	clipboard  string
 	clipIsLine bool
 
 	lastKey kero.KeyEvent
+	// optional: record the time of lastKey, make it expire after a while
 
 	diags       []Diagnostic
 	diagTimer   *time.Timer
@@ -129,30 +130,8 @@ type diagResult struct {
 }
 
 func (e *Editor) Init(ctx *kero.Context) error {
-	if e.path == "" {
-		e.buf = NewBuffer("")
-		e.cursor.Row, e.cursor.Col = 0, 0
-		e.message = "new buffer"
-		return nil
-	}
-
-	data, err := os.ReadFile(e.path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			e.buf = NewBuffer("")
-			e.cursor.Row, e.cursor.Col = 0, 0
-			e.message = "new file"
-			return nil
-		}
-		return err
-	}
-
-	text := strings.ReplaceAll(string(data), "\r\n", "\n")
-	text = strings.TrimSuffix(text, "\n")
-	e.buf = NewBuffer(text)
-	e.cursor = e.buf.ClampPos(e.cursor)
 	e.ensureCursorVisible(ctx)
-	if isGoFile(e.path) {
+	if isGoFile(e.Path) {
 		e.debounceCheckSemantic()
 	}
 	return nil
@@ -180,7 +159,7 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 	// can quit at anytime, first priority
 	if key.String() == "ctrl+q" {
 		quitAgain := e.lastKey.String() == "ctrl+q"
-		if e.dirty && !quitAgain {
+		if e.Dirty && !quitAgain {
 			e.message = "warn: unsaved changes, press ctrl+s to save or ctrl+q again to quit"
 			return nil
 		}
@@ -210,12 +189,24 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 		case "ctrl+g":
 			e.GotoDefinition()
 			return nil
+		case "ctrl+n":
+			// ctrl+b ctrl+n goto next buffer
+			if e.lastKey.String() == "ctrl+b" {
+				e.NextBuffer()
+				return nil
+			}
+			return nil
 		case "ctrl+p":
+			// ctrl+b ctrl+p goto previous buffer
+			if e.lastKey.String() == "ctrl+b" {
+				e.PrevBuffer()
+				return nil
+			}
 			e.startCmdPalette("")
 			return nil
 		case "ctrl+]":
 			if v := e.nextDiagnostic(); v.Message != "" {
-				e.cursor = e.buf.ClampPos(Position{Row: v.Row, Col: v.Col})
+				e.Cursor = e.Buffer.ClampPos(Position{Row: v.Row, Col: v.Col})
 			}
 			return nil
 		case "ctrl+s":
@@ -237,10 +228,10 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 				// duplicate selection not implemented yet
 				return nil
 			}
-			if start, end := e.buf.WordBounds(e.cursor); start != end {
-				e.selecting = true
-				e.selAnchor = start
-				e.cursor = end
+			if start, end := e.Buffer.WordBounds(e.Cursor); start != end {
+				e.Selecting = true
+				e.SelAnchor = start
+				e.Cursor = end
 			}
 			return nil
 		case "ctrl+l":
@@ -251,14 +242,14 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 			e.deleteToLineEnd()
 			return nil
 		case "ctrl+a":
-			p := e.buf.LineStartNonSpace(e.cursor)
-			if e.cursor == p {
-				e.cursor.Col = 0
+			p := e.Buffer.LineStartNonSpace(e.Cursor)
+			if e.Cursor == p {
+				e.Cursor.Col = 0
 				return nil
 			}
-			e.cursor = p
+			e.Cursor = p
 		case "ctrl+e":
-			e.cursor = e.buf.LineEnd(e.cursor)
+			e.Cursor = e.Buffer.LineEnd(e.Cursor)
 		}
 		if key.Mod != 0 {
 			break
@@ -270,13 +261,13 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 		}
 		// insert raw newline
 		if e.pasting {
-			e.cursor = e.buf.Insert(e.cursor, "\n")
+			e.Cursor = e.Buffer.Insert(e.Cursor, "\n")
 			return nil
 		}
 
 		// insert newline with auto-indent
 		var n int
-		line := e.buf.Line(e.cursor.Row)
+		line := e.Buffer.Line(e.Cursor.Row)
 		for _, b := range line {
 			if !unicode.IsSpace(b) {
 				break
@@ -287,12 +278,12 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 		if key.Mod&kero.ModCtrl != 0 {
 			// add indentation on block start
 			if line[len(line)-1] == '{' {
-				indent= append(indent, '\t')
+				indent = append(indent, '\t')
 			}
-			p := Position{Row: e.cursor.Row, Col: len(line)}
-			e.cursor = e.buf.Insert(p, "\n"+string(indent))
+			p := Position{Row: e.Cursor.Row, Col: len(line)}
+			e.Cursor = e.Buffer.Insert(p, "\n"+string(indent))
 		} else {
-			e.cursor = e.buf.Insert(e.cursor, "\n"+string(indent))
+			e.Cursor = e.Buffer.Insert(e.Cursor, "\n"+string(indent))
 		}
 		e.markDirty()
 	case kero.KeyTab:
@@ -301,7 +292,7 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 			break
 		}
 		if e.hasSelect() {
-			start, end := orderPos(e.selAnchor, e.cursor)
+			start, end := orderPos(e.SelAnchor, e.Cursor)
 			if start.Row != end.Row {
 				e.indentSelect()
 				break
@@ -316,37 +307,37 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 		switch key.String() {
 		case "ctrl+backspace", "cmd+backspace":
 			// delete to line start
-			e.cursor = e.buf.DeleteRange(Position{Row: e.cursor.Row, Col: 0}, e.cursor)
+			e.Cursor = e.Buffer.DeleteRange(Position{Row: e.Cursor.Row, Col: 0}, e.Cursor)
 		case "alt+backspace":
 			// delete word backwards
-			prev := e.buf.MoveWordLeft(e.cursor)
-			e.cursor = e.buf.DeleteRange(prev, e.cursor)
+			prev := e.Buffer.MoveWordLeft(e.Cursor)
+			e.Cursor = e.Buffer.DeleteRange(prev, e.Cursor)
 		case "cmd+shift+backspace":
 			// delete whole line
-			e.cursor = e.buf.DeleteRange(Position{Row: e.cursor.Row}, Position{Row: e.cursor.Row + 1})
+			e.Cursor = e.Buffer.DeleteRange(Position{Row: e.Cursor.Row}, Position{Row: e.Cursor.Row + 1})
 		default:
-			e.cursor = e.buf.DeleteRange(e.buf.PrevPos(e.cursor), e.cursor)
+			e.Cursor = e.Buffer.DeleteRange(e.Buffer.PrevPos(e.Cursor), e.Cursor)
 		}
 		e.markDirty()
 	case kero.KeyDelete:
-		e.cursor = e.buf.DeleteRange(e.cursor, e.buf.NextPos(e.cursor))
+		e.Cursor = e.Buffer.DeleteRange(e.Cursor, e.Buffer.NextPos(e.Cursor))
 		e.markDirty()
 	case kero.KeyLeft:
 		switch key.String() {
 		case "alt+left":
-			e.cursor = e.buf.MoveWordLeft(e.cursor)
+			e.Cursor = e.Buffer.MoveWordLeft(e.Cursor)
 		case "cmd+left":
-			p := e.buf.LineStartNonSpace(e.cursor)
-			if e.cursor == p {
-				e.cursor.Col = 0
+			p := e.Buffer.LineStartNonSpace(e.Cursor)
+			if e.Cursor == p {
+				e.Cursor.Col = 0
 			} else {
-				e.cursor = p
+				e.Cursor = p
 			}
 		case "shift+left":
 			// start selection
-			if !e.selecting {
-				e.selecting = true
-				e.selAnchor = e.cursor
+			if !e.Selecting {
+				e.Selecting = true
+				e.SelAnchor = e.Cursor
 			}
 			e.moveLeft()
 		default:
@@ -355,14 +346,14 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 	case kero.KeyRight:
 		switch key.String() {
 		case "alt+right":
-			e.cursor = e.buf.MoveWordRight(e.cursor)
+			e.Cursor = e.Buffer.MoveWordRight(e.Cursor)
 		case "cmd+right":
-			e.cursor = e.buf.LineEnd(e.cursor)
+			e.Cursor = e.Buffer.LineEnd(e.Cursor)
 		case "shift+right":
 			// start selection
-			if !e.selecting {
-				e.selecting = true
-				e.selAnchor = e.cursor
+			if !e.Selecting {
+				e.Selecting = true
+				e.SelAnchor = e.Cursor
 			}
 			e.moveRight()
 		default:
@@ -372,13 +363,13 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 		switch key.String() {
 		case "cmd+up":
 			// file start
-			e.cursor.Row = 0
-			e.cursor.Col = 0
+			e.Cursor.Row = 0
+			e.Cursor.Col = 0
 		case "shift+up":
 			// start selection
-			if !e.selecting {
-				e.selecting = true
-				e.selAnchor = e.cursor
+			if !e.Selecting {
+				e.Selecting = true
+				e.SelAnchor = e.Cursor
 			}
 			e.moveUp()
 		default:
@@ -388,33 +379,33 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 		switch key.String() {
 		case "cmd+down":
 			// file end
-			e.cursor.Row = e.buf.LenLines() - 1
-			e.cursor = e.buf.LineEnd(e.cursor)
+			e.Cursor.Row = e.Buffer.LenLines() - 1
+			e.Cursor = e.Buffer.LineEnd(e.Cursor)
 		case "shift+down":
 			// start selection
-			if !e.selecting {
-				e.selecting = true
-				e.selAnchor = e.cursor
+			if !e.Selecting {
+				e.Selecting = true
+				e.SelAnchor = e.Cursor
 			}
 			e.moveDown()
 		default:
 			e.moveDown()
 		}
 	case kero.KeyHome:
-		p := e.buf.LineStartNonSpace(e.cursor)
-		if e.cursor == p {
-			e.cursor.Col = 0
+		p := e.Buffer.LineStartNonSpace(e.Cursor)
+		if e.Cursor == p {
+			e.Cursor.Col = 0
 			return nil
 		}
-		e.cursor = p
+		e.Cursor = p
 	case kero.KeyEnd:
-		e.cursor = e.buf.LineEnd(e.cursor)
+		e.Cursor = e.Buffer.LineEnd(e.Cursor)
 	case kero.KeyPgUp:
-		e.cursor.Row -= editorHeight(ctx)
-		e.cursor = e.buf.ClampPos(e.cursor)
+		e.Cursor.Row -= editorHeight(ctx)
+		e.Cursor = e.Buffer.ClampPos(e.Cursor)
 	case kero.KeyPgDown:
-		e.cursor.Row += editorHeight(ctx)
-		e.cursor = e.buf.ClampPos(e.cursor)
+		e.Cursor.Row += editorHeight(ctx)
+		e.Cursor = e.Buffer.ClampPos(e.Cursor)
 	case kero.KeyEsc:
 		e.clearSelect()
 	}
@@ -431,34 +422,34 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 	messageStyle := kero.NewStyle()
 
 	name := "[No Name]"
-	if e.path != "" {
-		name = filepath.Base(e.path)
+	if e.Path != "" {
+		name = filepath.Base(e.Path)
 	}
 	modified := ""
-	if e.dirty {
+	if e.Dirty {
 		modified = " *"
 	}
 
 	editorH := editorHeight(ctx)
-	lineNoW := lineNumberWidth(e.buf.LenLines())
+	lineNoW := lineNumberWidth(e.Buffer.LenLines())
 	gutterW := lineNoW + 2 // marker, line number, and separator
 	for y := range editorH {
-		lineIndex := e.rowOffset + y
-		if lineIndex >= e.buf.LenLines() {
+		lineIndex := e.RowOffset + y
+		if lineIndex >= e.Buffer.LenLines() {
 			f.Write(0, y, "~", lineNoStyle)
 			continue
 		}
 
 		f.Write(1, y, fmt.Sprintf("%*d ", lineNoW, lineIndex+1), lineNoStyle)
 
-		srcLine := e.buf.Line(lineIndex)
+		srcLine := e.Buffer.Line(lineIndex)
 		fullPadded := padTab(srcLine, 4)
 		limit := max(0, ctx.Width-gutterW)
 
 		// visual part of the padded line
 		var visPadded string
-		if e.colOffset < len(fullPadded) {
-			visPadded = fullPadded[e.colOffset:]
+		if e.ColOffset < len(fullPadded) {
+			visPadded = fullPadded[e.ColOffset:]
 		}
 		if len(visPadded) > limit {
 			visPadded = visPadded[:limit]
@@ -466,7 +457,7 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 
 		// draw the line
 		style := textStyle
-		if lineIndex == e.cursor.Row {
+		if lineIndex == e.Cursor.Row {
 			style = style.Underline()
 		}
 		f.Write(gutterW, y, visPadded, style)
@@ -478,8 +469,8 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 		}
 
 		// highlight selection if any
-		if e.selecting {
-			start, end := orderPos(e.selAnchor, e.cursor)
+		if e.Selecting {
+			start, end := orderPos(e.SelAnchor, e.Cursor)
 			if lineIndex >= start.Row && lineIndex <= end.Row {
 				var selStartCol, selEndCol int
 				if start.Row == end.Row {
@@ -499,8 +490,8 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 				startVisCol := runeIndexToDisplayColumn(srcLine, selStartCol)
 				endVisCol := runeIndexToDisplayColumn(srcLine, selEndCol)
 
-				startDisplay := max(0, min(startVisCol-e.colOffset, len(visPadded)))
-				endDisplay := max(0, min(endVisCol-e.colOffset, len(visPadded)))
+				startDisplay := max(0, min(startVisCol-e.ColOffset, len(visPadded)))
+				endDisplay := max(0, min(endVisCol-e.ColOffset, len(visPadded)))
 
 				for x := startDisplay; x < endDisplay; x++ {
 					ch := rune(visPadded[x])
@@ -513,8 +504,8 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 			startVisCol := runeIndexToDisplayColumn(srcLine, e.findMatchStart.Col)
 			endVisCol := runeIndexToDisplayColumn(srcLine, e.findMatchEnd.Col)
 
-			startDisplay := max(0, min(startVisCol-e.colOffset, len(visPadded)))
-			endDisplay := max(0, min(endVisCol-e.colOffset, len(visPadded)))
+			startDisplay := max(0, min(startVisCol-e.ColOffset, len(visPadded)))
+			endDisplay := max(0, min(endVisCol-e.ColOffset, len(visPadded)))
 
 			for x := startDisplay; x < endDisplay; x++ {
 				ch := rune(visPadded[x])
@@ -523,10 +514,10 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 		}
 	}
 
-	line := e.buf.Line(e.cursor.Row)
-	cursorDisplayCol := runeIndexToDisplayColumn(line, e.cursor.Col)
-	cursorX := gutterW + cursorDisplayCol - e.colOffset
-	cursorY := 0 + e.cursor.Row - e.rowOffset
+	line := e.Buffer.Line(e.Cursor.Row)
+	cursorDisplayCol := runeIndexToDisplayColumn(line, e.Cursor.Col)
+	cursorX := gutterW + cursorDisplayCol - e.ColOffset
+	cursorY := 0 + e.Cursor.Row - e.RowOffset
 	if cursorY >= 0 && cursorY < editorH && cursorX >= gutterW && cursorX < ctx.Width {
 		fullLinePadded := padTab(line, 4)
 		ch := ' '
@@ -539,14 +530,18 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 	statusY := ctx.Height - 1
 	if statusY >= 0 {
 		status := fmt.Sprintf(" %s | %d lines | Ln %d, Col %d",
-			name+modified, e.buf.LenLines(), e.cursor.Row+1, cursorDisplayCol+1)
-		if e.selecting {
+			name+modified, e.Buffer.LenLines(), e.Cursor.Row+1, cursorDisplayCol+1)
+		if len(e.buffers) > 1 {
+			status = fmt.Sprintf(" %s (%d/%d buffers) | Ln %d, Col %d",
+				name+modified, e.active+1, len(e.buffers), e.Cursor.Row+1, cursorDisplayCol+1)
+		}
+		if e.Selecting {
 			status = status + " | Selecting"
 		}
 		f.Fill(kero.Rect{X: 0, Y: statusY, W: ctx.Width, H: 1}, ' ', statusStyle)
 		f.Write(0, statusY, trimToWidth(status, ctx.Width), statusStyle)
 		if len(e.diags) > 0 {
-			warn := fmt.Sprintf("ctrl+] goto diagnostic")
+			warn := "ctrl+] goto diagnostic"
 			statusWidth := len([]rune(status))
 			f.Write(statusWidth+1, statusY, "| ", statusStyle)
 			keyWidth := len([]rune(e.lastKey.String()))
@@ -590,15 +585,15 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 }
 
 func (e *Editor) selectLine() {
-	if !e.selecting {
-		e.selecting = true
-		e.selAnchor = Position{Row: e.cursor.Row, Col: 0}
+	if !e.Selecting {
+		e.Selecting = true
+		e.SelAnchor = Position{Row: e.Cursor.Row, Col: 0}
 	}
-	if e.cursor.Row < e.buf.LenLines()-1 {
-		e.cursor.Row++
-		e.cursor.Col = 0
+	if e.Cursor.Row < e.Buffer.LenLines()-1 {
+		e.Cursor.Row++
+		e.Cursor.Col = 0
 	} else {
-		e.cursor = e.buf.LineEnd(e.cursor)
+		e.Cursor = e.Buffer.LineEnd(e.Cursor)
 	}
 }
 
@@ -607,21 +602,21 @@ func isWordChar(r rune) bool {
 }
 
 func (e *Editor) hasSelect() bool {
-	return e.selecting && e.selAnchor != e.cursor
+	return e.Selecting && e.SelAnchor != e.Cursor
 }
 
 func (e *Editor) clearSelect() {
-	e.selecting = false
+	e.Selecting = false
 }
 
 func (e *Editor) copy() {
 	if e.hasSelect() {
-		e.clipboard = e.buf.GetRange(e.selAnchor, e.cursor)
+		e.clipboard = e.Buffer.GetRange(e.SelAnchor, e.Cursor)
 		e.clipIsLine = false
 		return
 	}
 	// copy entire current line, remember it's a line copy
-	e.clipboard = string(e.buf.Line(e.cursor.Row))
+	e.clipboard = string(e.Buffer.Line(e.Cursor.Row))
 	e.clipIsLine = true
 }
 
@@ -630,7 +625,7 @@ func (e *Editor) indentSelect() {
 		return
 	}
 
-	start, end := orderPos(e.selAnchor, e.cursor)
+	start, end := orderPos(e.SelAnchor, e.Cursor)
 	if start.Row == end.Row {
 		return
 	}
@@ -639,13 +634,13 @@ func (e *Editor) indentSelect() {
 		lastRow = end.Row - 1
 	}
 	for r := start.Row; r <= lastRow; r++ {
-		e.buf.Insert(Position{Row: r, Col: 0}, "\t")
+		e.Buffer.Insert(Position{Row: r, Col: 0}, "\t")
 	}
-	if start.Row <= e.selAnchor.Row && e.selAnchor.Row <= lastRow {
-		e.selAnchor.Col++
+	if start.Row <= e.SelAnchor.Row && e.SelAnchor.Row <= lastRow {
+		e.SelAnchor.Col++
 	}
-	if start.Row <= e.cursor.Row && e.cursor.Row <= lastRow {
-		e.cursor.Col++
+	if start.Row <= e.Cursor.Row && e.Cursor.Row <= lastRow {
+		e.Cursor.Col++
 	}
 	e.markDirty()
 }
@@ -666,37 +661,37 @@ func unindentLine(s string) (string, int) {
 
 func (e *Editor) unindentSelectOrLine() {
 	if !e.hasSelect() {
-		newLine, removed := unindentLine(string(e.buf.Line(e.cursor.Row)))
+		newLine, removed := unindentLine(string(e.Buffer.Line(e.Cursor.Row)))
 		if removed > 0 {
-			e.buf.SetLine(e.cursor.Row, []rune(newLine))
-			e.cursor.Col = max(0, e.cursor.Col-removed)
+			e.Buffer.SetLine(e.Cursor.Row, []rune(newLine))
+			e.Cursor.Col = max(0, e.Cursor.Col-removed)
 			e.markDirty()
 		}
 		return
 	}
 
-	start, end := orderPos(e.selAnchor, e.cursor)
+	start, end := orderPos(e.SelAnchor, e.Cursor)
 	lastRow := end.Row
 	if end.Col == 0 && end.Row > start.Row {
 		lastRow = end.Row - 1
 	}
 	var startRemoved, endRemoved int
 	for r := start.Row; r <= lastRow; r++ {
-		newLine, removed := unindentLine(string(e.buf.Line(r)))
-		if r == e.selAnchor.Row {
+		newLine, removed := unindentLine(string(e.Buffer.Line(r)))
+		if r == e.SelAnchor.Row {
 			startRemoved = removed
 		}
-		if r == e.cursor.Row {
+		if r == e.Cursor.Row {
 			endRemoved = removed
 		}
-		e.buf.SetLine(r, []rune(newLine))
+		e.Buffer.SetLine(r, []rune(newLine))
 	}
 
-	if e.selAnchor.Row <= lastRow {
-		e.selAnchor.Col = max(0, e.selAnchor.Col-startRemoved)
+	if e.SelAnchor.Row <= lastRow {
+		e.SelAnchor.Col = max(0, e.SelAnchor.Col-startRemoved)
 	}
-	if e.cursor.Row <= lastRow {
-		e.cursor.Col = max(0, e.cursor.Col-endRemoved)
+	if e.Cursor.Row <= lastRow {
+		e.Cursor.Col = max(0, e.Cursor.Col-endRemoved)
 	}
 	e.markDirty()
 }
@@ -705,9 +700,9 @@ func (e *Editor) deleteSelect() {
 	if !e.hasSelect() {
 		return
 	}
-	start, end := orderPos(e.selAnchor, e.cursor)
-	e.cursor = e.buf.DeleteRange(start, end)
-	e.selecting = false
+	start, end := orderPos(e.SelAnchor, e.Cursor)
+	e.Cursor = e.Buffer.DeleteRange(start, end)
+	e.Selecting = false
 	e.markDirty()
 }
 
@@ -719,10 +714,10 @@ func (e *Editor) cut() {
 		return
 	}
 	// cut current line
-	p1 := Position{Row: e.cursor.Row}
-	e.clipboard = e.buf.GetRange(p1, e.buf.LineEnd(e.cursor))
+	p1 := Position{Row: e.Cursor.Row}
+	e.clipboard = e.Buffer.GetRange(p1, e.Buffer.LineEnd(e.Cursor))
 	e.clipIsLine = true
-	e.cursor = e.buf.DeleteRange(p1, Position{Row: e.cursor.Row + 1})
+	e.Cursor = e.Buffer.DeleteRange(p1, Position{Row: e.Cursor.Row + 1})
 	e.markDirty()
 }
 
@@ -738,13 +733,13 @@ func (e *Editor) paste() {
 	// whole-line copy: paste a fresh copy of that line ABOVE the current line,
 	// pushing the current line downward.
 	if e.clipIsLine && e.clipboard != "" {
-		e.buf.Insert(Position{Row: e.cursor.Row, Col: 0}, e.clipboard+"\n")
-		e.cursor.Row++
+		e.Buffer.Insert(Position{Row: e.Cursor.Row, Col: 0}, e.clipboard+"\n")
+		e.Cursor.Row++
 		e.markDirty()
 		return
 	}
 
-	e.cursor = e.buf.Insert(e.cursor, e.clipboard)
+	e.Cursor = e.Buffer.Insert(e.Cursor, e.clipboard)
 	e.markDirty()
 }
 
@@ -765,25 +760,23 @@ func padTab(s []rune, tabSize int) string {
 }
 
 func (e *Editor) save() error {
-	if e.path == "" {
+	if e.Path == "" {
 		e.startSaveAs()
 		return nil
 	}
 
-	data := append(e.buf.Bytes(), '\n')
-	if err := os.WriteFile(e.path, data, 0644); err != nil {
+	if err := e.Buffer.Save(); err != nil {
 		e.message = "error: " + err.Error()
 		return nil
 	}
 
-	e.dirty = false
-	e.message = fmt.Sprintf("saved %s", filepath.Base(e.path))
+	e.message = fmt.Sprintf("saved %s", filepath.Base(e.Path))
 	return nil
 }
 
 func (e *Editor) startSaveAs() {
 	e.saveAs = true
-	e.saveInput.Value = e.path
+	e.saveInput.Value = e.Path
 	e.saveInput.Cursor = len([]rune(e.saveInput.Value))
 	e.message = "enter a filename"
 }
@@ -809,7 +802,7 @@ func (e *Editor) finishSaveAs() error {
 		return nil
 	}
 
-	e.path = path
+	e.Path = path
 	e.saveAs = false
 	return e.save()
 }
@@ -876,6 +869,17 @@ func (e *Editor) finishCmdPalette() error {
 	switch input[0] {
 	case '/':
 		// run commands
+		parts := strings.Fields(input)
+		switch parts[0] {
+		case "/open", "/o":
+			if len(parts) <= 1 {
+				return errors.New("required file path")
+			}
+			if err := e.OpenFile(parts[1]); err != nil {
+				return err
+			}
+		}
+		return nil
 	case ':':
 		// goto line, for example :123
 		if len(input) < 2 {
@@ -886,15 +890,17 @@ func (e *Editor) finishCmdPalette() error {
 		if err != nil {
 			return errors.New("invalid line number: " + lineStr)
 		}
-		if lineNum < 1 || lineNum > e.buf.LenLines() {
+		if lineNum < 1 || lineNum > e.Buffer.LenLines() {
 			return errors.New("line number out of range")
 		}
-		e.cursor.Row = lineNum - 1
-		e.cursor.Col = 0
+		e.Cursor.Row = lineNum - 1
+		e.Cursor.Col = 0
 		if e.hasSelect() {
 			e.clearSelect()
 		}
 		return nil
+	default:
+		// TODO: show file picker
 	}
 	return errors.New("command must start with / or :")
 }
@@ -903,7 +909,7 @@ func (e *Editor) startFind() {
 	e.finding = true
 	e.replacing = false
 	if e.hasSelect() {
-		e.findInput.Value = e.buf.GetRange(e.selAnchor, e.cursor)
+		e.findInput.Value = e.Buffer.GetRange(e.SelAnchor, e.Cursor)
 		e.findInput.Cursor = len([]rune(e.findInput.Value))
 		e.findInput.SelStart = 0
 		e.findInput.SelEnd = e.findInput.Cursor
@@ -966,19 +972,19 @@ func (e *Editor) updateFind(ev kero.KeyEvent) error {
 
 		if ev.Mod&kero.ModShift != 0 {
 			if ignoreCase {
-				if start, end, ok := e.buf.FindPrevIgnoreCase(query, e.cursor); ok {
+				if start, end, ok := e.Buffer.FindPrevIgnoreCase(query, e.Cursor); ok {
 					e.findMatch = true
 					e.findMatchStart = start
 					e.findMatchEnd = end
-					e.cursor = start
+					e.Cursor = start
 					e.clearSelect()
 				}
 			} else {
-				if start, end, ok := e.buf.FindPrev(query, e.cursor); ok {
+				if start, end, ok := e.Buffer.FindPrev(query, e.Cursor); ok {
 					e.findMatch = true
 					e.findMatchStart = start
 					e.findMatchEnd = end
-					e.cursor = start
+					e.Cursor = start
 					e.clearSelect()
 				}
 			}
@@ -986,21 +992,21 @@ func (e *Editor) updateFind(ev kero.KeyEvent) error {
 		}
 
 		if ignoreCase {
-			start, end, ok := e.buf.FindNextIgnoreCase(query, e.cursor)
+			start, end, ok := e.Buffer.FindNextIgnoreCase(query, e.Cursor)
 			if ok {
 				e.findMatch = true
 				e.findMatchStart = start
 				e.findMatchEnd = end
-				e.cursor = end
+				e.Cursor = end
 				e.clearSelect()
 			}
 		} else {
-			start, end, ok := e.buf.FindNext(query, e.cursor)
+			start, end, ok := e.Buffer.FindNext(query, e.Cursor)
 			if ok {
 				e.findMatch = true
 				e.findMatchStart = start
 				e.findMatchEnd = end
-				e.cursor = end
+				e.Cursor = end
 				e.clearSelect()
 			}
 		}
@@ -1039,7 +1045,7 @@ func (e *Editor) skipFindMatch() {
 	if query == "" {
 		return
 	}
-	from := e.cursor
+	from := e.Cursor
 	if e.findMatch {
 		from = e.findMatchEnd
 	}
@@ -1047,9 +1053,9 @@ func (e *Editor) skipFindMatch() {
 	var start, end Position
 	var ok bool
 	if ignoreCase {
-		start, end, ok = e.buf.FindNextIgnoreCase(query, from)
+		start, end, ok = e.Buffer.FindNextIgnoreCase(query, from)
 	} else {
-		start, end, ok = e.buf.FindNext(query, from)
+		start, end, ok = e.Buffer.FindNext(query, from)
 	}
 	if !ok {
 		e.findMatch = false
@@ -1058,7 +1064,7 @@ func (e *Editor) skipFindMatch() {
 	e.findMatch = true
 	e.findMatchStart = start
 	e.findMatchEnd = end
-	e.cursor = end
+	e.Cursor = end
 	e.clearSelect()
 }
 
@@ -1075,15 +1081,15 @@ func (e *Editor) replaceCurrent() error {
 	}
 
 	start := e.findMatchStart
-	replacedEnd := e.buf.DeleteRange(start, e.findMatchEnd)
-	replacedEnd = e.buf.Insert(replacedEnd, e.replaceInput.Value)
+	replacedEnd := e.Buffer.DeleteRange(start, e.findMatchEnd)
+	replacedEnd = e.Buffer.Insert(replacedEnd, e.replaceInput.Value)
 	e.markDirty()
-	e.cursor = replacedEnd
+	e.Cursor = replacedEnd
 	e.findMatch = false
 	// if e.replaceInput.Value == query && replacedEnd.Col < len(e.buf.Line(replacedEnd.Row)) {
-	if e.replaceInput.Value == query && replacedEnd.Col < e.buf.LineEnd(replacedEnd).Col {
+	if e.replaceInput.Value == query && replacedEnd.Col < e.Buffer.LineEnd(replacedEnd).Col {
 		replacedEnd.Col++
-		e.cursor = replacedEnd
+		e.Cursor = replacedEnd
 	}
 	e.skipFindMatch()
 	return nil
@@ -1097,9 +1103,9 @@ func (e *Editor) replaceAll() error {
 	ignoreCase := findQueryIgnoreCase(query)
 	var count int
 	if ignoreCase {
-		count = e.buf.ReplaceAllIgnoreCase(query, e.replaceInput.Value)
+		count = e.Buffer.ReplaceAllIgnoreCase(query, e.replaceInput.Value)
 	} else {
-		count = e.buf.ReplaceAll(query, e.replaceInput.Value)
+		count = e.Buffer.ReplaceAll(query, e.replaceInput.Value)
 	}
 	if count > 0 {
 		e.markDirty()
@@ -1113,7 +1119,7 @@ func (e *Editor) insertRune(r rune) {
 	if e.hasSelect() {
 		e.deleteSelect()
 	}
-	e.cursor = e.buf.Insert(e.cursor, string([]rune{r}))
+	e.Cursor = e.Buffer.Insert(e.Cursor, string([]rune{r}))
 	e.markDirty()
 }
 
@@ -1122,40 +1128,40 @@ func (e *Editor) deleteToLineEnd() {
 		e.deleteSelect()
 		return
 	}
-	e.cursor = e.buf.DeleteRange(e.cursor, e.buf.LineEnd(e.cursor))
+	e.Cursor = e.Buffer.DeleteRange(e.Cursor, e.Buffer.LineEnd(e.Cursor))
 	e.markDirty()
 }
 
 func (e *Editor) moveLeft() {
-	e.cursor = e.buf.PrevPos(e.cursor)
+	e.Cursor = e.Buffer.PrevPos(e.Cursor)
 }
 
 func (e *Editor) moveRight() {
-	e.cursor = e.buf.NextPos(e.cursor)
+	e.Cursor = e.Buffer.NextPos(e.Cursor)
 }
 
 func (e *Editor) moveUp() {
-	if e.cursor.Row == 0 {
+	if e.Cursor.Row == 0 {
 		return
 	}
-	displayCol := runeIndexToDisplayColumn(e.buf.Line(e.cursor.Row), e.cursor.Col)
-	i := displayColumnToRuneIndex(e.buf.Line(e.cursor.Row-1), displayCol)
-	e.cursor = Position{Row: e.cursor.Row - 1, Col: i}
+	displayCol := runeIndexToDisplayColumn(e.Buffer.Line(e.Cursor.Row), e.Cursor.Col)
+	i := displayColumnToRuneIndex(e.Buffer.Line(e.Cursor.Row-1), displayCol)
+	e.Cursor = Position{Row: e.Cursor.Row - 1, Col: i}
 }
 
 func (e *Editor) moveDown() {
-	if e.cursor.Row == e.buf.LenLines()-1 {
+	if e.Cursor.Row == e.Buffer.LenLines()-1 {
 		return
 	}
-	displayCol := runeIndexToDisplayColumn(e.buf.Line(e.cursor.Row), e.cursor.Col)
-	i := displayColumnToRuneIndex(e.buf.Line(e.cursor.Row+1), displayCol)
-	e.cursor = Position{Row: e.cursor.Row + 1, Col: i}
+	displayCol := runeIndexToDisplayColumn(e.Buffer.Line(e.Cursor.Row), e.Cursor.Col)
+	i := displayColumnToRuneIndex(e.Buffer.Line(e.Cursor.Row+1), displayCol)
+	e.Cursor = Position{Row: e.Cursor.Row + 1, Col: i}
 }
 
 func (e *Editor) markDirty() {
-	e.dirty = true
+	e.Dirty = true
 	e.message = ""
-	if isGoFile(e.path) {
+	if isGoFile(e.Path) {
 		e.debounceCheckSemantic()
 	}
 }
@@ -1163,7 +1169,7 @@ func (e *Editor) markDirty() {
 // debounceCheckSemantic is In-memory, fast syntax and type checking
 // on current buffer, debounced 300ms on keypress
 func (e *Editor) debounceCheckSemantic() {
-	if e.buf == nil {
+	if e.Buffer == nil {
 		return
 	}
 
@@ -1175,8 +1181,8 @@ func (e *Editor) debounceCheckSemantic() {
 	if e.diagChan == nil {
 		e.diagChan = make(chan diagResult, 4)
 	}
-	filename := e.path
-	src := e.buf.NewReader()
+	filename := e.Path
+	src := e.Buffer.NewReader()
 	e.diagTimer = time.AfterFunc(300*time.Millisecond, func() {
 		diags := CheckSemantics(filename, src)
 		result := diagResult{version: version, diagnostics: diags}
@@ -1222,8 +1228,8 @@ func (e *Editor) nextDiagnostic() Diagnostic {
 	}
 
 	for _, d := range e.diags {
-		if d.Row > e.cursor.Row ||
-			(d.Row == e.cursor.Row && d.Col > e.cursor.Col) {
+		if d.Row > e.Cursor.Row ||
+			(d.Row == e.Cursor.Row && d.Col > e.Cursor.Col) {
 			return d
 		}
 	}
@@ -1284,37 +1290,37 @@ func (e *Editor) ensureCursorVisible(ctx *kero.Context) {
 
 	// 1. Vertical Scrolling (Row)
 	// Ensure cursor is above the bottom margin
-	maxRowOffset := e.cursor.Row - (editorH - 1 - margin)
-	if e.rowOffset < maxRowOffset {
-		e.rowOffset = maxRowOffset
+	maxRowOffset := e.Cursor.Row - (editorH - 1 - margin)
+	if e.RowOffset < maxRowOffset {
+		e.RowOffset = maxRowOffset
 	}
 
 	// Ensure cursor is below the top margin
-	minRowOffset := e.cursor.Row - margin
-	if e.rowOffset > minRowOffset {
-		e.rowOffset = minRowOffset
+	minRowOffset := e.Cursor.Row - margin
+	if e.RowOffset > minRowOffset {
+		e.RowOffset = minRowOffset
 	}
 
 	// Clamp to top boundary
-	if e.rowOffset < 0 {
-		e.rowOffset = 0
+	if e.RowOffset < 0 {
+		e.RowOffset = 0
 	}
 
 	// 2. Horizontal Scrolling (Column)
-	textW := ctx.Width - lineNumberWidth(e.buf.LenLines()) - 2
+	textW := ctx.Width - lineNumberWidth(e.Buffer.LenLines()) - 2
 	textW = max(1, textW)
 
-	line := e.buf.Line(e.cursor.Row)
-	cursorDisplay := runeIndexToDisplayColumn(line, e.cursor.Col)
+	line := e.Buffer.Line(e.Cursor.Row)
+	cursorDisplay := runeIndexToDisplayColumn(line, e.Cursor.Col)
 
-	if cursorDisplay < e.colOffset {
-		e.colOffset = cursorDisplay
-	} else if cursorDisplay >= e.colOffset+textW {
-		e.colOffset = cursorDisplay - textW + 1
+	if cursorDisplay < e.ColOffset {
+		e.ColOffset = cursorDisplay
+	} else if cursorDisplay >= e.ColOffset+textW {
+		e.ColOffset = cursorDisplay - textW + 1
 	}
 
-	if e.colOffset < 0 {
-		e.colOffset = 0
+	if e.ColOffset < 0 {
+		e.ColOffset = 0
 	}
 }
 
@@ -1347,28 +1353,28 @@ func trimToWidth(s string, width int) string {
 }
 
 func (e *Editor) GotoDefinition() {
-	reader := e.buf.NewReader()
+	reader := e.Buffer.NewReader()
 
 	// Convert internal 0-based cursor to 1-based for go/token
-	res := FindDefinitionLoc(reader, e.cursor.Row+1, e.cursor.Col+1)
+	res := FindDefinitionLoc(reader, e.Cursor.Row+1, e.Cursor.Col+1)
 	if !res.Found {
 		return // Symbol definition not found in current file
 	}
 
 	// Jump editor cursor (converting back to 0-based)
-	e.cursor.Row = res.Line - 1
-	e.cursor.Col = res.Column - 1
+	e.Cursor.Row = res.Line - 1
+	e.Cursor.Col = res.Column - 1
 }
 
 func (e *Editor) GotoSymbol(name string) {
-	loc, found := FindSymbolLoc(e.buf.String(), name)
+	loc, found := FindSymbolLoc(e.Buffer.String(), name)
 	if !found {
 		return
 	}
 
 	// Move cursor (converting 1-based line/col to 0-based)
-	e.cursor.Row = loc.Line - 1
-	e.cursor.Col = loc.Column - 1
+	e.Cursor.Row = loc.Line - 1
+	e.Cursor.Col = loc.Column - 1
 }
 
 type SymbolPicker struct {
@@ -1391,8 +1397,8 @@ func (e *Editor) updateSymbolPicker(ev kero.KeyEvent) {
 			return
 		}
 		picked := e.symbolPicker.Filtered[e.symbolPicker.Index]
-		e.cursor.Row = picked.Line - 1
-		e.cursor.Col = picked.Column - 1
+		e.Cursor.Row = picked.Line - 1
+		e.Cursor.Col = picked.Column - 1
 		e.symbolPicker.Active = false
 	case "up", "ctrl+p":
 		e.symbolPicker.Index = (e.symbolPicker.Index - 1 + len(e.symbolPicker.Filtered)) % len(e.symbolPicker.Filtered)
@@ -1438,7 +1444,7 @@ func (e *Editor) drawSymbolPicker(f *kero.Frame, y, width int) {
 }
 
 func (e *Editor) OpenSymbolPicker() {
-	symbols := ExtractAllSymbols(e.buf.String())
+	symbols := ExtractAllSymbols(e.Buffer.String())
 	e.symbolPicker = SymbolPicker{
 		Active:   true,
 		All:      symbols,
@@ -1616,7 +1622,15 @@ type Position struct {
 }
 
 type Buffer struct {
-	lines [][]rune // Using [][]rune handles multi-byte UTF-8 correctly
+	Path      string
+	Lines     [][]rune // Using [][]rune handles multi-byte UTF-8 correctly
+	Cursor    Position
+	RowOffset int // Scroll offsets for the view viewport
+	ColOffset int // visual display column offset (0-based horizontal scroll position)
+	Dirty     bool
+
+	Selecting bool
+	SelAnchor Position // selection at [e.selAnchor, e.pos)
 }
 
 func NewBuffer(content string) *Buffer {
@@ -1625,16 +1639,16 @@ func NewBuffer(content string) *Buffer {
 	for i, l := range rawLines {
 		lines[i] = []rune(l)
 	}
-	return &Buffer{lines: lines}
+	return &Buffer{Lines: lines}
 }
 
 // Line returns a copy of the line at the specified row.
 // Returns nil if the row index is out of bounds.
 func (b *Buffer) Line(row int) []rune {
-	if row < 0 || row >= len(b.lines) {
+	if row < 0 || row >= len(b.Lines) {
 		return nil
 	}
-	src := b.lines[row]
+	src := b.Lines[row]
 	if src == nil {
 		return nil
 	}
@@ -1645,30 +1659,30 @@ func (b *Buffer) Line(row int) []rune {
 }
 
 func (b *Buffer) SetLine(row int, line []rune) {
-	if row < 0 || row >= len(b.lines) {
+	if row < 0 || row >= len(b.Lines) {
 		return
 	}
 
 	// Copy input slice to prevent external modification
 	dst := make([]rune, len(line))
 	copy(dst, line)
-	b.lines[row] = dst
+	b.Lines[row] = dst
 }
 
 func (b *Buffer) LenLines() int {
-	return len(b.lines)
+	return len(b.Lines)
 }
 
 // Bytes returns the entire buffer content as a UTF-8 encoded byte slice.
 func (b *Buffer) Bytes() []byte {
-	linesCount := len(b.lines)
+	linesCount := len(b.Lines)
 	if linesCount == 0 {
 		return []byte{}
 	}
 
 	// 1. Calculate total byte capacity upfront to do a single allocation
 	var totalBytes int
-	for _, line := range b.lines {
+	for _, line := range b.Lines {
 		for _, r := range line {
 			totalBytes += utf8.RuneLen(r)
 		}
@@ -1681,7 +1695,7 @@ func (b *Buffer) Bytes() []byte {
 
 	// 3. Append UTF-8 encoded bytes line by line
 	var runeBuf [utf8.UTFMax]byte
-	for i, line := range b.lines {
+	for i, line := range b.Lines {
 		if i > 0 {
 			buf = append(buf, '\n')
 		}
@@ -1696,14 +1710,14 @@ func (b *Buffer) Bytes() []byte {
 
 // String returns the full buffer text as a string, joined by newlines.
 func (b *Buffer) String() string {
-	linesCount := len(b.lines)
+	linesCount := len(b.Lines)
 	if linesCount == 0 {
 		return ""
 	}
 
 	// 1. Calculate approximate total byte capacity to minimize allocations
 	var totalBytes int
-	for _, line := range b.lines {
+	for _, line := range b.Lines {
 		for _, r := range line {
 			totalBytes += utf8.RuneLen(r)
 		}
@@ -1716,7 +1730,7 @@ func (b *Buffer) String() string {
 	sb.Grow(totalBytes)
 
 	// 3. Write lines joined by newlines
-	for i, line := range b.lines {
+	for i, line := range b.Lines {
 		if i > 0 {
 			sb.WriteByte('\n')
 		}
@@ -1730,11 +1744,11 @@ func (b *Buffer) String() string {
 
 // InsertAt inserts text at the given position and returns the new cursor position.
 func (b *Buffer) Insert(p Position, text string) Position {
-	if p.Row < 0 || p.Row >= len(b.lines) {
+	if p.Row < 0 || p.Row >= len(b.Lines) {
 		return p
 	}
 
-	line := b.lines[p.Row]
+	line := b.Lines[p.Row]
 	if p.Col < 0 {
 		p.Col = 0
 	}
@@ -1752,7 +1766,7 @@ func (b *Buffer) Insert(p Position, text string) Position {
 		newLine = append(newLine, runesToInsert...)
 		newLine = append(newLine, line[p.Col:]...)
 
-		b.lines[p.Row] = newLine
+		b.Lines[p.Row] = newLine
 
 		return Position{
 			Row: p.Row,
@@ -1785,12 +1799,12 @@ func (b *Buffer) Insert(p Position, text string) Position {
 	newSegment = append(newSegment, lastLine)
 
 	// Replace target line with the expanded multi-line segment
-	finalLines := make([][]rune, 0, len(b.lines)+len(insertLines)-1)
-	finalLines = append(finalLines, b.lines[:p.Row]...)
+	finalLines := make([][]rune, 0, len(b.Lines)+len(insertLines)-1)
+	finalLines = append(finalLines, b.Lines[:p.Row]...)
 	finalLines = append(finalLines, newSegment...)
-	finalLines = append(finalLines, b.lines[p.Row+1:]...)
+	finalLines = append(finalLines, b.Lines[p.Row+1:]...)
 
-	b.lines = finalLines
+	b.Lines = finalLines
 
 	return Position{
 		Row: p.Row + len(insertLines) - 1,
@@ -1808,7 +1822,7 @@ func orderPos(p1, p2 Position) (start, end Position) {
 
 // ClampPos ensures p falls within valid buffer bounds.
 func (b *Buffer) ClampPos(p Position) Position {
-	if len(b.lines) == 0 {
+	if len(b.Lines) == 0 {
 		return Position{Row: 0, Col: 0}
 	}
 
@@ -1816,12 +1830,12 @@ func (b *Buffer) ClampPos(p Position) Position {
 	row := p.Row
 	if row < 0 {
 		row = 0
-	} else if row >= len(b.lines) {
-		row = len(b.lines) - 1
+	} else if row >= len(b.Lines) {
+		row = len(b.Lines) - 1
 	}
 
 	// Clamp Col within the valid row
-	lineLen := len(b.lines[row])
+	lineLen := len(b.Lines[row])
 	col := p.Col
 	if col < 0 {
 		col = 0
@@ -1842,24 +1856,24 @@ func (b *Buffer) GetRange(p1, p2 Position) string {
 
 	// Single-line range fast path
 	if start.Row == end.Row {
-		return string(b.lines[start.Row][start.Col:end.Col])
+		return string(b.Lines[start.Row][start.Col:end.Col])
 	}
 
 	// Multi-line range path
 	var sb strings.Builder
 
 	// First line fragment
-	sb.WriteString(string(b.lines[start.Row][start.Col:]))
+	sb.WriteString(string(b.Lines[start.Row][start.Col:]))
 	sb.WriteRune('\n')
 
 	// Intermediate full lines
 	for l := start.Row + 1; l < end.Row; l++ {
-		sb.WriteString(string(b.lines[l]))
+		sb.WriteString(string(b.Lines[l]))
 		sb.WriteRune('\n')
 	}
 
 	// Final line fragment
-	sb.WriteString(string(b.lines[end.Row][:end.Col]))
+	sb.WriteString(string(b.Lines[end.Row][:end.Col]))
 
 	return sb.String()
 }
@@ -1874,18 +1888,18 @@ func (b *Buffer) DeleteRange(p1, p2 Position) Position {
 
 	// Single-line deletion fast path
 	if start.Row == end.Row {
-		line := b.lines[start.Row]
+		line := b.Lines[start.Row]
 		newLine := make([]rune, 0, len(line)-(end.Col-start.Col))
 		newLine = append(newLine, line[:start.Col]...)
 		newLine = append(newLine, line[end.Col:]...)
 
-		b.lines[start.Row] = newLine
+		b.Lines[start.Row] = newLine
 		return start
 	}
 
 	// Multi-line deletion path
-	startLinePrefix := b.lines[start.Row][:start.Col]
-	endLineSuffix := b.lines[end.Row][end.Col:]
+	startLinePrefix := b.Lines[start.Row][:start.Col]
+	endLineSuffix := b.Lines[end.Row][end.Col:]
 
 	// Stitch start prefix and end suffix into one merged line
 	mergedLine := make([]rune, 0, len(startLinePrefix)+len(endLineSuffix))
@@ -1893,23 +1907,23 @@ func (b *Buffer) DeleteRange(p1, p2 Position) Position {
 	mergedLine = append(mergedLine, endLineSuffix...)
 
 	// Rebuild line slice removing deleted lines
-	newLines := make([][]rune, 0, len(b.lines)-(end.Row-start.Row))
-	newLines = append(newLines, b.lines[:start.Row]...)
+	newLines := make([][]rune, 0, len(b.Lines)-(end.Row-start.Row))
+	newLines = append(newLines, b.Lines[:start.Row]...)
 	newLines = append(newLines, mergedLine)
-	newLines = append(newLines, b.lines[end.Row+1:]...)
+	newLines = append(newLines, b.Lines[end.Row+1:]...)
 
-	b.lines = newLines
+	b.Lines = newLines
 
 	return start
 }
 
 // WordBounds finds the start and end of the word surrounding pos on its line.
 func (b *Buffer) WordBounds(p Position) (start, end Position) {
-	if p.Row < 0 || p.Row >= len(b.lines) {
+	if p.Row < 0 || p.Row >= len(b.Lines) {
 		return
 	}
 
-	line := b.lines[p.Row]
+	line := b.Lines[p.Row]
 	if len(line) == 0 {
 		return
 	}
@@ -1952,7 +1966,7 @@ func (b *Buffer) FindNextIgnoreCase(query string, from Position) (start, end Pos
 }
 
 func (b *Buffer) findNext(query string, from Position, ignoreCase bool) (start, end Position, ok bool) {
-	if query == "" || len(b.lines) == 0 {
+	if query == "" || len(b.Lines) == 0 {
 		return Position{}, Position{}, false
 	}
 
@@ -1963,8 +1977,8 @@ func (b *Buffer) findNext(query string, from Position, ignoreCase bool) (start, 
 
 	row := from.Row
 	col := from.Col
-	for rowsSearched := 0; rowsSearched <= len(b.lines); rowsSearched++ {
-		line := b.lines[row]
+	for rowsSearched := 0; rowsSearched <= len(b.Lines); rowsSearched++ {
+		line := b.Lines[row]
 		for i := col; i <= len(line)-len(queryRunes); i++ {
 			match := true
 			for j := range queryRunes {
@@ -1980,7 +1994,7 @@ func (b *Buffer) findNext(query string, from Position, ignoreCase bool) (start, 
 			}
 		}
 
-		if row+1 < len(b.lines) {
+		if row+1 < len(b.Lines) {
 			row++
 		} else {
 			row = 0
@@ -2004,7 +2018,7 @@ func (b *Buffer) FindPrevIgnoreCase(query string, from Position) (start, end Pos
 }
 
 func (b *Buffer) findPrev(query string, from Position, ignoreCase bool) (start, end Position, ok bool) {
-	if query == "" || len(b.lines) == 0 {
+	if query == "" || len(b.Lines) == 0 {
 		return Position{}, Position{}, false
 	}
 
@@ -2015,8 +2029,8 @@ func (b *Buffer) findPrev(query string, from Position, ignoreCase bool) (start, 
 	qLen := len(queryRunes)
 
 	row := from.Row
-	for rowsSearched := 0; rowsSearched <= len(b.lines); rowsSearched++ {
-		line := b.lines[row]
+	for rowsSearched := 0; rowsSearched <= len(b.Lines); rowsSearched++ {
+		line := b.Lines[row]
 		// Determine the rightmost starting column index for search on this row
 		maxCol := len(line) - qLen
 		if row == from.Row {
@@ -2044,7 +2058,7 @@ func (b *Buffer) findPrev(query string, from Position, ignoreCase bool) (start, 
 		if row > 0 {
 			row--
 		} else {
-			row = len(b.lines) - 1
+			row = len(b.Lines) - 1
 		}
 	}
 
@@ -2067,7 +2081,7 @@ func (b *Buffer) replaceAll(query, replacement string, ignoreCase bool) (count i
 		return 0
 	}
 
-	for row, line := range b.lines {
+	for row, line := range b.Lines {
 		result := make([]rune, 0, len(line))
 		for col := 0; col < len(line); {
 			if col+len(queryRunes) <= len(line) {
@@ -2089,7 +2103,7 @@ func (b *Buffer) replaceAll(query, replacement string, ignoreCase bool) (count i
 			col++
 		}
 		if count > 0 {
-			b.lines[row] = result
+			b.Lines[row] = result
 		}
 	}
 	return count
@@ -2105,15 +2119,15 @@ func runeMatches(left, right rune, ignoreCase bool) bool {
 // MoveWordRight moves the cursor to the end of the current word,
 // or across whitespace/punctuation to the end of the next word.
 func (b *Buffer) MoveWordRight(p Position) Position {
-	if p.Row >= len(b.lines) {
+	if p.Row >= len(b.Lines) {
 		return p
 	}
 
-	line := b.lines[p.Row]
+	line := b.Lines[p.Row]
 
 	// If at or past line end, wrap to the start of the next line
 	if p.Col >= len(line) {
-		if p.Row+1 < len(b.lines) {
+		if p.Row+1 < len(b.Lines) {
 			return Position{Row: p.Row + 1, Col: 0}
 		}
 		return p // End of document
@@ -2137,11 +2151,11 @@ func (b *Buffer) MoveWordRight(p Position) Position {
 // MoveWordLeft moves the cursor to the start of the current word,
 // or across whitespace/punctuation to the start of the previous word.
 func (b *Buffer) MoveWordLeft(p Position) Position {
-	if p.Row < 0 || p.Row >= len(b.lines) {
+	if p.Row < 0 || p.Row >= len(b.Lines) {
 		return p
 	}
 
-	line := b.lines[p.Row]
+	line := b.Lines[p.Row]
 	col := p.Col
 	if col > len(line) {
 		col = len(line)
@@ -2152,7 +2166,7 @@ func (b *Buffer) MoveWordLeft(p Position) Position {
 		if p.Row == 0 {
 			return Position{Row: 0, Col: 0}
 		}
-		prevLine := b.lines[p.Row-1]
+		prevLine := b.Lines[p.Row-1]
 		return Position{Row: p.Row - 1, Col: len(prevLine)}
 	}
 
@@ -2193,10 +2207,10 @@ func (b *Buffer) PrevPos(p Position) Position {
 }
 
 func (b *Buffer) LineStartNonSpace(p Position) Position {
-	if p.Row < 0 || p.Row >= len(b.lines) {
+	if p.Row < 0 || p.Row >= len(b.Lines) {
 		return p
 	}
-	for i, char := range b.lines[p.Row] {
+	for i, char := range b.Lines[p.Row] {
 		if !unicode.IsSpace(char) {
 			return Position{Row: p.Row, Col: i}
 		}
@@ -2205,10 +2219,10 @@ func (b *Buffer) LineStartNonSpace(p Position) Position {
 }
 
 func (b *Buffer) LineEnd(p Position) Position {
-	if p.Row < 0 || p.Row >= len(b.lines) {
+	if p.Row < 0 || p.Row >= len(b.Lines) {
 		return p
 	}
-	return Position{Row: p.Row, Col: len(b.lines[p.Row])}
+	return Position{Row: p.Row, Col: len(b.Lines[p.Row])}
 }
 
 // BufReader implements io.Reader over Buffer lines.
@@ -2226,7 +2240,7 @@ func (b *Buffer) NewReader() *BufReader {
 }
 
 func (r *BufReader) Read(p []byte) (n int, err error) {
-	if r.lineIdx >= len(r.buf.lines) {
+	if r.lineIdx >= len(r.buf.Lines) {
 		return 0, io.EOF
 	}
 
@@ -2239,7 +2253,7 @@ func (r *BufReader) Read(p []byte) (n int, err error) {
 			continue
 		}
 
-		line := r.buf.lines[r.lineIdx]
+		line := r.buf.Lines[r.lineIdx]
 
 		// At end of line, output newline character
 		if r.colIdx >= len(line) {
@@ -2249,7 +2263,7 @@ func (r *BufReader) Read(p []byte) (n int, err error) {
 			r.colIdx = 0
 			r.encLen = 0
 			r.encOffset = 0
-			if r.lineIdx >= len(r.buf.lines) {
+			if r.lineIdx >= len(r.buf.Lines) {
 				break
 			}
 			continue
@@ -2612,4 +2626,170 @@ func FilterSymbols(src []SymbolLocation, query string) []SymbolLocation {
 	}
 
 	return matches
+}
+
+// OpenFile loads a file into memory or focuses it if already loaded.
+func (e *Editor) OpenFile(path string) error {
+	var buf *Buffer
+	if path == "" {
+		buf = &Buffer{
+			Path:  "",
+			Lines: [][]rune{},
+		}
+	} else {
+		path = filepath.Clean(path)
+		// switch to existing buffer
+		for i, buf := range e.buffers {
+			if buf.Path == path {
+				e.active = i
+				e.Buffer = buf
+				e.diags = nil
+				if isGoFile(e.Path) {
+					e.debounceCheckSemantic()
+				}
+				return nil
+			}
+		}
+
+		var err error
+		buf, err = loadBuffer(path)
+		if err != nil {
+			return err
+		}
+	}
+
+	e.buffers = append(e.buffers, buf)
+	e.active = len(e.buffers) - 1
+	e.Buffer = buf
+	e.diags = nil
+	if isGoFile(e.Path) {
+		e.debounceCheckSemantic()
+	}
+	return nil
+}
+
+// CloseBuffer closes the active buffer.
+func (e *Editor) CloseBuffer() {
+	if len(e.buffers) <= 1 {
+		// Either exit or leave an empty scratch buffer
+		return
+	}
+	// Remove from slice and adjust active index
+	e.buffers = append(e.buffers[:e.active], e.buffers[e.active+1:]...)
+	if e.active >= len(e.buffers) {
+		e.active = len(e.buffers) - 1
+	}
+	e.Buffer = e.buffers[e.active]
+	e.diags = nil
+	if isGoFile(e.Path) {
+		e.debounceCheckSemantic()
+	}
+}
+
+func (e *Editor) NextBuffer() {
+	if len(e.buffers) > 1 {
+		e.active = (e.active + 1) % len(e.buffers)
+		e.Buffer = e.buffers[e.active]
+		e.diags = nil
+		if isGoFile(e.Path) {
+			e.debounceCheckSemantic()
+		}
+	}
+}
+
+func (e *Editor) PrevBuffer() {
+	if len(e.buffers) > 1 {
+		e.active = (e.active - 1 + len(e.buffers)) % len(e.buffers)
+		e.Buffer = e.buffers[e.active]
+		e.diags = nil
+		if isGoFile(e.Path) {
+			e.debounceCheckSemantic()
+		}
+	}
+}
+
+// loadBuffer opens a file and prepares a Buffer struct.
+// If the file does not exist, it creates a new empty buffer associated with that path.
+func loadBuffer(path string) (*Buffer, error) {
+	cleanPath := filepath.Clean(path)
+
+	file, err := os.Open(cleanPath)
+	if os.IsNotExist(err) {
+		// New/unsaved file: initialize with one empty line
+		return &Buffer{
+			Path:  cleanPath,
+			Lines: [][]rune{},
+		}, nil
+	} else if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	lines, err := readLines(file)
+	if err != nil {
+		return nil, err
+	}
+
+	// Guarantee at least one line exists in memory
+	if len(lines) == 0 {
+		lines = [][]rune{}
+	}
+
+	return &Buffer{
+		Path:  cleanPath,
+		Lines: lines,
+	}, nil
+}
+
+func readLines(r io.Reader) ([][]rune, error) {
+	var lines [][]rune
+	reader := bufio.NewReader(r)
+
+	for {
+		line, err := reader.ReadString('\n')
+
+		// Strip '\n' and carriage return '\r' (Windows normalization)
+		line = strings.TrimSuffix(line, "\n")
+		line = strings.TrimSuffix(line, "\r")
+
+		if line != "" || err == nil {
+			lines = append(lines, []rune(line))
+		}
+
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return nil, err
+		}
+	}
+
+	return lines, nil
+}
+
+func (b *Buffer) Save() error {
+	file, err := os.OpenFile(b.Path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	writer := bufio.NewWriter(file)
+	for i, line := range b.Lines {
+		if _, err := writer.WriteString(string(line)); err != nil {
+			return err
+		}
+		if i < len(b.Lines)-1 {
+			if _, err := writer.WriteString("\n"); err != nil {
+				return err
+			}
+		}
+	}
+
+	if err := writer.Flush(); err != nil {
+		return err
+	}
+
+	b.Dirty = false
+	return nil
 }
