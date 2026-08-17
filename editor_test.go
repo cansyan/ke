@@ -47,25 +47,25 @@ func TestEnsureCursorVisible_WithTabs(t *testing.T) {
 	// Mock context with width = 10 (marker + line number + space leaves textW = 7)
 	ctx := &kero.Context{Width: 10, Height: 10}
 
-	ed.ensureCursorVisible(ctx)
-	if ed.ColOffset != 0 {
-		t.Fatalf("expected colOffset = 0, got %d", ed.ColOffset)
+	ed.showCursorCenter(ctx)
+	if ed.LeftCol != 0 {
+		t.Fatalf("expected colOffset = 0, got %d", ed.LeftCol)
 	}
 
 	// Move cursor to 'w' in "world" (rune index 7: '\t', h, e, l, l, o, ' ') -> display column 4 + 6 = 10
 	ed.Cursor.Col = 7
-	ed.ensureCursorVisible(ctx)
+	ed.showCursorCenter(ctx)
 	// textW = 10 - 1 - 2 = 7. cursorDisplay = 10.
 	// 10 >= colOffset + 7 => colOffset = 10 - 7 + 1 = 4.
-	if ed.ColOffset != 4 {
-		t.Fatalf("expected colOffset = 4, got %d", ed.ColOffset)
+	if ed.LeftCol != 4 {
+		t.Fatalf("expected colOffset = 4, got %d", ed.LeftCol)
 	}
 
 	// Move cursor back to index 0 ('\t', display column 0)
 	ed.Cursor.Col = 0
-	ed.ensureCursorVisible(ctx)
-	if ed.ColOffset != 0 {
-		t.Fatalf("expected colOffset = 0 when returning to start, got %d", ed.ColOffset)
+	ed.showCursorCenter(ctx)
+	if ed.LeftCol != 0 {
+		t.Fatalf("expected colOffset = 0 when returning to start, got %d", ed.LeftCol)
 	}
 }
 
@@ -118,7 +118,7 @@ func TestTab_MultiLineSelection(t *testing.T) {
 		"third line",
 	}
 
-	for i := range ed.Buffer.LenLines() {
+	for i := range len(ed.Buffer.Lines) {
 		if line := string(ed.Buffer.Line(i)); line != expectedLines[i] {
 			t.Errorf("line %d = %q, want %q", i, line, expectedLines[i])
 		}
@@ -181,7 +181,7 @@ func TestShiftTab_UnindentSelection(t *testing.T) {
 		"third line",
 	}
 
-	for i := range ed.Buffer.LenLines() {
+	for i := range len(ed.Buffer.Lines) {
 		if line := string(ed.Buffer.Line(i)); line != expectedLines[i] {
 			t.Errorf("line %d = %q, want %q", i, line, expectedLines[i])
 		}

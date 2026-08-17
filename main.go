@@ -74,7 +74,7 @@ func main() {
 	log.SetOutput(f)
 
 	// set FPS for refreshing diagnostic
-	p := kero.New(e, kero.WithAltScreen(true), kero.WithKitty(true), kero.WithFPS(3))
+	p := kero.New(e, kero.WithAltScreen(true), kero.WithKitty(true), kero.WithFPS(3), kero.WithMouse(true))
 	if err := p.Run(); err != nil {
 		panic(err)
 	}
@@ -108,8 +108,9 @@ type Editor struct {
 	clipboard  string
 	clipIsLine bool
 
-	lastKey kero.KeyEvent
+	// lastKey kero.KeyEvent
 	// optional: record the time of lastKey, make it expire after a while
+	lastEvent kero.Event
 
 	diags       []Diagnostic
 	diagTimer   *time.Timer
@@ -122,6 +123,8 @@ type Editor struct {
 	// reports whether the key comes from a paste action,
 	// to distinguish the manual KeyEnter or a pasted \n
 	pasting bool
+
+	gutterW int
 }
 
 type diagResult struct {
@@ -130,35 +133,98 @@ type diagResult struct {
 }
 
 func (e *Editor) Init(ctx *kero.Context) error {
-	e.ensureCursorVisible(ctx)
+	e.showCursorCenter(ctx)
 	if isGoFile(e.Path) {
-		e.debounceCheckSemantic()
+		e.debounceDiagnose()
 	}
 	return nil
 }
 
+func (e *Editor) LastEvent() string {
+	if e.lastEvent == nil {
+		return ""
+	}
+	if s, ok := e.lastEvent.(fmt.Stringer); ok {
+		return s.String()
+	}
+	return fmt.Sprintf("%T", e.lastEvent)
+}
+
 func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
-	switch ev.(type) {
+	// refresh diagnostic as soon as possible
+	e.applyDiagnostic()
+
+	switch ev := ev.(type) {
+	case kero.TickEvent:
+		return nil
 	case kero.PasteStartEvent:
 		e.pasting = true
 	case kero.PasteEndEvent:
 		e.pasting = false
+	case kero.MouseEvent:
+		e.handleMouse(ctx, ev)
+	case kero.KeyEvent:
+		e.handleKey(ctx, ev)
 	}
+	e.lastEvent = ev
+	return nil
+}
 
-	// refresh diagnostic as soon as possible, no matter what event is
-	e.applyDiagnosticResults()
-	key, ok := ev.(kero.KeyEvent)
-	if !ok {
-		return nil
+func (e *Editor) cursorFromMouse(m kero.MouseEvent) Position {
+	row := e.TopRow + m.Y
+	displayCol := m.X - e.gutterW
+	return e.ClampPos(Position{
+		Row: row,
+		Col: displayColumnToRuneIndex(e.Lines[row], displayCol),
+	})
+}
+
+func (e *Editor) handleMouse(ctx *kero.Context, m kero.MouseEvent) error {
+	switch m.Button {
+	case kero.MouseWheelUp:
+		e.TopRow = max(0, e.TopRow-1)
+	case kero.MouseWheelDown:
+		e.TopRow = min(e.TopRow+1, len(e.Lines)-editorHeight(ctx))
+	case kero.MouseLeft:
+		switch m.Action {
+		case kero.MousePress:
+			if m.Y >= editorHeight(ctx) {
+				// out of viewport
+				return nil
+			}
+			e.Cursor = e.cursorFromMouse(m)
+			if e.hasSelect() {
+				e.clearSelect()
+			}
+		case kero.MouseRelease:
+			if m.Y >= editorHeight(ctx) {
+				// out of viewport
+				return nil
+			}
+			// ctrl+mouse_left_release goto definition
+			if m.Mod == kero.ModCtrl {
+				e.GotoDefinition()
+				e.showCursorCenter(ctx)
+			}
+		case kero.MouseDrag:
+			if last, ok := e.lastEvent.(kero.MouseEvent); ok &&
+				last.Button == kero.MouseLeft && last.Action == kero.MousePress {
+				// first drag sets selection anchor
+				e.Selecting = true
+				e.SelAnchor = e.cursorFromMouse(last)
+			}
+			// later drag expands selection
+			e.Cursor = e.cursorFromMouse(m)
+			e.showCursor(ctx)
+		}
 	}
-	defer func() {
-		e.lastKey = key
-		e.ensureCursorVisible(ctx)
-	}()
+	return nil
+}
 
+func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 	// can quit at anytime, first priority
 	if key.String() == "ctrl+q" {
-		quitAgain := e.lastKey.String() == "ctrl+q"
+		quitAgain := e.LastEvent() == "ctrl+q"
 		if e.Dirty && !quitAgain {
 			e.message = "warn: unsaved changes, press ctrl+s to save or ctrl+q again to quit"
 			return nil
@@ -171,15 +237,25 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 		return e.updateSaveAs(key)
 	}
 	if e.finding {
+		defer e.showCursor(ctx)
 		return e.updateFind(key)
 	}
 	if e.cmdMode {
-		return e.updateCmdPalette(key)
+		return e.updateCmdPalette(ctx, key)
 	}
 	if e.symbolPicker.Active {
-		e.updateSymbolPicker(key)
+		e.updateSymbolPicker(ctx, key)
 		return nil
 	}
+
+	var centerCursor bool
+	defer func() {
+		if centerCursor {
+			e.showCursorCenter(ctx)
+		} else {
+			e.showCursor(ctx)
+		}
+	}()
 
 	switch key.Key {
 	case kero.KeyRune:
@@ -188,17 +264,18 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 			e.OpenSymbolPicker()
 		case "ctrl+g":
 			e.GotoDefinition()
+			centerCursor = true
 			return nil
 		case "ctrl+n":
 			// ctrl+b ctrl+n goto next buffer
-			if e.lastKey.String() == "ctrl+b" {
+			if e.LastEvent() == "ctrl+b" {
 				e.NextBuffer()
 				return nil
 			}
 			return nil
 		case "ctrl+p":
 			// ctrl+b ctrl+p goto previous buffer
-			if e.lastKey.String() == "ctrl+b" {
+			if e.LastEvent() == "ctrl+b" {
 				e.PrevBuffer()
 				return nil
 			}
@@ -207,6 +284,7 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 		case "ctrl+]":
 			if v := e.nextDiagnostic(); v.Message != "" {
 				e.Cursor = e.Buffer.ClampPos(Position{Row: v.Row, Col: v.Col})
+				centerCursor = true
 			}
 			return nil
 		case "ctrl+s":
@@ -379,7 +457,7 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 		switch key.String() {
 		case "cmd+down":
 			// file end
-			e.Cursor.Row = e.Buffer.LenLines() - 1
+			e.Cursor.Row = len(e.Buffer.Lines) - 1
 			e.Cursor = e.Buffer.LineEnd(e.Cursor)
 		case "shift+down":
 			// start selection
@@ -409,7 +487,6 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 	case kero.KeyEsc:
 		e.clearSelect()
 	}
-
 	return nil
 }
 
@@ -431,11 +508,12 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 	}
 
 	editorH := editorHeight(ctx)
-	lineNoW := lineNumberWidth(e.Buffer.LenLines())
+	lineNoW := lineNumberWidth(len(e.Buffer.Lines))
 	gutterW := lineNoW + 2 // marker, line number, and separator
+	e.gutterW = gutterW
 	for y := range editorH {
-		lineIndex := e.RowOffset + y
-		if lineIndex >= e.Buffer.LenLines() {
+		lineIndex := e.TopRow + y
+		if lineIndex >= len(e.Buffer.Lines) {
 			f.Write(0, y, "~", lineNoStyle)
 			continue
 		}
@@ -448,8 +526,8 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 
 		// visual part of the padded line
 		var visPadded string
-		if e.ColOffset < len(fullPadded) {
-			visPadded = fullPadded[e.ColOffset:]
+		if e.LeftCol < len(fullPadded) {
+			visPadded = fullPadded[e.LeftCol:]
 		}
 		if len(visPadded) > limit {
 			visPadded = visPadded[:limit]
@@ -490,8 +568,8 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 				startVisCol := runeIndexToDisplayColumn(srcLine, selStartCol)
 				endVisCol := runeIndexToDisplayColumn(srcLine, selEndCol)
 
-				startDisplay := max(0, min(startVisCol-e.ColOffset, len(visPadded)))
-				endDisplay := max(0, min(endVisCol-e.ColOffset, len(visPadded)))
+				startDisplay := max(0, min(startVisCol-e.LeftCol, len(visPadded)))
+				endDisplay := max(0, min(endVisCol-e.LeftCol, len(visPadded)))
 
 				for x := startDisplay; x < endDisplay; x++ {
 					ch := rune(visPadded[x])
@@ -504,8 +582,8 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 			startVisCol := runeIndexToDisplayColumn(srcLine, e.findMatchStart.Col)
 			endVisCol := runeIndexToDisplayColumn(srcLine, e.findMatchEnd.Col)
 
-			startDisplay := max(0, min(startVisCol-e.ColOffset, len(visPadded)))
-			endDisplay := max(0, min(endVisCol-e.ColOffset, len(visPadded)))
+			startDisplay := max(0, min(startVisCol-e.LeftCol, len(visPadded)))
+			endDisplay := max(0, min(endVisCol-e.LeftCol, len(visPadded)))
 
 			for x := startDisplay; x < endDisplay; x++ {
 				ch := rune(visPadded[x])
@@ -516,8 +594,8 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 
 	line := e.Buffer.Line(e.Cursor.Row)
 	cursorDisplayCol := runeIndexToDisplayColumn(line, e.Cursor.Col)
-	cursorX := gutterW + cursorDisplayCol - e.ColOffset
-	cursorY := 0 + e.Cursor.Row - e.RowOffset
+	cursorX := gutterW + cursorDisplayCol - e.LeftCol
+	cursorY := 0 + e.Cursor.Row - e.TopRow
 	if cursorY >= 0 && cursorY < editorH && cursorX >= gutterW && cursorX < ctx.Width {
 		fullLinePadded := padTab(line, 4)
 		ch := ' '
@@ -530,7 +608,7 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 	statusY := ctx.Height - 1
 	if statusY >= 0 {
 		status := fmt.Sprintf(" %s | %d lines | Ln %d, Col %d",
-			name+modified, e.Buffer.LenLines(), e.Cursor.Row+1, cursorDisplayCol+1)
+			name+modified, len(e.Buffer.Lines), e.Cursor.Row+1, cursorDisplayCol+1)
 		if len(e.buffers) > 1 {
 			status = fmt.Sprintf(" %s (%d/%d buffers) | Ln %d, Col %d",
 				name+modified, e.active+1, len(e.buffers), e.Cursor.Row+1, cursorDisplayCol+1)
@@ -544,15 +622,14 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 			warn := "ctrl+] goto diagnostic"
 			statusWidth := len([]rune(status))
 			f.Write(statusWidth+1, statusY, "| ", statusStyle)
-			keyWidth := len([]rune(e.lastKey.String()))
-			remainWidth := ctx.Width - statusWidth - keyWidth
+			eventWidth := len(e.LastEvent())
+			remainWidth := ctx.Width - statusWidth - eventWidth
 			if remainWidth > 0 {
 				f.Write(statusWidth+3, statusY, trimToWidth(warn, remainWidth), statusStyle.Background(kero.ColorRed))
 			}
 		}
-		if e.lastKey.Key != kero.KeyUnknown {
-			ks := e.lastKey.String()
-			f.Write(ctx.Width-len(ks), statusY, ks, statusStyle)
+		if s := e.LastEvent(); s != "" {
+			f.Write(ctx.Width-len(s), statusY, s, statusStyle)
 		}
 	}
 
@@ -589,7 +666,7 @@ func (e *Editor) selectLine() {
 		e.Selecting = true
 		e.SelAnchor = Position{Row: e.Cursor.Row, Col: 0}
 	}
-	if e.Cursor.Row < e.Buffer.LenLines()-1 {
+	if e.Cursor.Row < len(e.Buffer.Lines)-1 {
 		e.Cursor.Row++
 		e.Cursor.Col = 0
 	} else {
@@ -833,10 +910,10 @@ func (e *Editor) startCmdPalette(prefix string) {
 	e.message = ""
 }
 
-func (e *Editor) updateCmdPalette(key kero.KeyEvent) error {
+func (e *Editor) updateCmdPalette(ctx *kero.Context, key kero.KeyEvent) error {
 	switch key.Key {
 	case kero.KeyEnter:
-		err := e.finishCmdPalette()
+		err := e.finishCmdPalette(ctx)
 		if err != nil {
 			e.message = "warn: " + err.Error()
 		}
@@ -859,7 +936,7 @@ func (e *Editor) drawCmdPalette(f *kero.Frame, y int, width int) {
 	e.cmdInput.Draw(f, kero.Rect{X: inputX, Y: y, W: width - inputX, H: 1}, style)
 }
 
-func (e *Editor) finishCmdPalette() error {
+func (e *Editor) finishCmdPalette(ctx *kero.Context) error {
 	input := strings.TrimSpace(e.cmdInput.Value)
 	e.cmdMode = false
 	if input == "" {
@@ -890,11 +967,12 @@ func (e *Editor) finishCmdPalette() error {
 		if err != nil {
 			return errors.New("invalid line number: " + lineStr)
 		}
-		if lineNum < 1 || lineNum > e.Buffer.LenLines() {
+		if lineNum < 1 || lineNum > len(e.Buffer.Lines) {
 			return errors.New("line number out of range")
 		}
 		e.Cursor.Row = lineNum - 1
 		e.Cursor.Col = 0
+		e.showCursorCenter(ctx)
 		if e.hasSelect() {
 			e.clearSelect()
 		}
@@ -1150,7 +1228,7 @@ func (e *Editor) moveUp() {
 }
 
 func (e *Editor) moveDown() {
-	if e.Cursor.Row == e.Buffer.LenLines()-1 {
+	if e.Cursor.Row == len(e.Buffer.Lines)-1 {
 		return
 	}
 	displayCol := runeIndexToDisplayColumn(e.Buffer.Line(e.Cursor.Row), e.Cursor.Col)
@@ -1162,13 +1240,13 @@ func (e *Editor) markDirty() {
 	e.Dirty = true
 	e.message = ""
 	if isGoFile(e.Path) {
-		e.debounceCheckSemantic()
+		e.debounceDiagnose()
 	}
 }
 
-// debounceCheckSemantic is In-memory, fast syntax and type checking
+// debounceDiagnose is In-memory, fast syntax and type checking
 // on current buffer, debounced 300ms on keypress
-func (e *Editor) debounceCheckSemantic() {
+func (e *Editor) debounceDiagnose() {
 	if e.Buffer == nil {
 		return
 	}
@@ -1197,7 +1275,7 @@ func (e *Editor) debounceCheckSemantic() {
 	})
 }
 
-func (e *Editor) applyDiagnosticResults() {
+func (e *Editor) applyDiagnostic() {
 	if e.diagChan == nil {
 		return
 	}
@@ -1279,48 +1357,91 @@ func displayColumnToRuneIndex(runes []rune, targetCol int) int {
 	return len(runes)
 }
 
-func (e *Editor) ensureCursorVisible(ctx *kero.Context) {
+// showCursor adjusts TopRow and LeftCol to ensure the cursor is within
+// the visible viewport.
+func (e *Editor) showCursor(ctx *kero.Context) {
 	editorH := editorHeight(ctx)
 	if editorH <= 0 {
 		return
 	}
 
-	// Dynamic margin: keep 5 lines padding, but never exceed half the viewport height
-	margin := min(5, max(0, (editorH-1)/2))
-
 	// 1. Vertical Scrolling (Row)
-	// Ensure cursor is above the bottom margin
-	maxRowOffset := e.Cursor.Row - (editorH - 1 - margin)
-	if e.RowOffset < maxRowOffset {
-		e.RowOffset = maxRowOffset
+	maxTopRow := e.Cursor.Row - (editorH - 1)
+	if e.TopRow < maxTopRow {
+		e.TopRow = maxTopRow
 	}
 
 	// Ensure cursor is below the top margin
-	minRowOffset := e.Cursor.Row - margin
-	if e.RowOffset > minRowOffset {
-		e.RowOffset = minRowOffset
+	minTopRow := e.Cursor.Row
+	if e.TopRow > minTopRow {
+		e.TopRow = minTopRow
 	}
 
 	// Clamp to top boundary
-	if e.RowOffset < 0 {
-		e.RowOffset = 0
+	if e.TopRow < 0 {
+		e.TopRow = 0
 	}
-
 	// 2. Horizontal Scrolling (Column)
-	textW := ctx.Width - lineNumberWidth(e.Buffer.LenLines()) - 2
+	textW := ctx.Width - lineNumberWidth(len(e.Buffer.Lines)) - 2
 	textW = max(1, textW)
 
 	line := e.Buffer.Line(e.Cursor.Row)
 	cursorDisplay := runeIndexToDisplayColumn(line, e.Cursor.Col)
 
-	if cursorDisplay < e.ColOffset {
-		e.ColOffset = cursorDisplay
-	} else if cursorDisplay >= e.ColOffset+textW {
-		e.ColOffset = cursorDisplay - textW + 1
+	if cursorDisplay < e.LeftCol {
+		e.LeftCol = cursorDisplay
+	} else if cursorDisplay >= e.LeftCol+textW {
+		e.LeftCol = cursorDisplay - textW + 1
 	}
 
-	if e.ColOffset < 0 {
-		e.ColOffset = 0
+	if e.LeftCol < 0 {
+		e.LeftCol = 0
+	}
+}
+
+// showCursor adjusts TopRow and LeftCol to ensure the cursor is at
+// the center of visible viewport.
+func (e *Editor) showCursorCenter(ctx *kero.Context) {
+	editorH := editorHeight(ctx)
+	if editorH <= 0 {
+		return
+	}
+
+	margin := editorH / 2
+
+	// 1. Vertical Scrolling (Row)
+	// Ensure cursor is above the bottom margin
+	maxTopRow := e.Cursor.Row - (editorH - 1 - margin)
+	if e.TopRow < maxTopRow {
+		e.TopRow = maxTopRow
+	}
+
+	// Ensure cursor is below the top margin
+	minTopRow := e.Cursor.Row - margin
+	if e.TopRow > minTopRow {
+		e.TopRow = minTopRow
+	}
+
+	// Clamp to top boundary
+	if e.TopRow < 0 {
+		e.TopRow = 0
+	}
+
+	// 2. Horizontal Scrolling (Column)
+	textW := ctx.Width - lineNumberWidth(len(e.Buffer.Lines)) - 2
+	textW = max(1, textW)
+
+	line := e.Buffer.Line(e.Cursor.Row)
+	cursorDisplay := runeIndexToDisplayColumn(line, e.Cursor.Col)
+
+	if cursorDisplay < e.LeftCol {
+		e.LeftCol = cursorDisplay
+	} else if cursorDisplay >= e.LeftCol+textW {
+		e.LeftCol = cursorDisplay - textW + 1
+	}
+
+	if e.LeftCol < 0 {
+		e.LeftCol = 0
 	}
 }
 
@@ -1367,7 +1488,7 @@ func (e *Editor) GotoDefinition() {
 }
 
 func (e *Editor) GotoSymbol(name string) {
-	loc, found := FindSymbolLoc(e.Buffer.String(), name)
+	loc, found := FindSymbolLoc(e.Buffer.NewReader(), name)
 	if !found {
 		return
 	}
@@ -1386,7 +1507,7 @@ type SymbolPicker struct {
 	Limit    int // max number of symbols to display
 }
 
-func (e *Editor) updateSymbolPicker(ev kero.KeyEvent) {
+func (e *Editor) updateSymbolPicker(ctx *kero.Context, ev kero.KeyEvent) {
 	prevQuery := e.symbolInput.Value
 	switch ev.String() {
 	case "esc":
@@ -1400,6 +1521,7 @@ func (e *Editor) updateSymbolPicker(ev kero.KeyEvent) {
 		e.Cursor.Row = picked.Line - 1
 		e.Cursor.Col = picked.Column - 1
 		e.symbolPicker.Active = false
+		e.showCursorCenter(ctx)
 	case "up", "ctrl+p":
 		e.symbolPicker.Index = (e.symbolPicker.Index - 1 + len(e.symbolPicker.Filtered)) % len(e.symbolPicker.Filtered)
 	case "down", "ctrl+n":
@@ -1444,7 +1566,7 @@ func (e *Editor) drawSymbolPicker(f *kero.Frame, y, width int) {
 }
 
 func (e *Editor) OpenSymbolPicker() {
-	symbols := ExtractAllSymbols(e.Buffer.String())
+	symbols := ExtractAllSymbols(e.Buffer.NewReader())
 	e.symbolPicker = SymbolPicker{
 		Active:   true,
 		All:      symbols,
@@ -1622,12 +1744,14 @@ type Position struct {
 }
 
 type Buffer struct {
-	Path      string
-	Lines     [][]rune // Using [][]rune handles multi-byte UTF-8 correctly
-	Cursor    Position
-	RowOffset int // Scroll offsets for the view viewport
-	ColOffset int // visual display column offset (0-based horizontal scroll position)
-	Dirty     bool
+	Path   string
+	Lines  [][]rune // Using [][]rune handles multi-byte UTF-8 correctly
+	Cursor Position
+	Dirty  bool
+
+	// viewport
+	TopRow  int // vertical scroll offsets, starts from 0
+	LeftCol int // horizontal scroll offsets, starts from display column offset (0-based horizontal scroll position)
 
 	Selecting bool
 	SelAnchor Position // selection at [e.selAnchor, e.pos)
@@ -1667,45 +1791,6 @@ func (b *Buffer) SetLine(row int, line []rune) {
 	dst := make([]rune, len(line))
 	copy(dst, line)
 	b.Lines[row] = dst
-}
-
-func (b *Buffer) LenLines() int {
-	return len(b.Lines)
-}
-
-// Bytes returns the entire buffer content as a UTF-8 encoded byte slice.
-func (b *Buffer) Bytes() []byte {
-	linesCount := len(b.Lines)
-	if linesCount == 0 {
-		return []byte{}
-	}
-
-	// 1. Calculate total byte capacity upfront to do a single allocation
-	var totalBytes int
-	for _, line := range b.Lines {
-		for _, r := range line {
-			totalBytes += utf8.RuneLen(r)
-		}
-	}
-	// Add room for newline characters ('\n' is 1 byte per line break)
-	totalBytes += (linesCount - 1)
-
-	// 2. Pre-allocate slice buffer
-	buf := make([]byte, 0, totalBytes)
-
-	// 3. Append UTF-8 encoded bytes line by line
-	var runeBuf [utf8.UTFMax]byte
-	for i, line := range b.Lines {
-		if i > 0 {
-			buf = append(buf, '\n')
-		}
-		for _, r := range line {
-			n := utf8.EncodeRune(runeBuf[:], r)
-			buf = append(buf, runeBuf[:n]...)
-		}
-	}
-
-	return buf
 }
 
 // String returns the full buffer text as a string, joined by newlines.
@@ -2188,7 +2273,7 @@ func (b *Buffer) NextPos(p Position) Position {
 	if p.Col < lineLen {
 		return Position{Row: p.Row, Col: p.Col + 1}
 	}
-	if p.Row < b.LenLines()-1 {
+	if p.Row < len(b.Lines)-1 {
 		return Position{Row: p.Row + 1, Col: 0}
 	}
 	return p
@@ -2645,7 +2730,7 @@ func (e *Editor) OpenFile(path string) error {
 				e.Buffer = buf
 				e.diags = nil
 				if isGoFile(e.Path) {
-					e.debounceCheckSemantic()
+					e.debounceDiagnose()
 				}
 				return nil
 			}
@@ -2663,7 +2748,7 @@ func (e *Editor) OpenFile(path string) error {
 	e.Buffer = buf
 	e.diags = nil
 	if isGoFile(e.Path) {
-		e.debounceCheckSemantic()
+		e.debounceDiagnose()
 	}
 	return nil
 }
@@ -2682,7 +2767,7 @@ func (e *Editor) CloseBuffer() {
 	e.Buffer = e.buffers[e.active]
 	e.diags = nil
 	if isGoFile(e.Path) {
-		e.debounceCheckSemantic()
+		e.debounceDiagnose()
 	}
 }
 
@@ -2692,7 +2777,7 @@ func (e *Editor) NextBuffer() {
 		e.Buffer = e.buffers[e.active]
 		e.diags = nil
 		if isGoFile(e.Path) {
-			e.debounceCheckSemantic()
+			e.debounceDiagnose()
 		}
 	}
 }
@@ -2703,7 +2788,7 @@ func (e *Editor) PrevBuffer() {
 		e.Buffer = e.buffers[e.active]
 		e.diags = nil
 		if isGoFile(e.Path) {
-			e.debounceCheckSemantic()
+			e.debounceDiagnose()
 		}
 	}
 }

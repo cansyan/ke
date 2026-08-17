@@ -36,6 +36,11 @@ Command keys are supported in Kitty terminal:
 - Cmd+Right move cursor to line end
 - Cmd+Backspace delete to line start
 
+Mouse motions:
+- mouse_left_press move cursor
+- mouse_left_drag expand selection
+- ctrl+mouse_left_release goto definition
+
 Design Choices:
 - future key chords, Ctrl+K or Ctrl+X as leader key are good, but both taken. 
 - did consider Ctrl+Shift+P for command palette, but the key combo seems unreliable in practice
