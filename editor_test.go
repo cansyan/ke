@@ -7,20 +7,19 @@ import (
 	"github.com/cansyan/kero"
 )
 
-func TestDisplayColumnAndRuneIndex(t *testing.T) {
-	line := []rune("a\tbc")
-
-	if got := runeIndexToDisplayColumn(line, 2); got != 4 {
-		t.Fatalf("runeIndexToDisplayColumn(line, 2) = %d, want 4", got)
+func TestDisplayColumn(t *testing.T) {
+	b := NewBuffer("a\tbc")
+	if got := b.VisualPos(Position{Col: 2}); got.Col != 4 {
+		t.Fatalf("VisualPos(Position{Row: 0, Col: 2}) = %+v, want col 4", got)
 	}
-	if got := runeIndexToDisplayColumn(line, 3); got != 5 {
-		t.Fatalf("runeIndexToDisplayColumn(line, 3) = %d, want 5", got)
+	if got := b.VisualPos(Position{Col: 3}); got.Col != 5 {
+		t.Fatalf("VisualPos(Position{Row: 0, Col: 3}) = %+v, want col 5", got)
 	}
-	if got := displayColumnToRuneIndex(line, 4); got != 2 {
-		t.Fatalf("displayColumnToRuneIndex(line, 4) = %d, want 2", got)
+	if got := b.PosFromVisual(Position{Col: 4}); got.Col != 2 {
+		t.Fatalf("PosFromVisual(Position{Col: 4}) = %+v, want col 2", got)
 	}
-	if got := displayColumnToRuneIndex(line, 5); got != 3 {
-		t.Fatalf("displayColumnToRuneIndex(line, 5) = %d, want 3", got)
+	if got := b.PosFromVisual(Position{Col: 5}); got.Col != 3 {
+		t.Fatalf("PosFromVisual(Position{Col: 5}) = %+v, want col 3", got)
 	}
 }
 

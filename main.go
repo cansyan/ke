@@ -54,12 +54,13 @@ func parsePathArg(arg string) (path string, row, col int) {
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 
-	e := &Editor{}
 	var path string
 	var row, col int
 	if len(os.Args) > 1 {
 		path, row, col = parsePathArg(os.Args[1])
 	}
+
+	e := &Editor{}
 	err := e.OpenFile(path)
 	if err != nil {
 		log.Fatal(err)
@@ -108,8 +109,7 @@ type Editor struct {
 	clipboard  string
 	clipIsLine bool
 
-	// lastKey kero.KeyEvent
-	// optional: record the time of lastKey, make it expire after a while
+	// optional: record the time of last key, make it expire after a while
 	lastEvent kero.Event
 
 	diags       []Diagnostic
@@ -133,10 +133,7 @@ type diagResult struct {
 }
 
 func (e *Editor) Init(ctx *kero.Context) error {
-	e.showCursorCenter(ctx)
-	if isGoFile(e.Path) {
-		e.debounceDiagnose()
-	}
+	e.showCursor(ctx)
 	return nil
 }
 
@@ -172,11 +169,13 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 
 func (e *Editor) cursorFromMouse(m kero.MouseEvent) Position {
 	row := e.TopRow + m.Y
+	if row >= len(e.Lines) {
+		// out of viewport, return current cursor
+		return e.Cursor
+	}
+
 	displayCol := m.X - e.gutterW
-	return e.ClampPos(Position{
-		Row: row,
-		Col: displayColumnToRuneIndex(e.Lines[row], displayCol),
-	})
+	return e.PosFromVisual(Position{Row: row, Col: displayCol})
 }
 
 func (e *Editor) handleMouse(ctx *kero.Context, m kero.MouseEvent) error {
@@ -260,6 +259,16 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 	switch key.Key {
 	case kero.KeyRune:
 		switch key.String() {
+		case "ctrl+w":
+			if e.Dirty && !(e.LastEvent() == "ctrl+w") {
+				e.message = "warn: unsaved changes, press ctrl+s to save or ctrl+w again to close"
+				return nil
+			}
+			if len(e.buffers) <= 1 {
+				ctx.Quit()
+				return nil
+			}
+			e.CloseBuffer()
 		case "ctrl+r":
 			e.OpenSymbolPicker()
 		case "ctrl+g":
@@ -565,11 +574,11 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 					selEndCol = len(srcLine)
 				}
 
-				startVisCol := runeIndexToDisplayColumn(srcLine, selStartCol)
-				endVisCol := runeIndexToDisplayColumn(srcLine, selEndCol)
+				visStart := e.VisualPos(Position{Row: lineIndex, Col: selStartCol})
+				visEnd := e.VisualPos(Position{Row: lineIndex, Col: selEndCol})
 
-				startDisplay := max(0, min(startVisCol-e.LeftCol, len(visPadded)))
-				endDisplay := max(0, min(endVisCol-e.LeftCol, len(visPadded)))
+				startDisplay := max(0, min(visStart.Col-e.LeftCol, len(visPadded)))
+				endDisplay := max(0, min(visEnd.Col-e.LeftCol, len(visPadded)))
 
 				for x := startDisplay; x < endDisplay; x++ {
 					ch := rune(visPadded[x])
@@ -579,11 +588,11 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 		}
 
 		if e.finding && e.findMatch && lineIndex == e.findMatchStart.Row && lineIndex == e.findMatchEnd.Row {
-			startVisCol := runeIndexToDisplayColumn(srcLine, e.findMatchStart.Col)
-			endVisCol := runeIndexToDisplayColumn(srcLine, e.findMatchEnd.Col)
+			visStart := e.VisualPos(Position{Row: lineIndex, Col: e.findMatchStart.Col})
+			visEnd := e.VisualPos(Position{Row: lineIndex, Col: e.findMatchEnd.Col})
 
-			startDisplay := max(0, min(startVisCol-e.LeftCol, len(visPadded)))
-			endDisplay := max(0, min(endVisCol-e.LeftCol, len(visPadded)))
+			startDisplay := max(0, min(visStart.Col-e.LeftCol, len(visPadded)))
+			endDisplay := max(0, min(visEnd.Col-e.LeftCol, len(visPadded)))
 
 			for x := startDisplay; x < endDisplay; x++ {
 				ch := rune(visPadded[x])
@@ -592,15 +601,14 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 		}
 	}
 
-	line := e.Buffer.Line(e.Cursor.Row)
-	cursorDisplayCol := runeIndexToDisplayColumn(line, e.Cursor.Col)
-	cursorX := gutterW + cursorDisplayCol - e.LeftCol
+	cursorVisPos := e.VisualPos(e.Cursor)
+	cursorX := gutterW + cursorVisPos.Col - e.LeftCol
 	cursorY := 0 + e.Cursor.Row - e.TopRow
 	if cursorY >= 0 && cursorY < editorH && cursorX >= gutterW && cursorX < ctx.Width {
-		fullLinePadded := padTab(line, 4)
+		fullLinePadded := padTab(e.Line(e.Cursor.Row), 4)
 		ch := ' '
-		if cursorDisplayCol < len(fullLinePadded) {
-			ch = rune(fullLinePadded[cursorDisplayCol])
+		if cursorVisPos.Col < len(fullLinePadded) {
+			ch = rune(fullLinePadded[cursorVisPos.Col])
 		}
 		f.Set(cursorX, cursorY, ch, cursorStyle)
 	}
@@ -608,10 +616,10 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 	statusY := ctx.Height - 1
 	if statusY >= 0 {
 		status := fmt.Sprintf(" %s | %d lines | Ln %d, Col %d",
-			name+modified, len(e.Buffer.Lines), e.Cursor.Row+1, cursorDisplayCol+1)
+			name+modified, len(e.Buffer.Lines), e.Cursor.Row+1, cursorVisPos.Col+1)
 		if len(e.buffers) > 1 {
 			status = fmt.Sprintf(" %s (%d/%d buffers) | Ln %d, Col %d",
-				name+modified, e.active+1, len(e.buffers), e.Cursor.Row+1, cursorDisplayCol+1)
+				name+modified, e.active+1, len(e.buffers), e.Cursor.Row+1, cursorVisPos.Col+1)
 		}
 		if e.Selecting {
 			status = status + " | Selecting"
@@ -652,7 +660,7 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 			return
 		}
 		if e.message == "" {
-			e.message = "^S save | ^Q quit | ^F find | ^G definition | ^R symbols | ^] diagnostic"
+			e.message = "^S save | ^W close | ^Q quit | ^F find | ^G definition | ^R symbols | ^] diagnostic"
 		}
 		if strings.HasPrefix(e.message, "error:") || strings.HasPrefix(e.message, "warn:") {
 			messageStyle = messageStyle.Foreground(kero.ColorRed)
@@ -904,7 +912,7 @@ func (e *Editor) drawSaveAs(f *kero.Frame, y int, width int) {
 // startCmdPalette opens the command palette.
 func (e *Editor) startCmdPalette(prefix string) {
 	e.cmdMode = true
-	e.cmdInput = TextInput{Placeholder: "/command or :line"}
+	e.cmdInput = TextInput{Placeholder: "file name, /command or :line"}
 	e.cmdInput.Value = prefix
 	e.cmdInput.Cursor = len([]rune(prefix))
 	e.message = ""
@@ -948,12 +956,14 @@ func (e *Editor) finishCmdPalette(ctx *kero.Context) error {
 		// run commands
 		parts := strings.Fields(input)
 		switch parts[0] {
-		case "/open", "/o":
-			if len(parts) <= 1 {
-				return errors.New("required file path")
-			}
-			if err := e.OpenFile(parts[1]); err != nil {
-				return err
+		case "/ls":
+			// list buffer
+			for i, buf := range e.buffers {
+				name := buf.Path
+				if name == "" {
+					name = "untitled"
+				}
+				e.message += fmt.Sprintf("%d:%s ", i+1, name)
 			}
 		}
 		return nil
@@ -979,8 +989,10 @@ func (e *Editor) finishCmdPalette(ctx *kero.Context) error {
 		return nil
 	default:
 		// TODO: show file picker
+		// open file by default
+		parts := strings.Fields(input)
+		return e.OpenFile(parts[0])
 	}
-	return errors.New("command must start with / or :")
 }
 
 func (e *Editor) startFind() {
@@ -1222,18 +1234,16 @@ func (e *Editor) moveUp() {
 	if e.Cursor.Row == 0 {
 		return
 	}
-	displayCol := runeIndexToDisplayColumn(e.Buffer.Line(e.Cursor.Row), e.Cursor.Col)
-	i := displayColumnToRuneIndex(e.Buffer.Line(e.Cursor.Row-1), displayCol)
-	e.Cursor = Position{Row: e.Cursor.Row - 1, Col: i}
+	vp := e.VisualPos(e.Cursor)
+	e.Cursor = e.PosFromVisual(Position{Row: vp.Row - 1, Col: vp.Col})
 }
 
 func (e *Editor) moveDown() {
 	if e.Cursor.Row == len(e.Buffer.Lines)-1 {
 		return
 	}
-	displayCol := runeIndexToDisplayColumn(e.Buffer.Line(e.Cursor.Row), e.Cursor.Col)
-	i := displayColumnToRuneIndex(e.Buffer.Line(e.Cursor.Row+1), displayCol)
-	e.Cursor = Position{Row: e.Cursor.Row + 1, Col: i}
+	vp := e.VisualPos(e.Cursor)
+	e.Cursor = e.PosFromVisual(Position{Row: vp.Row + 1, Col: vp.Col})
 }
 
 func (e *Editor) markDirty() {
@@ -1319,44 +1329,6 @@ func isGoFile(path string) bool {
 	return strings.EqualFold(filepath.Ext(path), ".go")
 }
 
-func runeIndexToDisplayColumn(runes []rune, pos int) int {
-	if pos < 0 {
-		pos = 0
-	}
-	if pos > len(runes) {
-		pos = len(runes)
-	}
-
-	col := 0
-	for i := range pos {
-		if runes[i] == '\t' {
-			col += 4 - (col % 4)
-			continue
-		}
-		col++
-	}
-	return col
-}
-
-func displayColumnToRuneIndex(runes []rune, targetCol int) int {
-	if targetCol <= 0 {
-		return 0
-	}
-
-	col := 0
-	for i, r := range runes {
-		advance := 1
-		if r == '\t' {
-			advance = 4 - (col % 4)
-		}
-		if col+advance > targetCol {
-			return i
-		}
-		col += advance
-	}
-	return len(runes)
-}
-
 // showCursor adjusts TopRow and LeftCol to ensure the cursor is within
 // the visible viewport.
 func (e *Editor) showCursor(ctx *kero.Context) {
@@ -1385,13 +1357,11 @@ func (e *Editor) showCursor(ctx *kero.Context) {
 	textW := ctx.Width - lineNumberWidth(len(e.Buffer.Lines)) - 2
 	textW = max(1, textW)
 
-	line := e.Buffer.Line(e.Cursor.Row)
-	cursorDisplay := runeIndexToDisplayColumn(line, e.Cursor.Col)
-
-	if cursorDisplay < e.LeftCol {
-		e.LeftCol = cursorDisplay
-	} else if cursorDisplay >= e.LeftCol+textW {
-		e.LeftCol = cursorDisplay - textW + 1
+	visualCursor := e.VisualPos(e.Cursor)
+	if visualCursor.Col < e.LeftCol {
+		e.LeftCol = visualCursor.Col
+	} else if visualCursor.Col >= e.LeftCol+textW {
+		e.LeftCol = visualCursor.Col - textW + 1
 	}
 
 	if e.LeftCol < 0 {
@@ -1431,13 +1401,12 @@ func (e *Editor) showCursorCenter(ctx *kero.Context) {
 	textW := ctx.Width - lineNumberWidth(len(e.Buffer.Lines)) - 2
 	textW = max(1, textW)
 
-	line := e.Buffer.Line(e.Cursor.Row)
-	cursorDisplay := runeIndexToDisplayColumn(line, e.Cursor.Col)
+	visCursor := e.VisualPos(e.Cursor)
 
-	if cursorDisplay < e.LeftCol {
-		e.LeftCol = cursorDisplay
-	} else if cursorDisplay >= e.LeftCol+textW {
-		e.LeftCol = cursorDisplay - textW + 1
+	if visCursor.Col < e.LeftCol {
+		e.LeftCol = visCursor.Col
+	} else if visCursor.Col >= e.LeftCol+textW {
+		e.LeftCol = visCursor.Col - textW + 1
 	}
 
 	if e.LeftCol < 0 {
@@ -1738,6 +1707,7 @@ func (t TextInput) Draw(f *kero.Frame, r kero.Rect, s kero.Style) {
 	}
 }
 
+// Position represents the buffer character index
 type Position struct {
 	Row int // line index, starting at 0
 	Col int // column index, starting at 0
@@ -2364,6 +2334,55 @@ func (r *BufReader) Read(p []byte) (n int, err error) {
 	return n, nil
 }
 
+// VisualPos converts a buffer position to a visual display position, accounting tab stop.
+func (b *Buffer) VisualPos(p Position) Position {
+	if p.Row < 0 || p.Row >= len(b.Lines) {
+		return p
+	}
+
+	line := b.Lines[p.Row]
+	if p.Col < 0 {
+		p.Col = 0
+	} else if p.Col > len(line) {
+		p.Col = len(line)
+	}
+
+	col := 0
+	for i := range p.Col {
+		if line[i] == '\t' {
+			col += 4 - (col % 4)
+			continue
+		}
+		col++
+	}
+	return Position{Row: p.Row, Col: col}
+}
+
+// PosFromVisual converts a visual display Position back to a buffer Position.
+func (b *Buffer) PosFromVisual(p Position) Position {
+	if p.Row < 0 || p.Row >= len(b.Lines) {
+		return p
+	}
+
+	if p.Col <= 0 {
+		return Position{Row: p.Row, Col: 0}
+	}
+
+	col := 0
+	line := b.Lines[p.Row]
+	for i, r := range line {
+		advance := 1
+		if r == '\t' {
+			advance = 4 - (col % 4)
+		}
+		if col+advance > p.Col {
+			return Position{Row: p.Row, Col: i}
+		}
+		col += advance
+	}
+	return Position{Row: p.Row, Col: len(line)}
+}
+
 type Diagnostic struct {
 	Row     int // start from 0
 	Col     int // start from 0
@@ -2718,8 +2737,10 @@ func (e *Editor) OpenFile(path string) error {
 	var buf *Buffer
 	if path == "" {
 		buf = &Buffer{
-			Path:  "",
-			Lines: [][]rune{},
+			Path: "",
+			Lines: [][]rune{
+				[]rune(""),
+			},
 		}
 	} else {
 		path = filepath.Clean(path)
@@ -2766,6 +2787,7 @@ func (e *Editor) CloseBuffer() {
 	}
 	e.Buffer = e.buffers[e.active]
 	e.diags = nil
+	e.message = ""
 	if isGoFile(e.Path) {
 		e.debounceDiagnose()
 	}

@@ -18,12 +18,16 @@ Key bindings:
 - Ctrl+G goto definition
 - Ctrl+P command palette
 	- `:123` goto line 123
+	- `/ls` list buffer
 - Ctrl+Backspace delete to line start
 - Ctrl+K delete to line end
 - Ctrl+Enter insert line below
 - Ctrl+A or Home move cursor to line start
 - Ctrl+E or End move cursor to line end
 - Ctrl+] goto next diagnostic
+- Ctrl+W close buffer
+- Ctrl+B Ctrl+N next buffer
+- Ctrl+B Ctrl+P previous buffer
 - Alt+Left move cursor to start of current/previous word
 - Alt+Right move cursor to end of current/next word
 - Alt+Backspace delete word backwards
@@ -46,4 +50,4 @@ Design Choices:
 - did consider Ctrl+Shift+P for command palette, but the key combo seems unreliable in practice
 - early version should keep things tiny, avoid duplicate selection, mutilple cursor, undo/redo, go back/forward
 - using / as command prefix is more convenient than > (shift+.)
-- in-process semantics checking ignore external module, benefits instant feedback
+- in-process semantics checking ignores external file/module, benefits instant feedback
