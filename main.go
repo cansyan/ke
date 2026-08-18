@@ -125,6 +125,8 @@ type Editor struct {
 	pasting bool
 
 	gutterW int
+
+	jumps JumpList
 }
 
 type diagResult struct {
@@ -259,6 +261,12 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 	switch key.Key {
 	case kero.KeyRune:
 		switch key.String() {
+		case "ctrl+-":
+			e.GoBack()
+			e.showCursorCenter(ctx)
+		case "ctrl+shift+-":
+			e.GoForward()
+			e.showCursorCenter(ctx)
 		case "ctrl+w":
 			if e.Dirty && !(e.LastEvent() == "ctrl+w") {
 				e.message = "warn: unsaved changes, press ctrl+s to save or ctrl+w again to close"
@@ -980,6 +988,7 @@ func (e *Editor) finishCmdPalette(ctx *kero.Context) error {
 		if lineNum < 1 || lineNum > len(e.Buffer.Lines) {
 			return errors.New("line number out of range")
 		}
+		e.recordJump() // Save location before jumping
 		e.Cursor.Row = lineNum - 1
 		e.Cursor.Col = 0
 		e.showCursorCenter(ctx)
@@ -1487,6 +1496,7 @@ func (e *Editor) updateSymbolPicker(ctx *kero.Context, ev kero.KeyEvent) {
 			return
 		}
 		picked := e.symbolPicker.Filtered[e.symbolPicker.Index]
+		e.recordJump() // Save location before jumping
 		e.Cursor.Row = picked.Line - 1
 		e.Cursor.Col = picked.Column - 1
 		e.symbolPicker.Active = false
@@ -2735,6 +2745,7 @@ func FilterSymbols(src []SymbolLocation, query string) []SymbolLocation {
 // OpenFile loads a file into memory or focuses it if already loaded.
 func (e *Editor) OpenFile(path string) error {
 	var buf *Buffer
+	// FIXME: seems duplicate with loadBuffer
 	if path == "" {
 		buf = &Buffer{
 			Path: "",
@@ -2825,7 +2836,7 @@ func loadBuffer(path string) (*Buffer, error) {
 		// New/unsaved file: initialize with one empty line
 		return &Buffer{
 			Path:  cleanPath,
-			Lines: [][]rune{},
+			Lines: [][]rune{[]rune("")},
 		}, nil
 	} else if err != nil {
 		return nil, err
@@ -2899,4 +2910,117 @@ func (b *Buffer) Save() error {
 
 	b.Dirty = false
 	return nil
+}
+
+// Jump represents a recorded location in a buffer.
+type Jump struct {
+	Path string   // File path (used to match across buffer switches/reopens)
+	Pos  Position // Cursor position (Row, Col)
+}
+
+// JumpList manages navigation history for long jumps (Go To Def, Find Symbol, etc.).
+type JumpList struct {
+	items []Jump
+	index int // Points to current position in history
+}
+
+const maxJumps = 100
+
+// Push adds a new jump location to the stack.
+// If the new position is identical or right next to the current jump, it is ignored.
+func (j *JumpList) Push(path string, pos Position) {
+	if len(j.items) > 0 && j.index >= 0 && j.index < len(j.items) {
+		curr := j.items[j.index]
+		// Avoid pushing duplicate positions in the same file
+		if curr.Path == path && curr.Pos == pos {
+			return
+		}
+	}
+
+	// Truncate forward history if we jump from somewhere in the middle
+	if j.index < len(j.items)-1 {
+		j.items = j.items[:j.index+1]
+	}
+
+	j.items = append(j.items, Jump{Path: path, Pos: pos})
+	if len(j.items) > maxJumps {
+		j.items = j.items[1:]
+	}
+	j.index = len(j.items) - 1
+}
+
+// Back steps back in history and returns the target jump position.
+func (j *JumpList) Back(currentPath string, currentPos Position) (Jump, bool) {
+	if len(j.items) == 0 {
+		return Jump{}, false
+	}
+
+	// If we are at the head of the jump list, record current position first
+	// so we can jump forward back to it later.
+	if j.index == len(j.items)-1 {
+		j.Push(currentPath, currentPos)
+	}
+
+	if j.index <= 0 {
+		j.index = 0
+		return j.items[0], true
+	}
+
+	j.index--
+	return j.items[j.index], true
+}
+
+// Forward steps forward in history and returns the target jump position.
+func (j *JumpList) Forward() (Jump, bool) {
+	if len(j.items) == 0 || j.index >= len(j.items)-1 {
+		return Jump{}, false
+	}
+
+	j.index++
+	return j.items[j.index], true
+}
+
+// recordJump saves the current editor position into the jump history.
+func (e *Editor) recordJump() {
+	if e.Buffer == nil {
+		return
+	}
+	e.jumps.Push(e.Path, e.Cursor)
+}
+
+// jumpTo restores a recorded location, switching buffers if necessary.
+func (e *Editor) jumpTo(target Jump) {
+	// 1. Switch buffer if the target is in a different file
+	if target.Path != "" && target.Path != e.Path {
+		err := e.OpenFile(target.Path)
+		if err != nil {
+			log.Print(err)
+			return
+		}
+	}
+
+	// 2. Set cursor position
+	if target.Pos.Row >= 0 && target.Pos.Row < len(e.Lines) {
+		e.Cursor = e.ClampPos(target.Pos)
+	}
+}
+
+// GoBack moves to the previous position in jump history.
+func (e *Editor) GoBack() {
+	if e.Buffer == nil {
+		return
+	}
+	if target, ok := e.jumps.Back(e.Path, e.Cursor); ok {
+		e.jumpTo(target)
+	}
+}
+
+// GoForward moves to the next position in jump history.
+func (e *Editor) GoForward() {
+	if e.Buffer == nil {
+		return
+	}
+	if target, ok := e.jumps.Forward(); ok {
+		e.jumpTo(target)
+	}
 }

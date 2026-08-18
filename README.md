@@ -28,6 +28,8 @@ Key bindings:
 - Ctrl+W close buffer
 - Ctrl+B Ctrl+N next buffer
 - Ctrl+B Ctrl+P previous buffer
+- Ctrl+- go back (long jumps only)
+- Ctrl+Shift+- go forward (long jumps only)
 - Alt+Left move cursor to start of current/previous word
 - Alt+Right move cursor to end of current/next word
 - Alt+Backspace delete word backwards
@@ -48,6 +50,6 @@ Mouse motions:
 Design Choices:
 - future key chords, Ctrl+K or Ctrl+X as leader key are good, but both taken. 
 - did consider Ctrl+Shift+P for command palette, but the key combo seems unreliable in practice
-- early version should keep things tiny, avoid duplicate selection, mutilple cursor, undo/redo, go back/forward
+- early version should keep things tiny, avoid duplicate selection, mutilple cursor, undo/redo
 - using / as command prefix is more convenient than > (shift+.)
 - in-process semantics checking ignores external file/module, benefits instant feedback
