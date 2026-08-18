@@ -176,7 +176,7 @@ func (e *Editor) cursorFromMouse(m kero.MouseEvent) Position {
 		return e.Cursor
 	}
 
-	displayCol := m.X - e.gutterW
+	displayCol := m.X - e.gutterW + e.LeftCol
 	return e.PosFromVisual(Position{Row: row, Col: displayCol})
 }
 
@@ -1762,7 +1762,7 @@ type Buffer struct {
 
 	// viewport
 	TopRow  int // vertical scroll offsets, starts from 0
-	LeftCol int // horizontal scroll offsets, starts from display column offset (0-based horizontal scroll position)
+	LeftCol int // horizontal scroll offsets, starts from display column offset (0-based)
 
 	Selecting bool
 	SelAnchor Position // selection at [e.selAnchor, e.pos)
