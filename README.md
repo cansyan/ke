@@ -21,7 +21,8 @@ Key bindings:
 	- `/ls` list buffer
 - Ctrl+Backspace delete to line start
 - Ctrl+K delete to line end
-- Ctrl+Enter insert line below
+- Ctrl+Enter insert newline below
+- Shift+Enter insert newline above
 - Ctrl+A or Home move cursor to line start
 - Ctrl+E or End move cursor to line end
 - Ctrl+] goto next diagnostic

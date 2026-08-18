@@ -356,30 +356,52 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 		if e.hasSelect() {
 			e.deleteSelect()
 		}
-		// insert raw newline
+
 		if e.pasting {
 			e.Cursor = e.Buffer.Insert(e.Cursor, "\n")
 			return nil
 		}
 
-		// insert newline with auto-indent
-		var n int
-		line := e.Buffer.Line(e.Cursor.Row)
-		for _, b := range line {
-			if !unicode.IsSpace(b) {
-				break
+		autoIndent := func(line []rune, col int) string {
+			if len(line) == 0 || col == 0 {
+				return ""
 			}
-			n++
+			// get indentation before the column
+			var n int
+			for _, b := range line[:col] {
+				if !unicode.IsSpace(b) {
+					break
+				}
+				n++
+			}
+			indent := string(line[:n])
+			// indent on block start
+			if line[col-1] == '{' {
+				indent += "\t"
+			}
+			return indent
 		}
-		indent := line[:n]
-		if key.Mod&kero.ModCtrl != 0 {
-			// add indentation on block start
-			if line[len(line)-1] == '{' {
-				indent = append(indent, '\t')
-			}
+
+		switch key.String() {
+		case "ctrl+enter":
+			// insert newline below
+			line := e.Buffer.Line(e.Cursor.Row)
+			indent := autoIndent(line, len(line))
 			p := Position{Row: e.Cursor.Row, Col: len(line)}
-			e.Cursor = e.Buffer.Insert(p, "\n"+string(indent))
-		} else {
+			e.Cursor = e.Buffer.Insert(p, "\n"+indent)
+		case "shift+enter":
+			// insert newline above
+			var prevIndent string
+			if e.Cursor.Row > 0 {
+				prevLine := e.Buffer.Line(e.Cursor.Row - 1)
+				prevIndent = autoIndent(prevLine, len(prevLine))
+			}
+			e.Buffer.Insert(Position{Row: e.Cursor.Row, Col: 0}, "\n")
+			e.Cursor = e.Buffer.Insert(Position{Row: e.Cursor.Row, Col: 0}, prevIndent)
+		default:
+			// insert newline under cursor
+			line := e.Buffer.Line(e.Cursor.Row)
+			indent := autoIndent(line, e.Cursor.Col)
 			e.Cursor = e.Buffer.Insert(e.Cursor, "\n"+string(indent))
 		}
 		e.markDirty()
@@ -459,6 +481,7 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 	case kero.KeyUp:
 		switch key.String() {
 		case "cmd+up":
+			e.recordJump()
 			// file start
 			e.Cursor.Row = 0
 			e.Cursor.Col = 0
@@ -475,6 +498,7 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 	case kero.KeyDown:
 		switch key.String() {
 		case "cmd+down":
+			e.recordJump()
 			// file end
 			e.Cursor.Row = len(e.Buffer.Lines) - 1
 			e.Cursor = e.Buffer.LineEnd(e.Cursor)
@@ -513,18 +537,9 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 	statusStyle := kero.NewStyle().Reverse()
 	lineNoStyle := kero.NewStyle().Foreground(kero.ColorBlue).Dim()
 	textStyle := kero.NewStyle()
-	cursorStyle := textStyle.Reverse()
-	selectStyle := kero.NewStyle().Foreground(kero.ColorBlack).Background(kero.ColorYellow)
+	cursorStyle := textStyle.Reverse().Foreground(kero.ColorRed)
+	selectStyle := textStyle.Reverse()
 	messageStyle := kero.NewStyle()
-
-	name := "[No Name]"
-	if e.Path != "" {
-		name = filepath.Base(e.Path)
-	}
-	modified := ""
-	if e.Dirty {
-		modified = " *"
-	}
 
 	editorH := editorHeight(ctx)
 	lineNoW := lineNumberWidth(len(e.Buffer.Lines))
@@ -557,11 +572,7 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 		}
 
 		// draw the line
-		style := textStyle
-		if lineIndex == e.Cursor.Row {
-			style = style.Underline()
-		}
-		f.Write(gutterW, y, visPadded, style)
+		f.Write(gutterW, y, visPadded, textStyle)
 
 		if v, ok := e.diagnosticForLine(lineIndex); ok {
 			red := kero.NewStyle().Foreground(kero.ColorRed)
@@ -629,12 +640,21 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 
 	statusY := ctx.Height - 1
 	if statusY >= 0 {
-		status := fmt.Sprintf(" %s | %d lines | Ln %d, Col %d",
-			name+modified, len(e.Buffer.Lines), e.Cursor.Row+1, cursorVisPos.Col+1)
-		if len(e.buffers) > 1 {
-			status = fmt.Sprintf(" %s (%d/%d buffers) | Ln %d, Col %d",
-				name+modified, e.active+1, len(e.buffers), e.Cursor.Row+1, cursorVisPos.Col+1)
+		var names string
+		for i, b := range e.buffers {
+			name := "untitled"
+			if b.Path != "" {
+				name = filepath.Base(b.Path)
+			}
+			if b.Dirty {
+				name += "*"
+			}
+			if i == e.active {
+				name = "[" + name + "]"
+			}
+			names += name + " "
 		}
+		status := fmt.Sprintf(" %s| Line %d, Col %d", names, e.Cursor.Row+1, cursorVisPos.Col+1)
 		if e.Selecting {
 			status = status + " | Selecting"
 		}
@@ -967,18 +987,27 @@ func (e *Editor) finishCmdPalette(ctx *kero.Context) error {
 
 	switch input[0] {
 	case '/':
+		// TODO: command picker
 		// run commands
 		parts := strings.Fields(input)
 		switch parts[0] {
-		case "/ls":
-			// list buffer
-			for i, buf := range e.buffers {
-				name := buf.Path
-				if name == "" {
-					name = "untitled"
+		/*
+			case "/ls":
+				// list buffer
+				for i, buf := range e.buffers {
+					name := buf.Path
+					if name == "" {
+						name = "untitled"
+					}
+					e.message += fmt.Sprintf("%d:%s ", i+1, name)
 				}
-				e.message += fmt.Sprintf("%d:%s ", i+1, name)
-			}
+		*/
+		case "/goback":
+			e.GoBack()
+			e.showCursorCenter(ctx)
+		case "/goforward":
+			e.GoForward()
+			e.showCursorCenter(ctx)
 		}
 		return nil
 	case ':':
@@ -1017,14 +1046,12 @@ func (e *Editor) startFind() {
 		e.findInput.Value = e.Buffer.GetRange(e.SelAnchor, e.Cursor)
 		e.findInput.Cursor = len([]rune(e.findInput.Value))
 		e.findInput.SelStart = 0
-		e.findInput.SelEnd = e.findInput.Cursor
 		return
 	}
 	// if no selection, pre-fill with last query
 	if e.findInput.Value != "" {
 		e.findInput.Cursor = len([]rune(e.findInput.Value))
 		e.findInput.SelStart = 0
-		e.findInput.SelEnd = e.findInput.Cursor
 	}
 }
 
@@ -1041,6 +1068,7 @@ func (e *Editor) updateFind(ev kero.KeyEvent) error {
 	if ev.String() == "ctrl+r" {
 		e.replacing = !e.replacing
 		if e.replacing {
+			e.replaceInput.Value = ""
 			e.replaceInput.Placeholder = "replacement"
 		}
 		return nil
@@ -1128,7 +1156,7 @@ func (e *Editor) updateFind(ev kero.KeyEvent) error {
 func (e *Editor) drawFind(f *kero.Frame, y int, width int) {
 	normal := kero.NewStyle()
 	prompt := " Find: "
-	f.Write(0, y, trimToWidth(prompt, width), normal.Foreground(kero.ColorYellow))
+	f.Write(0, y, trimToWidth(prompt, width), normal)
 	inputX := len([]rune(prompt))
 	if inputX >= width {
 		return
@@ -1565,14 +1593,13 @@ func (e *Editor) OpenSymbolPicker() {
 type TextInput struct {
 	Value       string
 	Cursor      int
-	SelStart    int // selection start
-	SelEnd      int
+	SelStart    int    // selection range [SelStart, Cursor)
 	Placeholder string // displayed when Value is empty
 }
 
 func (t *TextInput) adjustSelect() (int, int) {
 	runes := []rune(t.Value)
-	start, end := t.SelStart, t.SelEnd
+	start, end := t.SelStart, t.Cursor
 	if start > end {
 		start, end = end, start
 	}
@@ -1593,7 +1620,6 @@ func (t *TextInput) adjustSelect() (int, int) {
 
 func (t *TextInput) clearSelect() {
 	t.SelStart = t.Cursor
-	t.SelEnd = t.Cursor
 }
 
 // Update applies keyboard input to the text input.
@@ -1620,8 +1646,7 @@ func (t *TextInput) Update(ev kero.Event) {
 		if start != end {
 			runes = append(runes[:start], runes[end:]...)
 			t.Cursor = start
-			t.SelStart = start
-			t.SelEnd = start
+			t.clearSelect()
 		}
 
 		runes = append(runes, 0)
@@ -1671,8 +1696,8 @@ func (t *TextInput) Update(ev kero.Event) {
 
 // Draw renders the text input and its cursor.
 func (t TextInput) Draw(f *kero.Frame, r kero.Rect, s kero.Style) {
-	selectStyle := s.Foreground(kero.ColorBlack).Background(kero.ColorYellow)
-	cursorStyle := s.Reverse()
+	selectStyle := s.Reverse()
+	cursorStyle := s.Reverse().Foreground(kero.ColorRed)
 	runes := []rune(t.Value)
 
 	if t.Cursor < 0 {
