@@ -41,6 +41,7 @@ Command keys are supported in Kitty terminal:
 - Cmd+Left move cursor to line start
 - Cmd+Right move cursor to line end
 - Cmd+Backspace delete to line start
+- Cmd+Shift+Backspace delete whole line
 
 Mouse motions:
 - mouse_left_press move cursor

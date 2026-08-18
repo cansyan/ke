@@ -204,6 +204,7 @@ func (e *Editor) handleMouse(ctx *kero.Context, m kero.MouseEvent) error {
 			}
 			// ctrl+mouse_left_release goto definition
 			if m.Mod == kero.ModCtrl {
+				e.recordJump()
 				e.GotoDefinition()
 				e.showCursorCenter(ctx)
 			}
@@ -280,6 +281,7 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 		case "ctrl+r":
 			e.OpenSymbolPicker()
 		case "ctrl+g":
+			e.recordJump()
 			e.GotoDefinition()
 			centerCursor = true
 			return nil
@@ -535,7 +537,11 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 			continue
 		}
 
-		f.Write(1, y, fmt.Sprintf("%*d ", lineNoW, lineIndex+1), lineNoStyle)
+		lnStyle := lineNoStyle
+		if lineIndex == e.Cursor.Row {
+			lnStyle = kero.NewStyle().Foreground(kero.ColorBlue)
+		}
+		f.Write(1, y, fmt.Sprintf("%*d ", lineNoW, lineIndex+1), lnStyle)
 
 		srcLine := e.Buffer.Line(lineIndex)
 		fullPadded := padTab(srcLine, 4)
