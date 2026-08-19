@@ -26,6 +26,13 @@ import (
 	"github.com/cansyan/kero"
 )
 
+var pairMatch = map[rune]rune{
+	'(': ')',
+	'[': ']',
+	'{': '}',
+	'"': '"',
+}
+
 // parsePathArg parses an argument of the form "path", "path:row", or
 // "path:row:col". row and col are 1-based and converted to 0-based.
 func parsePathArg(arg string) (path string, row, col int) {
@@ -357,6 +364,10 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 			break
 		}
 		e.insertRune(key.Rune)
+		if closing, ok := pairMatch[key.Rune]; ok && !e.pasting {
+			e.insertRune(closing)
+			e.Cursor = e.Buffer.PrevPos(e.Cursor)
+		}
 	case kero.KeyEnter:
 		if e.hasSelect() {
 			e.deleteSelect()
@@ -367,6 +378,7 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 			return nil
 		}
 
+		// compute indentation
 		autoIndent := func(line []rune, col int) string {
 			if len(line) == 0 || col == 0 {
 				return ""
@@ -381,12 +393,12 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 			}
 			indent := string(line[:n])
 			// indent on block start
-			if line[col-1] == '{' {
+			if col == len(line) && line[col-1] == '{' {
 				indent += "\t"
 			}
 			return indent
 		}
-
+		// newline retain the previous line's indentation
 		switch key.String() {
 		case "ctrl+enter":
 			// insert newline below
