@@ -2731,7 +2731,7 @@ func FindSymbolLoc(src any, exactName string) (SymbolLocation, bool) {
 }
 
 // ExtractAllSymbols collects all top-level symbols in the file.
-// Useful for fuzzy finding or symbol pickers (e.g. Ctrl+P / Cmd+Shift+O).
+// Useful for fuzzy finding or symbol pickers.
 func ExtractAllSymbols(src any) []SymbolLocation {
 	fset := token.NewFileSet()
 	file, err := parser.ParseFile(fset, "buffer.go", src, 0)
@@ -2746,11 +2746,19 @@ func ExtractAllSymbols(src any) []SymbolLocation {
 		case *ast.FuncDecl:
 			pos := fset.Position(d.Name.Pos())
 			kind := "func"
-			if d.Recv != nil {
+			name := d.Name.Name
+
+			// Extract receiver type if this function is a method
+			if d.Recv != nil && len(d.Recv.List) > 0 {
 				kind = "method"
+				recvType := formatReceiver(d.Recv.List[0].Type)
+				if recvType != "" {
+					name = fmt.Sprintf("(%s).%s", recvType, d.Name.Name)
+				}
 			}
+
 			results = append(results, SymbolLocation{
-				Name:   d.Name.Name,
+				Name:   name,
 				Kind:   kind,
 				Line:   pos.Line,
 				Column: pos.Column,
@@ -2796,17 +2804,44 @@ func ExtractAllSymbols(src any) []SymbolLocation {
 	return results
 }
 
+// formatReceiver recursively extracts the receiver string representation
+// handling pointer receivers (*Buffer) and value receivers (Buffer).
+func formatReceiver(expr ast.Expr) string {
+	switch t := expr.(type) {
+	case *ast.Ident:
+		return t.Name
+	case *ast.StarExpr:
+		return "*" + formatReceiver(t.X)
+	case *ast.IndexExpr: // Generic receiver: Buffer[T]
+		return fmt.Sprintf("%s[%s]", formatReceiver(t.X), formatReceiver(t.Index))
+	default:
+		return ""
+	}
+}
+
 // FilterSymbols returns top-level symbols whose names contain query (case-insensitive).
+// Query can be "save", "buffer.save" and "buffer save".
 func FilterSymbols(src []SymbolLocation, query string) []SymbolLocation {
 	if query == "" {
 		return src
 	}
 
 	queryLower := strings.ToLower(query)
-	var matches []SymbolLocation
+	parts := strings.Split(queryLower, ".")
+	if len(parts) == 1 {
+		parts = strings.Split(queryLower, " ")
+	}
 
+	var matches []SymbolLocation
 	for _, sym := range src {
-		if strings.Contains(strings.ToLower(sym.Name), queryLower) {
+		match := true
+		for _, q := range parts {
+			if !strings.Contains(strings.ToLower(sym.Name), q) {
+				match = false
+				break
+			}
+		}
+		if match {
 			matches = append(matches, sym)
 		}
 	}

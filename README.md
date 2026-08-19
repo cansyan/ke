@@ -50,6 +50,7 @@ Mouse motions:
 - ctrl+mouse_left_release goto definition
 
 Design Choices:
+- useing key ctrl+[, ctrl+d, ctrl+c is ok with Kitty protocol enabled
 - future key chords, Ctrl+K or Ctrl+X as leader key are good, but both taken. 
 - did consider Ctrl+Shift+P for command palette, but the key combo seems unreliable in practice
 - early version should keep things tiny, avoid duplicate selection, mutilple cursor, undo/redo
