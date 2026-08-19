@@ -38,7 +38,7 @@ Key bindings:
 
 Command keys are supported in Kitty terminal:
 - Cmd+Up move cursor to file start
-- Cmd+Down move cursor to find end
+- Cmd+Down move cursor to file end
 - Cmd+Left move cursor to line start
 - Cmd+Right move cursor to line end
 - Cmd+Backspace delete to line start

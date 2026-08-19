@@ -2,9 +2,11 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"errors"
 	"fmt"
 	"go/ast"
+	"go/format"
 	"go/importer"
 	"go/parser"
 	"go/scanner"
@@ -196,6 +198,9 @@ func (e *Editor) handleMouse(ctx *kero.Context, m kero.MouseEvent) error {
 			e.Cursor = e.cursorFromMouse(m)
 			if e.hasSelect() {
 				e.clearSelect()
+			}
+			if e.symbolPicker.Active {
+				e.symbolPicker.Active = false
 			}
 		case kero.MouseRelease:
 			if m.Y >= editorHeight(ctx) {
@@ -879,9 +884,16 @@ func padTab(s []rune, tabSize int) string {
 }
 
 func (e *Editor) save() error {
+	if e.Buffer == nil {
+		return nil
+	}
 	if e.Path == "" {
 		e.startSaveAs()
 		return nil
+	}
+
+	if _, err := e.Buffer.Format(); err != nil {
+		return err
 	}
 
 	if err := e.Buffer.Save(); err != nil {
@@ -987,28 +999,7 @@ func (e *Editor) finishCmdPalette(ctx *kero.Context) error {
 
 	switch input[0] {
 	case '/':
-		// TODO: command picker
 		// run commands
-		parts := strings.Fields(input)
-		switch parts[0] {
-		/*
-			case "/ls":
-				// list buffer
-				for i, buf := range e.buffers {
-					name := buf.Path
-					if name == "" {
-						name = "untitled"
-					}
-					e.message += fmt.Sprintf("%d:%s ", i+1, name)
-				}
-		*/
-		case "/goback":
-			e.GoBack()
-			e.showCursorCenter(ctx)
-		case "/goforward":
-			e.GoForward()
-			e.showCursorCenter(ctx)
-		}
 		return nil
 	case ':':
 		// goto line, for example :123
@@ -1045,13 +1036,13 @@ func (e *Editor) startFind() {
 	if e.hasSelect() {
 		e.findInput.Value = e.Buffer.GetRange(e.SelAnchor, e.Cursor)
 		e.findInput.Cursor = len([]rune(e.findInput.Value))
-		e.findInput.SelStart = 0
+		e.findInput.SelAnchor = 0
 		return
 	}
 	// if no selection, pre-fill with last query
 	if e.findInput.Value != "" {
 		e.findInput.Cursor = len([]rune(e.findInput.Value))
-		e.findInput.SelStart = 0
+		e.findInput.SelAnchor = 0
 	}
 }
 
@@ -1593,13 +1584,13 @@ func (e *Editor) OpenSymbolPicker() {
 type TextInput struct {
 	Value       string
 	Cursor      int
-	SelStart    int    // selection range [SelStart, Cursor)
+	SelAnchor   int    // selection range [SelStart, Cursor)
 	Placeholder string // displayed when Value is empty
 }
 
 func (t *TextInput) adjustSelect() (int, int) {
 	runes := []rune(t.Value)
-	start, end := t.SelStart, t.Cursor
+	start, end := t.SelAnchor, t.Cursor
 	if start > end {
 		start, end = end, start
 	}
@@ -1619,7 +1610,7 @@ func (t *TextInput) adjustSelect() (int, int) {
 }
 
 func (t *TextInput) clearSelect() {
-	t.SelStart = t.Cursor
+	t.SelAnchor = t.Cursor
 }
 
 // Update applies keyboard input to the text input.
@@ -2422,6 +2413,56 @@ func (b *Buffer) PosFromVisual(p Position) Position {
 		col += advance
 	}
 	return Position{Row: p.Row, Col: len(line)}
+}
+
+// Format runs go/format on the buffer's content if it is a Go source file.
+// It returns true if the buffer was modified, and an error if formatting fails.
+func (b *Buffer) Format() (bool, error) {
+	// Only format Go files
+	if filepath.Ext(b.Path) != ".go" {
+		return false, nil
+	}
+
+	// 1. Join [][]rune lines into a single byte slice for go/format
+	var buf bytes.Buffer
+	for i, line := range b.Lines {
+		buf.WriteString(string(line))
+		if i < len(b.Lines)-1 {
+			buf.WriteByte('\n')
+		}
+	}
+
+	// 2. Format the source code using go/format
+	formatted, err := format.Source(buf.Bytes())
+	if err != nil {
+		return false, err // Returns syntax/parser errors from the Go compiler
+	}
+
+	// 3. Convert formatted bytes back to [][]rune
+	formattedStr := string(formatted)
+	// Handle trailing newline splitting gracefully
+	rawLines := strings.Split(strings.TrimSuffix(formattedStr, "\n"), "\n")
+
+	newLines := make([][]rune, len(rawLines))
+	for i, l := range rawLines {
+		newLines[i] = []rune(l)
+	}
+
+	// 4. Update lines and preserve cursor sanity
+	b.Lines = newLines
+	b.Dirty = true
+
+	// Clamp cursor to valid row/col bounds after formatting changes line lengths
+	if b.Cursor.Row >= len(b.Lines) {
+		b.Cursor.Row = max(0, len(b.Lines)-1)
+	}
+	if len(b.Lines) > 0 {
+		b.Cursor.Col = min(b.Cursor.Col, len(b.Lines[b.Cursor.Row]))
+	} else {
+		b.Cursor.Col = 0
+	}
+
+	return true, nil
 }
 
 type Diagnostic struct {

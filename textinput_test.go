@@ -36,7 +36,7 @@ func TestTextInputDrawCursorAtEnd(t *testing.T) {
 }
 
 func TestTextInputInsertRuneDeletesSelection(t *testing.T) {
-	input := TextInput{Value: "abcd", Cursor: 3, SelStart: 1, SelEnd: 3}
+	input := TextInput{Value: "abcd", Cursor: 3, SelAnchor: 1}
 
 	input.Update(kero.KeyEvent{Key: kero.KeyRune, Rune: 'X'})
 
@@ -46,7 +46,7 @@ func TestTextInputInsertRuneDeletesSelection(t *testing.T) {
 	if input.Cursor != 2 {
 		t.Fatalf("Cursor = %d, want 2", input.Cursor)
 	}
-	if input.SelStart != 2 || input.SelEnd != 2 {
-		t.Fatalf("selection = (%d, %d), want (2, 2)", input.SelStart, input.SelEnd)
+	if input.SelAnchor != 2 || input.Cursor != 2 {
+		t.Fatalf("selection = (%d, %d), want nil", input.SelAnchor, input.Cursor)
 	}
 }
