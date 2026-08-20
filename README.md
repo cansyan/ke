@@ -20,18 +20,21 @@ Key bindings:
 	- `@symbol` goto symbol
 	- `:123` goto line 123
 	- `/format` format file
+	- `/goto definition`
+	- `/goto diagnostic`
+	- `/jump back`
+	- `/jump forward`
 - Ctrl+Backspace delete to line start
 - Ctrl+K delete to line end
 - Ctrl+Enter insert newline below
 - Shift+Enter insert newline above
 - Ctrl+A or Home move cursor to line start
 - Ctrl+E or End move cursor to line end
-- Ctrl+] goto next diagnostic
 - Ctrl+W close buffer
-- Ctrl+B Ctrl+N next buffer
-- Ctrl+B Ctrl+P previous buffer
-- Ctrl+- go back (long jumps only)
-- Ctrl+Shift+- go forward (long jumps only)
+- Ctrl+[ previous buffer
+- Ctrl+] next buffer
+- Ctrl+- jump back
+- Ctrl+Shift+- jump forward
 - Alt+Left move cursor to start of current/previous word
 - Alt+Right move cursor to end of current/next word
 - Alt+Backspace delete word backwards

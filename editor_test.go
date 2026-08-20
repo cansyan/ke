@@ -39,21 +39,17 @@ func TestCheckGoSemantics(t *testing.T) {
 func TestEnsureCursorVisible_WithTabs(t *testing.T) {
 	buf := NewBuffer("\thello world")
 	buf.Cursor = Position{Row: 0, Col: 0}
-	ed := &Editor{
-		Buffer: buf,
-	}
+	// Mock width = 10 (marker + line number + space leaves textW = 7)
+	ed := &Editor{Buffer: buf, Width: 10, Height: 10}
 
-	// Mock context with width = 10 (marker + line number + space leaves textW = 7)
-	ctx := &kero.Context{Width: 10, Height: 10}
-
-	ed.showCursorCenter(ctx)
+	ed.showCursorCenter()
 	if ed.LeftCol != 0 {
 		t.Fatalf("expected colOffset = 0, got %d", ed.LeftCol)
 	}
 
 	// Move cursor to 'w' in "world" (rune index 7: '\t', h, e, l, l, o, ' ') -> display column 4 + 6 = 10
 	ed.Cursor.Col = 7
-	ed.showCursorCenter(ctx)
+	ed.showCursorCenter()
 	// textW = 10 - 1 - 2 = 7. cursorDisplay = 10.
 	// 10 >= colOffset + 7 => colOffset = 10 - 7 + 1 = 4.
 	if ed.LeftCol != 4 {
@@ -62,7 +58,7 @@ func TestEnsureCursorVisible_WithTabs(t *testing.T) {
 
 	// Move cursor back to index 0 ('\t', display column 0)
 	ed.Cursor.Col = 0
-	ed.showCursorCenter(ctx)
+	ed.showCursorCenter()
 	if ed.LeftCol != 0 {
 		t.Fatalf("expected colOffset = 0 when returning to start, got %d", ed.LeftCol)
 	}

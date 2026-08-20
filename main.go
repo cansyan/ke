@@ -95,6 +95,8 @@ type Editor struct {
 	*Buffer // alias to the buffers[active], make refactor easier
 	buffers []*Buffer
 	active  int // index of currently active buffer
+	Width   int
+	Height  int
 
 	message string
 
@@ -139,7 +141,8 @@ type diagResult struct {
 }
 
 func (e *Editor) Init(ctx *kero.Context) error {
-	e.showCursor(ctx)
+	e.Width, e.Height = ctx.Width, ctx.Height
+	e.showCursor()
 	return nil
 }
 
@@ -160,12 +163,14 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 	switch ev := ev.(type) {
 	case kero.TickEvent:
 		return nil
+	case kero.ResizeEvent:
+		e.Width, e.Height = ev.Width, ev.Height
 	case kero.PasteStartEvent:
 		e.pasting = true
 	case kero.PasteEndEvent:
 		e.pasting = false
 	case kero.MouseEvent:
-		e.handleMouse(ctx, ev)
+		e.handleMouse(ev)
 	case kero.KeyEvent:
 		e.handleKey(ctx, ev)
 	}
@@ -184,16 +189,16 @@ func (e *Editor) cursorFromMouse(m kero.MouseEvent) Position {
 	return e.PosFromVisual(Position{Row: row, Col: displayCol})
 }
 
-func (e *Editor) handleMouse(ctx *kero.Context, m kero.MouseEvent) error {
+func (e *Editor) handleMouse(m kero.MouseEvent) error {
 	switch m.Button {
 	case kero.MouseWheelUp:
 		e.TopRow = max(0, e.TopRow-1)
 	case kero.MouseWheelDown:
-		e.TopRow = min(e.TopRow+1, len(e.Lines)-editorHeight(ctx))
+		e.TopRow = min(e.TopRow+1, len(e.Lines)-e.bufferH())
 	case kero.MouseLeft:
 		switch m.Action {
 		case kero.MousePress:
-			if m.Y >= editorHeight(ctx) {
+			if m.Y >= e.bufferH() {
 				// out of viewport
 				return nil
 			}
@@ -202,7 +207,7 @@ func (e *Editor) handleMouse(ctx *kero.Context, m kero.MouseEvent) error {
 				e.clearSelect()
 			}
 		case kero.MouseRelease:
-			if m.Y >= editorHeight(ctx) {
+			if m.Y >= e.bufferH() {
 				// out of viewport
 				return nil
 			}
@@ -210,7 +215,7 @@ func (e *Editor) handleMouse(ctx *kero.Context, m kero.MouseEvent) error {
 			if m.Mod == kero.ModCtrl {
 				e.recordJump()
 				e.GotoDefinition()
-				e.showCursorCenter(ctx)
+				e.showCursorCenter()
 			}
 		case kero.MouseDrag:
 			if last, ok := e.lastEvent.(kero.MouseEvent); ok &&
@@ -221,7 +226,7 @@ func (e *Editor) handleMouse(ctx *kero.Context, m kero.MouseEvent) error {
 			}
 			// later drag expands selection
 			e.Cursor = e.cursorFromMouse(m)
-			e.showCursor(ctx)
+			e.showCursor()
 		}
 	}
 	return nil
@@ -243,20 +248,20 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 		return e.updateSaveAs(key)
 	}
 	if e.finding {
-		defer e.showCursor(ctx)
+		defer e.showCursor()
 		return e.updateFind(key)
 	}
 	if e.palette.Active {
-		e.updatePalette(ctx, key)
+		e.updatePalette(key)
 		return nil
 	}
 
 	var centerCursor bool
 	defer func() {
 		if centerCursor {
-			e.showCursorCenter(ctx)
+			e.showCursorCenter()
 		} else {
-			e.showCursor(ctx)
+			e.showCursor()
 		}
 	}()
 
@@ -264,11 +269,11 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 	case kero.KeyRune:
 		switch key.String() {
 		case "ctrl+-":
-			e.GoBack()
-			e.showCursorCenter(ctx)
+			e.JumpBack()
+			centerCursor = true
 		case "ctrl+shift+-":
-			e.GoForward()
-			e.showCursorCenter(ctx)
+			e.JumpForward()
+			centerCursor = true
 		case "ctrl+w":
 			if e.Dirty && !(e.LastEvent() == "ctrl+w") {
 				e.message = "warn: unsaved changes, press ctrl+s to save or ctrl+w again to close"
@@ -516,10 +521,10 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 	case kero.KeyEnd:
 		e.Cursor = e.Buffer.LineEnd(e.Cursor)
 	case kero.KeyPgUp:
-		e.Cursor.Row -= editorHeight(ctx)
+		e.Cursor.Row -= e.bufferH()
 		e.Cursor = e.Buffer.ClampPos(e.Cursor)
 	case kero.KeyPgDown:
-		e.Cursor.Row += editorHeight(ctx)
+		e.Cursor.Row += e.bufferH()
 		e.Cursor = e.Buffer.ClampPos(e.Cursor)
 	case kero.KeyEsc:
 		e.clearSelect()
@@ -535,13 +540,13 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 	selectStyle := textStyle.Reverse()
 	messageStyle := kero.NewStyle()
 
-	editorH := editorHeight(ctx)
-	lineNoW := lineNumberWidth(len(e.Buffer.Lines))
+	bufferH := e.bufferH()
+	lineNoW := lineNumberW(len(e.Lines))
 	gutterW := lineNoW + 2 // marker, line number, and separator
 	e.gutterW = gutterW
-	for y := range editorH {
+	for y := range bufferH {
 		lineIndex := e.TopRow + y
-		if lineIndex >= len(e.Buffer.Lines) {
+		if lineIndex >= len(e.Lines) {
 			f.Write(0, y, "~", lineNoStyle)
 			continue
 		}
@@ -623,7 +628,7 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 	cursorVisPos := e.VisualPos(e.Cursor)
 	cursorX := gutterW + cursorVisPos.Col - e.LeftCol
 	cursorY := 0 + e.Cursor.Row - e.TopRow
-	if cursorY >= 0 && cursorY < editorH && cursorX >= gutterW && cursorX < ctx.Width {
+	if cursorY >= 0 && cursorY < bufferH && cursorX >= gutterW && cursorX < ctx.Width {
 		fullLinePadded := padTab(e.Line(e.Cursor.Row), 4)
 		ch := ' '
 		if cursorVisPos.Col < len(fullLinePadded) {
@@ -1274,14 +1279,14 @@ func isGoFile(path string) bool {
 
 // showCursor adjusts TopRow and LeftCol to ensure the cursor is within
 // the visible viewport.
-func (e *Editor) showCursor(ctx *kero.Context) {
-	editorH := editorHeight(ctx)
-	if editorH <= 0 {
+func (e *Editor) showCursor() {
+	bufH := e.bufferH()
+	if bufH <= 0 {
 		return
 	}
 
 	// 1. Vertical Scrolling (Row)
-	maxTopRow := e.Cursor.Row - (editorH - 1)
+	maxTopRow := e.Cursor.Row - (bufH - 1)
 	if e.TopRow < maxTopRow {
 		e.TopRow = maxTopRow
 	}
@@ -1297,7 +1302,7 @@ func (e *Editor) showCursor(ctx *kero.Context) {
 		e.TopRow = 0
 	}
 	// 2. Horizontal Scrolling (Column)
-	textW := ctx.Width - lineNumberWidth(len(e.Buffer.Lines)) - 2
+	textW := e.Width - lineNumberW(len(e.Lines)) - 2
 	textW = max(1, textW)
 
 	visualCursor := e.VisualPos(e.Cursor)
@@ -1314,18 +1319,17 @@ func (e *Editor) showCursor(ctx *kero.Context) {
 
 // showCursor adjusts TopRow and LeftCol to ensure the cursor is at
 // the center of visible viewport.
-// TODO: move it to Buffer, drop ctx
-func (e *Editor) showCursorCenter(ctx *kero.Context) {
-	editorH := editorHeight(ctx)
-	if editorH <= 0 {
+func (e *Editor) showCursorCenter() {
+	bufH := e.bufferH()
+	if bufH <= 0 {
 		return
 	}
 
-	margin := editorH / 2
+	margin := bufH / 2
 
 	// 1. Vertical Scrolling (Row)
 	// Ensure cursor is above the bottom margin
-	maxTopRow := e.Cursor.Row - (editorH - 1 - margin)
+	maxTopRow := e.Cursor.Row - (bufH - 1 - margin)
 	if e.TopRow < maxTopRow {
 		e.TopRow = maxTopRow
 	}
@@ -1342,7 +1346,7 @@ func (e *Editor) showCursorCenter(ctx *kero.Context) {
 	}
 
 	// 2. Horizontal Scrolling (Column)
-	textW := ctx.Width - lineNumberWidth(len(e.Buffer.Lines)) - 2
+	textW := e.Width - lineNumberW(len(e.Lines)) - 2
 	textW = max(1, textW)
 
 	visCursor := e.VisualPos(e.Cursor)
@@ -1358,15 +1362,17 @@ func (e *Editor) showCursorCenter(ctx *kero.Context) {
 	}
 }
 
-func editorHeight(ctx *kero.Context) int {
-	h := ctx.Height - 2
+// buffer height = app height - 2
+func (e *Editor) bufferH() int {
+	h := e.Height - 2
 	if h < 0 {
 		return 0
 	}
 	return h
 }
 
-func lineNumberWidth(lines int) int {
+// return the width of line number
+func lineNumberW(lines int) int {
 	width := 1
 	for lines >= 10 {
 		width++
@@ -2903,8 +2909,8 @@ func (e *Editor) jumpTo(target Jump) {
 	}
 }
 
-// GoBack moves to the previous position in jump history.
-func (e *Editor) GoBack() {
+// JumpBack moves to the previous position in jump history.
+func (e *Editor) JumpBack() {
 	if e.Buffer == nil {
 		return
 	}
@@ -2913,8 +2919,8 @@ func (e *Editor) GoBack() {
 	}
 }
 
-// GoForward moves to the next position in jump history.
-func (e *Editor) GoForward() {
+// JumpForward moves to the next position in jump history.
+func (e *Editor) JumpForward() {
 	if e.Buffer == nil {
 		return
 	}
@@ -2948,7 +2954,7 @@ func (p *Palette) Open(ctx *kero.Context, e *Editor, prefix string) {
 	p.Input.Placeholder = "search file (@symbol, /command or :line)"
 	p.Selected = 0
 	p.MaxRows = 10
-	p.Refresh(ctx, e)
+	p.Refresh(e)
 }
 
 func (p *Palette) Close() {
@@ -2959,16 +2965,16 @@ func (p *Palette) Close() {
 }
 
 // Refresh updates p.Items based on the current input value.
-func (p *Palette) Refresh(ctx *kero.Context, e *Editor) {
+func (p *Palette) Refresh(e *Editor) {
 	input := p.Input.String()
 
 	switch {
 	case strings.HasPrefix(input, "@"):
-		p.Items = p.symbolItems(ctx, e, strings.TrimPrefix(input, "@"))
+		p.Items = p.symbolItems(e, strings.TrimPrefix(input, "@"))
 	case strings.HasPrefix(input, ":"):
 		p.Items = p.lineItems(e, strings.TrimPrefix(input, ":"))
 	case strings.HasPrefix(input, "/"):
-		p.Items = p.commandItems(ctx, e, strings.TrimPrefix(input, "/"))
+		p.Items = p.commandItems(e, strings.TrimPrefix(input, "/"))
 	default:
 		p.Items = p.fileItems(e, input)
 	}
@@ -2980,7 +2986,7 @@ func (p *Palette) Refresh(ctx *kero.Context, e *Editor) {
 }
 
 // Symbol Provider (@)
-func (p *Palette) symbolItems(ctx *kero.Context, e *Editor, query string) []PaletteItem {
+func (p *Palette) symbolItems(e *Editor, query string) []PaletteItem {
 	if e.Buffer == nil {
 		return nil
 	}
@@ -3017,7 +3023,7 @@ func (p *Palette) symbolItems(ctx *kero.Context, e *Editor, query string) []Pale
 			Action: func(ed *Editor) {
 				ed.recordJump()
 				ed.Cursor = symPos
-				e.showCursorCenter(ctx)
+				e.showCursorCenter()
 			},
 		})
 	}
@@ -3025,25 +3031,38 @@ func (p *Palette) symbolItems(ctx *kero.Context, e *Editor, query string) []Pale
 }
 
 // Command Provider (/)
-func (p *Palette) commandItems(ctx *kero.Context, _ *Editor, query string) []PaletteItem {
+func (p *Palette) commandItems(_ *Editor, query string) []PaletteItem {
 	commands := []struct {
 		cmd    string
 		detail string
 		action func(e *Editor)
 	}{
 		// use readable name for cmd, easy to search
-		{"format", "Format file with go/format", func(ed *Editor) { ed.Buffer.Format() }},
-		{"diagnostic", "Goto diagnostic", func(e *Editor) {
+		{"format", "", func(e *Editor) { e.Buffer.Format() }},
+		{"goto definition", "ctrl+g", func(e *Editor) {
+			e.recordJump()
+			e.GotoDefinition()
+			e.showCursorCenter()
+		}},
+		{"goto diagnostic", "", func(e *Editor) {
 			if d := e.nextDiagnostic(); d.Message != "" {
 				e.Cursor = e.Buffer.ClampPos(Position{Row: d.Row, Col: d.Col})
-				e.showCursorCenter(ctx)
+				e.showCursorCenter()
 			}
+		}},
+		{"jump back", "ctrl+-", func(e *Editor) {
+			e.JumpBack()
+			e.showCursorCenter()
+		}},
+		{"jump forward", "ctrl+shift+-", func(e *Editor) {
+			e.JumpForward()
+			e.showCursorCenter()
 		}},
 	}
 
 	var items []PaletteItem
 	for _, c := range commands {
-		if query != "" && !strings.HasPrefix(c.cmd, query) {
+		if query != "" && !strings.Contains(c.cmd, query) {
 			continue
 		}
 
@@ -3083,7 +3102,7 @@ func (p *Palette) lineItems(e *Editor, query string) []PaletteItem {
 	}
 }
 
-func (e *Editor) updatePalette(ctx *kero.Context, ev kero.KeyEvent) {
+func (e *Editor) updatePalette(ev kero.KeyEvent) {
 	switch ev.Key {
 	case kero.KeyEsc:
 		e.palette.Close()
@@ -3104,7 +3123,7 @@ func (e *Editor) updatePalette(ctx *kero.Context, ev kero.KeyEvent) {
 	default:
 		// Pass key to TextInput (typing query text)
 		e.palette.Input.Update(ev)
-		e.palette.Refresh(ctx, e)
+		e.palette.Refresh(e)
 	}
 }
 
@@ -3232,10 +3251,10 @@ func (e *Editor) drawPalette(f *kero.Frame, y, width int) {
 		lineY := rect.Y + i
 
 		// Selection cursor indicator
-		prefix := "   "
+		prefix := "  "
 		style := normal.Reverse()
 		if idx == p.Selected {
-			prefix = " > "
+			prefix = " >"
 			style = normal.Reverse().Bold()
 		}
 
