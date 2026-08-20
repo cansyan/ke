@@ -1,8 +1,9 @@
 package main
 
 import (
-	"github.com/cansyan/kero"
 	"testing"
+
+	"github.com/cansyan/kero"
 )
 
 func TestTextInputUpdate(t *testing.T) {
@@ -12,8 +13,8 @@ func TestTextInputUpdate(t *testing.T) {
 	input.Update(kero.KeyEvent{Key: kero.KeyLeft})
 	input.Update(kero.KeyEvent{Key: kero.KeyRune, Rune: 'X'})
 
-	if input.Value != "aXb" {
-		t.Fatalf("Value = %q, want aXb", input.Value)
+	if input.String() != "aXb" {
+		t.Fatalf("Value = %q, want aXb", input.String())
 	}
 	if input.Cursor != 2 {
 		t.Fatalf("Cursor = %d, want 2", input.Cursor)
@@ -21,7 +22,8 @@ func TestTextInputUpdate(t *testing.T) {
 }
 
 func TestTextInputDrawCursorAtEnd(t *testing.T) {
-	input := TextInput{Value: "hi", Cursor: 2}
+	var input TextInput
+	input.SetText("hi")
 	f := kero.NewFrame(4, 1)
 
 	input.Draw(&f, kero.Rect{X: 0, Y: 0, W: 4, H: 1}, kero.NewStyle())
@@ -35,18 +37,19 @@ func TestTextInputDrawCursorAtEnd(t *testing.T) {
 	}
 }
 
-func TestTextInputInsertRuneDeletesSelection(t *testing.T) {
-	input := TextInput{Value: "abcd", Cursor: 3, SelAnchor: 1}
+func TestTextInputSelectAll(t *testing.T) {
+	var input TextInput
+	input.SetTextAndSelectAll("abcd")
 
 	input.Update(kero.KeyEvent{Key: kero.KeyRune, Rune: 'X'})
 
-	if input.Value != "aXd" {
-		t.Fatalf("Value = %q, want aXd", input.Value)
+	if input.String() != "X" {
+		t.Fatalf("Value = %q, want X", input.String())
 	}
-	if input.Cursor != 2 {
-		t.Fatalf("Cursor = %d, want 2", input.Cursor)
+	if input.Cursor != 1 {
+		t.Fatalf("Cursor = %d, want 1", input.Cursor)
 	}
-	if input.SelAnchor != 2 || input.Cursor != 2 {
-		t.Fatalf("selection = (%d, %d), want nil", input.SelAnchor, input.Cursor)
+	if input.SelectAll != false {
+		t.Fatalf("SelectAll = %v, want false", input.SelectAll)
 	}
 }

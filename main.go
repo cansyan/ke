@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"bytes"
-	"errors"
 	"fmt"
 	"go/ast"
 	"go/format"
@@ -16,6 +15,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -111,9 +111,7 @@ type Editor struct {
 	findMatchStart Position
 	findMatchEnd   Position
 
-	// cmd mode opens a input line at the message area
-	cmdMode  bool
-	cmdInput TextInput
+	palette Palette
 
 	clipboard  string
 	clipIsLine bool
@@ -125,9 +123,6 @@ type Editor struct {
 	diagTimer   *time.Timer
 	diagChan    chan diagResult
 	diagVersion atomic.Uint64
-
-	symbolPicker SymbolPicker
-	symbolInput  TextInput
 
 	// reports whether the key comes from a paste action,
 	// to distinguish the manual KeyEnter or a pasted \n
@@ -206,9 +201,6 @@ func (e *Editor) handleMouse(ctx *kero.Context, m kero.MouseEvent) error {
 			if e.hasSelect() {
 				e.clearSelect()
 			}
-			if e.symbolPicker.Active {
-				e.symbolPicker.Active = false
-			}
 		case kero.MouseRelease:
 			if m.Y >= editorHeight(ctx) {
 				// out of viewport
@@ -254,11 +246,8 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 		defer e.showCursor(ctx)
 		return e.updateFind(key)
 	}
-	if e.cmdMode {
-		return e.updateCmdPalette(ctx, key)
-	}
-	if e.symbolPicker.Active {
-		e.updateSymbolPicker(ctx, key)
+	if e.palette.Active {
+		e.updatePalette(ctx, key)
 		return nil
 	}
 
@@ -291,7 +280,7 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 			}
 			e.CloseBuffer()
 		case "ctrl+r":
-			e.OpenSymbolPicker()
+			e.palette.Open(ctx, e, "@")
 		case "ctrl+g":
 			e.recordJump()
 			e.GotoDefinition()
@@ -310,7 +299,7 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 				e.PrevBuffer()
 				return nil
 			}
-			e.startCmdPalette("")
+			e.palette.Open(ctx, e, "")
 			return nil
 		case "ctrl+]":
 			if v := e.nextDiagnostic(); v.Message != "" {
@@ -657,21 +646,25 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 
 	statusY := ctx.Height - 1
 	if statusY >= 0 {
-		var names string
+		var names strings.Builder
 		for i, b := range e.buffers {
+			if i == e.active && len(e.buffers) > 1 {
+				names.WriteString("[")
+			}
 			name := "untitled"
 			if b.Path != "" {
 				name = filepath.Base(b.Path)
 			}
+			names.WriteString(name)
 			if b.Dirty {
-				name += "*"
+				names.WriteString("*")
 			}
-			if i == e.active {
-				name = "[" + name + "]"
+			if i == e.active && len(e.buffers) > 1 {
+				names.WriteString("]")
 			}
-			names += name + " "
+			names.WriteString(" ")
 		}
-		status := fmt.Sprintf(" %s| Line %d, Col %d", names, e.Cursor.Row+1, cursorVisPos.Col+1)
+		status := fmt.Sprintf(" %s| Line %d, Col %d", names.String(), e.Cursor.Row+1, cursorVisPos.Col+1)
 		if e.Selecting {
 			status = status + " | Selecting"
 		}
@@ -694,10 +687,6 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 
 	messageY := ctx.Height - 2
 	if messageY >= 0 {
-		if e.cmdMode {
-			e.drawCmdPalette(f, messageY, ctx.Width)
-			return
-		}
 		if e.saveAs {
 			e.drawSaveAs(f, messageY, ctx.Width)
 			return
@@ -706,8 +695,8 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 			e.drawFind(f, messageY, ctx.Width)
 			return
 		}
-		if e.symbolPicker.Active {
-			e.drawSymbolPicker(f, messageY, ctx.Width)
+		if e.palette.Active {
+			e.drawPalette(f, messageY, ctx.Width)
 			return
 		}
 		if e.message == "" {
@@ -919,8 +908,7 @@ func (e *Editor) save() error {
 
 func (e *Editor) startSaveAs() {
 	e.saveAs = true
-	e.saveInput.Value = e.Path
-	e.saveInput.Cursor = len([]rune(e.saveInput.Value))
+	e.saveInput.SetText(e.Path)
 	e.message = "enter a filename"
 }
 
@@ -939,7 +927,7 @@ func (e *Editor) updateSaveAs(key kero.KeyEvent) error {
 }
 
 func (e *Editor) finishSaveAs() error {
-	path := strings.TrimSpace(e.saveInput.Value)
+	path := strings.TrimSpace(e.saveInput.String())
 	if path == "" {
 		e.message = "filename required"
 		return nil
@@ -967,94 +955,16 @@ func (e *Editor) drawSaveAs(f *kero.Frame, y int, width int) {
 	e.saveInput.Draw(f, kero.Rect{X: inputX, Y: y, W: width - inputX, H: 1}, style)
 }
 
-// startCmdPalette opens the command palette.
-func (e *Editor) startCmdPalette(prefix string) {
-	e.cmdMode = true
-	e.cmdInput = TextInput{Placeholder: "file name, /command or :line"}
-	e.cmdInput.Value = prefix
-	e.cmdInput.Cursor = len([]rune(prefix))
-	e.message = ""
-}
-
-func (e *Editor) updateCmdPalette(ctx *kero.Context, key kero.KeyEvent) error {
-	switch key.Key {
-	case kero.KeyEnter:
-		err := e.finishCmdPalette(ctx)
-		if err != nil {
-			e.message = "warn: " + err.Error()
-		}
-	case kero.KeyEsc:
-		e.cmdMode = false
-	default:
-		e.cmdInput.Update(key)
-	}
-	return nil
-}
-
-func (e *Editor) drawCmdPalette(f *kero.Frame, y int, width int) {
-	style := kero.NewStyle()
-	prompt := " Command "
-	f.Write(0, y, trimToWidth(prompt, width), style)
-	inputX := len([]rune(prompt))
-	if inputX >= width {
-		return
-	}
-	e.cmdInput.Draw(f, kero.Rect{X: inputX, Y: y, W: width - inputX, H: 1}, style)
-}
-
-func (e *Editor) finishCmdPalette(ctx *kero.Context) error {
-	input := strings.TrimSpace(e.cmdInput.Value)
-	e.cmdMode = false
-	if input == "" {
-		return nil
-	}
-
-	switch input[0] {
-	case '/':
-		// run commands
-		return nil
-	case ':':
-		// goto line, for example :123
-		if len(input) < 2 {
-			return nil
-		}
-		lineStr := strings.TrimSpace(input[1:])
-		lineNum, err := strconv.Atoi(lineStr)
-		if err != nil {
-			return errors.New("invalid line number: " + lineStr)
-		}
-		if lineNum < 1 || lineNum > len(e.Buffer.Lines) {
-			return errors.New("line number out of range")
-		}
-		e.recordJump() // Save location before jumping
-		e.Cursor.Row = lineNum - 1
-		e.Cursor.Col = 0
-		e.showCursorCenter(ctx)
-		if e.hasSelect() {
-			e.clearSelect()
-		}
-		return nil
-	default:
-		// TODO: show file picker
-		// open file by default
-		parts := strings.Fields(input)
-		return e.OpenFile(parts[0])
-	}
-}
-
+// startFind starts a Find prompt, and pre-fill with selection or last query, if any.
 func (e *Editor) startFind() {
 	e.finding = true
 	e.replacing = false
 	if e.hasSelect() {
-		e.findInput.Value = e.Buffer.GetRange(e.SelAnchor, e.Cursor)
-		e.findInput.Cursor = len([]rune(e.findInput.Value))
-		e.findInput.SelAnchor = 0
+		e.findInput.SetTextAndSelectAll(e.Buffer.GetRange(e.SelAnchor, e.Cursor))
 		return
 	}
-	// if no selection, pre-fill with last query
-	if e.findInput.Value != "" {
-		e.findInput.Cursor = len([]rune(e.findInput.Value))
-		e.findInput.SelAnchor = 0
+	if e.findInput.String() != "" {
+		e.findInput.SetTextAndSelectAll(e.findInput.String())
 	}
 }
 
@@ -1071,7 +981,7 @@ func (e *Editor) updateFind(ev kero.KeyEvent) error {
 	if ev.String() == "ctrl+r" {
 		e.replacing = !e.replacing
 		if e.replacing {
-			e.replaceInput.Value = ""
+			e.replaceInput.SetText("")
 			e.replaceInput.Placeholder = "replacement"
 		}
 		return nil
@@ -1100,7 +1010,7 @@ func (e *Editor) updateFind(ev kero.KeyEvent) error {
 		e.finding = false
 		return nil
 	case kero.KeyEnter:
-		query := e.findInput.Value
+		query := e.findInput.String()
 		if query == "" {
 			return nil
 		}
@@ -1169,7 +1079,7 @@ func (e *Editor) drawFind(f *kero.Frame, y int, width int) {
 		return
 	}
 	e.findInput.Draw(f, kero.Rect{X: inputX, Y: y, W: width - inputX, H: 1}, normal)
-	replaceX := inputX + len([]rune(e.findInput.Value)) + 4
+	replaceX := inputX + len([]rune(e.findInput.String())) + 4
 	if replaceX < width {
 		f.Write(replaceX-4, y, " -> ", normal.Foreground(kero.ColorYellow))
 		e.replaceInput.Draw(f, kero.Rect{X: replaceX, Y: y, W: width - replaceX, H: 1}, normal)
@@ -1177,7 +1087,7 @@ func (e *Editor) drawFind(f *kero.Frame, y int, width int) {
 }
 
 func (e *Editor) skipFindMatch() {
-	query := e.findInput.Value
+	query := e.findInput.String()
 	if query == "" {
 		return
 	}
@@ -1205,7 +1115,7 @@ func (e *Editor) skipFindMatch() {
 }
 
 func (e *Editor) replaceCurrent() error {
-	query := e.findInput.Value
+	query := e.findInput.String()
 	if query == "" {
 		return nil
 	}
@@ -1218,12 +1128,11 @@ func (e *Editor) replaceCurrent() error {
 
 	start := e.findMatchStart
 	replacedEnd := e.Buffer.DeleteRange(start, e.findMatchEnd)
-	replacedEnd = e.Buffer.Insert(replacedEnd, e.replaceInput.Value)
+	replacedEnd = e.Buffer.Insert(replacedEnd, e.replaceInput.String())
 	e.markDirty()
 	e.Cursor = replacedEnd
 	e.findMatch = false
-	// if e.replaceInput.Value == query && replacedEnd.Col < len(e.buf.Line(replacedEnd.Row)) {
-	if e.replaceInput.Value == query && replacedEnd.Col < e.Buffer.LineEnd(replacedEnd).Col {
+	if e.replaceInput.String() == query && replacedEnd.Col < e.Buffer.LineEnd(replacedEnd).Col {
 		replacedEnd.Col++
 		e.Cursor = replacedEnd
 	}
@@ -1232,16 +1141,16 @@ func (e *Editor) replaceCurrent() error {
 }
 
 func (e *Editor) replaceAll() error {
-	query := e.findInput.Value
+	query := e.findInput.String()
 	if query == "" {
 		return nil
 	}
 	ignoreCase := findQueryIgnoreCase(query)
 	var count int
 	if ignoreCase {
-		count = e.Buffer.ReplaceAllIgnoreCase(query, e.replaceInput.Value)
+		count = e.Buffer.ReplaceAllIgnoreCase(query, e.replaceInput.String())
 	} else {
-		count = e.Buffer.ReplaceAll(query, e.replaceInput.Value)
+		count = e.Buffer.ReplaceAll(query, e.replaceInput.String())
 	}
 	if count > 0 {
 		e.markDirty()
@@ -1417,6 +1326,7 @@ func (e *Editor) showCursor(ctx *kero.Context) {
 
 // showCursor adjusts TopRow and LeftCol to ensure the cursor is at
 // the center of visible viewport.
+// TODO: move it to Buffer, drop ctx
 func (e *Editor) showCursorCenter(ctx *kero.Context) {
 	editorH := editorHeight(ctx)
 	if editorH <= 0 {
@@ -1513,131 +1423,61 @@ func (e *Editor) GotoSymbol(name string) {
 	e.Cursor.Col = loc.Column - 1
 }
 
-type SymbolPicker struct {
-	Active   bool
-	All      []SymbolLocation
-	Filtered []SymbolLocation
-	Index    int
-	Offset   int // scrolling offset
-	Limit    int // max number of symbols to display
-}
-
-func (e *Editor) updateSymbolPicker(ctx *kero.Context, ev kero.KeyEvent) {
-	prevQuery := e.symbolInput.Value
-	switch ev.String() {
-	case "esc":
-		// Close overlay
-		e.symbolPicker.Active = false
-	case "enter":
-		if len(e.symbolPicker.Filtered) == 0 {
-			return
-		}
-		picked := e.symbolPicker.Filtered[e.symbolPicker.Index]
-		e.recordJump() // Save location before jumping
-		e.Cursor.Row = picked.Line - 1
-		e.Cursor.Col = picked.Column - 1
-		e.symbolPicker.Active = false
-		e.showCursorCenter(ctx)
-	case "up", "ctrl+p":
-		e.symbolPicker.Index = (e.symbolPicker.Index - 1 + len(e.symbolPicker.Filtered)) % len(e.symbolPicker.Filtered)
-	case "down", "ctrl+n":
-		e.symbolPicker.Index = (e.symbolPicker.Index + 1) % len(e.symbolPicker.Filtered)
-	default:
-		e.symbolInput.Update(ev)
-	}
-	if q := e.symbolInput.Value; q != prevQuery {
-		e.symbolPicker.Filtered = FilterSymbols(e.symbolPicker.All, q)
-		e.symbolPicker.Index = 0
-	}
-	if e.symbolPicker.Index < e.symbolPicker.Offset {
-		e.symbolPicker.Offset = e.symbolPicker.Index
-	}
-	if e.symbolPicker.Index > e.symbolPicker.Offset+e.symbolPicker.Limit-1 {
-		e.symbolPicker.Offset = e.symbolPicker.Index - (e.symbolPicker.Limit - 1)
-	}
-}
-
-// draws symbol list and TextInput
-func (e *Editor) drawSymbolPicker(f *kero.Frame, y, width int) {
-	normal := kero.NewStyle()
-	prompt := "Symbol: "
-	f.Write(0, y, prompt, normal)
-
-	p := e.symbolPicker
-	inputX := len([]rune(prompt))
-	e.symbolInput.Draw(f, kero.Rect{X: inputX, Y: y, W: width, H: 1}, normal)
-
-	// render the symbol list above the editor buffer
-	n := min(len(p.Filtered), p.Limit)
-	rect := kero.Rect{X: inputX, Y: y - n, W: width, H: n}
-	f.Fill(rect, ' ', normal.Reverse())
-	for i := range n {
-		j := i + p.Offset
-		if j == p.Index {
-			f.Write(rect.X, rect.Y+i, " > "+p.Filtered[j].Name, normal.Reverse().Bold())
-		} else {
-			f.Write(rect.X, rect.Y+i, "   "+p.Filtered[j].Name, normal.Reverse())
-		}
-	}
-}
-
-func (e *Editor) OpenSymbolPicker() {
-	symbols := ExtractAllSymbols(e.Buffer.NewReader())
-	e.symbolPicker = SymbolPicker{
-		Active:   true,
-		All:      symbols,
-		Filtered: FilterSymbols(symbols, ""),
-		Limit:    8,
-	}
-	e.symbolInput = TextInput{}
-}
-
 // TextInput is a small editable single-line text widget.
 type TextInput struct {
-	Value       string
-	Cursor      int
-	SelAnchor   int    // selection range [SelStart, Cursor)
-	Placeholder string // displayed when Value is empty
+	runes       []rune
+	Cursor      int // Rune index
+	Placeholder string
+	SelectAll   bool
 }
 
-func (t *TextInput) adjustSelect() (int, int) {
-	runes := []rune(t.Value)
-	start, end := t.SelAnchor, t.Cursor
-	if start > end {
-		start, end = end, start
-	}
-	if start < 0 {
-		start = 0
-	}
-	if end < 0 {
-		end = 0
-	}
-	if start > len(runes) {
-		start = len(runes)
-	}
-	if end > len(runes) {
-		end = len(runes)
-	}
-	return start, end
+// SetText populates the input and sets cursor to the end.
+func (t *TextInput) SetText(s string) {
+	t.runes = []rune(s)
+	t.Cursor = len(t.runes)
 }
 
-func (t *TextInput) clearSelect() {
-	t.SelAnchor = t.Cursor
+func (t *TextInput) SetTextAndSelectAll(s string) {
+	t.runes = []rune(s)
+	t.Cursor = len(t.runes)
+	t.SelectAll = true
 }
 
-// Update applies keyboard input to the text input.
+func (t *TextInput) Reset() {
+	t.runes = t.runes[:0] // Reuse underlying array memory
+	t.Cursor = 0
+	t.Placeholder = ""
+	t.SelectAll = false
+}
+
+func (t *TextInput) String() string {
+	return string(t.runes)
+}
+
+// Len returns the current rune count.
+func (t *TextInput) Len() int {
+	return len(t.runes)
+}
+
 func (t *TextInput) Update(ev kero.Event) {
 	e, ok := ev.(kero.KeyEvent)
 	if !ok {
 		return
 	}
 
-	runes := []rune(t.Value)
-	if t.Cursor < 0 {
-		t.Cursor = 0
-	}
-	if t.Cursor > len(runes) {
-		t.Cursor = len(runes)
+	// Handle SelectAll replacement on first keystroke
+	if t.SelectAll {
+		if e.Key == kero.KeyRune || e.Key == kero.KeyBackspace {
+			t.SelectAll = false
+			t.runes = t.runes[:0]
+			t.Cursor = 0
+			if e.Key == kero.KeyBackspace {
+				return
+			}
+		} else {
+			// Arrow keys or Esc just clear selection state
+			t.SelectAll = false
+		}
 	}
 
 	switch e.Key {
@@ -1645,108 +1485,90 @@ func (t *TextInput) Update(ev kero.Event) {
 		if e.Mod&kero.ModCtrl != 0 {
 			return
 		}
-		start, end := t.adjustSelect()
-		if start != end {
-			runes = append(runes[:start], runes[end:]...)
-			t.Cursor = start
-			t.clearSelect()
-		}
-
-		runes = append(runes, 0)
-		copy(runes[t.Cursor+1:], runes[t.Cursor:])
-		runes[t.Cursor] = e.Rune
+		t.runes = slices.Insert(t.runes, t.Cursor, e.Rune)
 		t.Cursor++
-		t.clearSelect()
+
 	case kero.KeyBackspace:
-		start, end := t.adjustSelect()
-		if start != end {
-			runes = append(runes[:start], runes[end:]...)
-			t.Cursor = start
-			t.clearSelect()
-			break
-		}
 		if t.Cursor > 0 {
-			runes = append(runes[:t.Cursor-1], runes[t.Cursor:]...)
+			t.runes = slices.Delete(t.runes, t.Cursor-1, t.Cursor)
 			t.Cursor--
 		}
+
 	case kero.KeyDelete:
-		start, end := t.adjustSelect()
-		if start != end {
-			runes = append(runes[:start], runes[end:]...)
-			t.Cursor = start
-			t.clearSelect()
-			break
+		if t.Cursor < len(t.runes) {
+			t.runes = slices.Delete(t.runes, t.Cursor, t.Cursor+1)
 		}
-		if t.Cursor < len(runes) {
-			runes = append(runes[:t.Cursor], runes[t.Cursor+1:]...)
-		}
+
 	case kero.KeyLeft:
 		if t.Cursor > 0 {
 			t.Cursor--
 		}
+
 	case kero.KeyRight:
-		if t.Cursor < len(runes) {
+		if t.Cursor < len(t.runes) {
 			t.Cursor++
 		}
+
 	case kero.KeyHome:
 		t.Cursor = 0
-	case kero.KeyEnd:
-		t.Cursor = len(runes)
-	}
 
-	t.Value = string(runes)
+	case kero.KeyEnd:
+		t.Cursor = len(t.runes)
+	}
 }
 
 // Draw renders the text input and its cursor.
 func (t TextInput) Draw(f *kero.Frame, r kero.Rect, s kero.Style) {
-	selectStyle := s.Reverse()
 	cursorStyle := s.Reverse().Foreground(kero.ColorRed)
-	runes := []rune(t.Value)
+
+	if t.SelectAll && len(t.runes) > 0 {
+		for i, ch := range t.runes {
+			x := r.X + i
+			if x < r.Right() {
+				f.Set(x, r.Y, ch, s.Reverse())
+			}
+		}
+		return
+	}
 
 	if t.Cursor < 0 {
 		t.Cursor = 0
 	}
-	if t.Cursor > len(runes) {
-		t.Cursor = len(runes)
+	if t.Cursor > len(t.runes) {
+		t.Cursor = len(t.runes)
 	}
 
-	start, end := t.adjustSelect()
-
-	for i, ch := range runes {
-		x := r.X + i
-		y := r.Y
-
-		if x >= r.Right() {
-			break
-		}
-
-		if i >= start && i < end {
-			f.Set(x, y, ch, selectStyle)
-			continue
-		}
-
-		if i == t.Cursor {
-			f.Set(x, y, ch, cursorStyle)
-			continue
-		}
-
-		f.Set(x, y, ch, s)
-	}
-
-	if t.Cursor == len(runes) {
-		x := r.X + t.Cursor
-		if x < r.Right() {
-			f.Set(x, r.Y, ' ', cursorStyle)
-		}
-	}
-
-	if t.Value == "" && t.Placeholder != "" {
+	// Render placeholder when value is empty
+	if len(t.runes) == 0 && t.Placeholder != "" {
 		for i, ch := range []rune(t.Placeholder) {
 			if i == 0 {
 				f.Set(r.X+i, r.Y, ch, cursorStyle)
 			} else {
 				f.Set(r.X+i, r.Y, ch, s.Dim())
 			}
+		}
+		return
+	}
+
+	// Render characters
+	for i, ch := range t.runes {
+		x := r.X + i
+		if x >= r.Right() {
+			break
+		}
+
+		if i == t.Cursor {
+			f.Set(x, r.Y, ch, cursorStyle)
+		} else {
+			f.Set(x, r.Y, ch, s)
+		}
+	}
+
+	// Render trailing cursor when at end of line
+	if t.Cursor == len(t.runes) {
+		x := r.X + t.Cursor
+		if x < r.Right() {
+			f.Set(x, r.Y, ' ', cursorStyle)
 		}
 	}
 }
@@ -2831,67 +2653,30 @@ func formatReceiver(expr ast.Expr) string {
 	}
 }
 
-// FilterSymbols returns top-level symbols whose names contain query (case-insensitive).
-// Query can be "save", "buffer.save" and "buffer save".
-func FilterSymbols(src []SymbolLocation, query string) []SymbolLocation {
-	if query == "" {
-		return src
-	}
-
-	queryLower := strings.ToLower(query)
-	parts := strings.Split(queryLower, ".")
-	if len(parts) == 1 {
-		parts = strings.Split(queryLower, " ")
-	}
-
-	var matches []SymbolLocation
-	for _, sym := range src {
-		match := true
-		for _, q := range parts {
-			if !strings.Contains(strings.ToLower(sym.Name), q) {
-				match = false
-				break
-			}
-		}
-		if match {
-			matches = append(matches, sym)
-		}
-	}
-
-	return matches
-}
-
 // OpenFile loads a file into memory or focuses it if already loaded.
 func (e *Editor) OpenFile(path string) error {
 	var buf *Buffer
-	// FIXME: seems duplicate with loadBuffer
-	if path == "" {
-		buf = &Buffer{
-			Path: "",
-			Lines: [][]rune{
-				[]rune(""),
-			},
-		}
-	} else {
-		path = filepath.Clean(path)
-		// switch to existing buffer
-		for i, buf := range e.buffers {
-			if buf.Path == path {
-				e.active = i
-				e.Buffer = buf
-				e.diags = nil
-				if isGoFile(e.Path) {
-					e.debounceDiagnose()
-				}
-				return nil
-			}
-		}
 
-		var err error
-		buf, err = loadBuffer(path)
-		if err != nil {
-			return err
+	if path != "" {
+		path = filepath.Clean(path)
+	}
+	// switch to existing buffer
+	for i, buf := range e.buffers {
+		if buf.Path == path {
+			e.active = i
+			e.Buffer = buf
+			e.diags = nil
+			if isGoFile(e.Path) {
+				e.debounceDiagnose()
+			}
+			return nil
 		}
+	}
+
+	var err error
+	buf, err = loadBuffer(path)
+	if err != nil {
+		return err
 	}
 
 	e.buffers = append(e.buffers, buf)
@@ -2948,8 +2733,14 @@ func (e *Editor) PrevBuffer() {
 // loadBuffer opens a file and prepares a Buffer struct.
 // If the file does not exist, it creates a new empty buffer associated with that path.
 func loadBuffer(path string) (*Buffer, error) {
-	cleanPath := filepath.Clean(path)
+	if path == "" {
+		return &Buffer{
+			Path:  "",
+			Lines: [][]rune{[]rune("")},
+		}, nil
+	}
 
+	cleanPath := filepath.Clean(path)
 	file, err := os.Open(cleanPath)
 	if os.IsNotExist(err) {
 		// New/unsaved file: initialize with one empty line
@@ -3141,5 +2932,330 @@ func (e *Editor) GoForward() {
 	}
 	if target, ok := e.jumps.Forward(); ok {
 		e.jumpTo(target)
+	}
+}
+
+// PaletteItem represents a single selectable row in the overlay.
+type PaletteItem struct {
+	Label  string // Main display text (e.g., "(b *Buffer) Format" or "fmt")
+	Detail string // Secondary detail (e.g., "Line 42" or "Ctrl+Shift+I")
+	// Kind   string          // Visual badge/tag (e.g., "sym", "cmd", "line", "file")
+	Action func(e *Editor) // Execution logic when user presses Enter
+}
+
+// Palette manages state, input handling, and item rendering for the overlay.
+type Palette struct {
+	Active   bool
+	Input    TextInput
+	Items    []PaletteItem
+	Selected int // Highlighted item index
+	MaxRows  int // UI render cap (e.g., 10 items)
+}
+
+// Open initializes the palette with a starting prefix ("@", ":", "/", or "").
+func (p *Palette) Open(ctx *kero.Context, e *Editor, prefix string) {
+	p.Active = true
+	p.Input.Reset()
+	p.Input.SetText(prefix)
+	p.Input.Placeholder = "search file (@symbol, /command or :line)"
+	p.Selected = 0
+	p.MaxRows = 10
+	p.Refresh(ctx, e)
+}
+
+func (p *Palette) Close() {
+	p.Active = false
+	p.Input.Reset()
+	p.Items = nil
+	p.Selected = 0
+}
+
+// Refresh updates p.Items based on the current input value.
+func (p *Palette) Refresh(ctx *kero.Context, e *Editor) {
+	input := p.Input.String()
+
+	switch {
+	case strings.HasPrefix(input, "@"):
+		// for example @palette.Refresh
+		p.Items = p.buildSymbolItems(ctx, e, strings.TrimPrefix(input, "@"))
+	case strings.HasPrefix(input, ":"):
+		p.Items = p.buildLineItems(e, strings.TrimPrefix(input, ":"))
+	case strings.HasPrefix(input, "/"):
+		p.Items = p.buildCommandItems(e, strings.TrimPrefix(input, "/"))
+	default:
+		p.Items = p.buildFileItems(e, input)
+	}
+
+	// Reset index bounds
+	if p.Selected >= len(p.Items) {
+		p.Selected = max(0, len(p.Items)-1)
+	}
+}
+
+// Symbol Provider (@)
+func (p *Palette) buildSymbolItems(ctx *kero.Context, e *Editor, query string) []PaletteItem {
+	if e.Buffer == nil {
+		return nil
+	}
+
+	lowerQuery := strings.ToLower(query)
+	queries := strings.Split(lowerQuery, ".")
+	if len(queries) == 1 {
+		queries = strings.Split(lowerQuery, " ")
+	}
+
+	symbols := ExtractAllSymbols(e.Buffer.NewReader()) // Uses your AST symbol extractor
+	var items []PaletteItem
+
+	for _, sym := range symbols {
+
+		if query != "" {
+			match := true
+			for _, q := range queries {
+				if !strings.Contains(strings.ToLower(sym.Name), q) {
+					match = false
+					break
+				}
+			}
+			if !match {
+				continue
+			}
+		}
+
+		symPos := Position{Row: sym.Line - 1, Col: sym.Column - 1}
+		items = append(items, PaletteItem{
+			Label: sym.Name,
+			// Detail: fmt.Sprintf("Line %d", sym.Line),
+			// Kind: sym.Kind,
+			Action: func(ed *Editor) {
+				ed.recordJump()
+				ed.Cursor = symPos
+				e.showCursorCenter(ctx)
+			},
+		})
+	}
+	return items
+}
+
+// Command Provider (/)
+func (p *Palette) buildCommandItems(_ *Editor, query string) []PaletteItem {
+	commands := []struct {
+		cmd    string
+		detail string
+		action func(e *Editor)
+	}{
+		{"format", "Format file with go/format", func(ed *Editor) { ed.Buffer.Format() }},
+	}
+
+	var items []PaletteItem
+	for _, c := range commands {
+		if query != "" && !strings.HasPrefix(c.cmd, query) {
+			continue
+		}
+
+		action := c.action
+		items = append(items, PaletteItem{
+			Label:  c.cmd,
+			Detail: c.detail,
+			// Kind:   "cmd",
+			Action: func(ed *Editor) {
+				action(ed)
+			},
+		})
+	}
+	return items
+}
+
+// Goto Line Provider (:)
+func (p *Palette) buildLineItems(e *Editor, query string) []PaletteItem {
+	if query == "" || e.Buffer == nil {
+		return nil
+	}
+
+	lineNum, err := strconv.Atoi(query)
+	if err != nil || lineNum <= 0 || lineNum > len(e.Lines) {
+		return nil
+	}
+
+	targetRow := lineNum - 1
+	return []PaletteItem{
+		{
+			Label: fmt.Sprintf("Go to line %d", lineNum),
+			// Detail: string(e.Lines[targetRow]),
+			// Kind:   "line",
+			Action: func(ed *Editor) {
+				ed.recordJump()
+				ed.Cursor = Position{Row: targetRow, Col: 0}
+			},
+		},
+	}
+}
+
+func (e *Editor) updatePalette(ctx *kero.Context, ev kero.KeyEvent) {
+	switch ev.Key {
+	case kero.KeyEsc:
+		e.palette.Close()
+	case kero.KeyDown:
+		if len(e.palette.Items) > 0 {
+			e.palette.Selected = (e.palette.Selected + 1) % len(e.palette.Items)
+		}
+	case kero.KeyUp:
+		if len(e.palette.Items) > 0 {
+			e.palette.Selected = (e.palette.Selected - 1 + len(e.palette.Items)) % len(e.palette.Items)
+		}
+	case kero.KeyEnter:
+		if len(e.palette.Items) > 0 && e.palette.Selected < len(e.palette.Items) {
+			action := e.palette.Items[e.palette.Selected].Action
+			e.palette.Close()
+			action(e) // Run selected action
+		}
+	default:
+		// Pass key to TextInput (typing query text)
+		e.palette.Input.Update(ev)
+		e.palette.Refresh(ctx, e)
+	}
+}
+
+// File Provider (Default mode when no prefix like '@', ':', or '/' is typed)
+func (p *Palette) buildFileItems(e *Editor, query string) []PaletteItem {
+	var items []PaletteItem
+	lowerQuery := strings.ToLower(query)
+
+	// 1. Include open buffers first for quick switching
+	openPaths := make(map[string]bool)
+	for i, buf := range e.buffers {
+		if buf.Path == "" {
+			continue
+		}
+		openPaths[buf.Path] = true
+
+		if query != "" && !strings.Contains(strings.ToLower(buf.Path), lowerQuery) {
+			continue
+		}
+
+		bufIdx := i
+		bufPath := buf.Path
+		items = append(items, PaletteItem{
+			Label:  filepath.Base(bufPath),
+			Detail: "active",
+			Action: func(ed *Editor) {
+				ed.recordJump()
+				ed.active = bufIdx
+				ed.Buffer = ed.buffers[bufIdx]
+			},
+		})
+	}
+
+	// 2. Scan workspace files on disk (skipping hidden folders & vendor)
+	const maxDiskItems = 50
+	_ = filepath.WalkDir(".", func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+
+		// Skip hidden directories (.git, .build, etc.) and vendor/node_modules
+		if d.IsDir() {
+			if (strings.HasPrefix(d.Name(), ".") && d.Name() != ".") || d.Name() == "vendor" || d.Name() == "node_modules" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
+		// Don't re-add files already listed as open buffers
+		if openPaths[path] {
+			return nil
+		}
+
+		cleanPath := filepath.Clean(path)
+		if query != "" && !strings.Contains(strings.ToLower(cleanPath), lowerQuery) {
+			return nil
+		}
+
+		filePath := cleanPath
+		items = append(items, PaletteItem{
+			Label: filepath.Base(filePath),
+			Action: func(ed *Editor) {
+				ed.recordJump()
+				ed.OpenFile(filePath)
+			},
+		})
+
+		// Cap results to preserve TUI render responsiveness
+		if len(items) >= maxDiskItems {
+			return filepath.SkipAll
+		}
+		return nil
+	})
+
+	return items
+}
+
+// drawPalette renders the input field and popup overlay menu above row y.
+func (e *Editor) drawPalette(f *kero.Frame, y, width int) {
+	if !e.palette.Active {
+		return
+	}
+
+	normal := kero.NewStyle()
+	p := &e.palette
+
+	// 1. Render input line at row y
+	p.Input.Draw(f, kero.Rect{X: 0, Y: y, W: width, H: 1}, normal)
+
+	// 2. Calculate visible window bounds
+	total := len(p.Items)
+	if total == 0 {
+		return
+	}
+
+	visibleRows := min(total, p.MaxRows)
+
+	// Calculate scrolling offset to keep selected item inside dropdown viewport
+	offset := 0
+	if p.Selected >= visibleRows {
+		offset = p.Selected - visibleRows + 1
+	}
+
+	// 3. Fill background for dropdown overlay rendered directly above row y
+	rect := kero.Rect{X: 0, Y: y - visibleRows, W: width, H: visibleRows}
+	f.Fill(rect, ' ', normal.Reverse())
+
+	// 4. Render item rows
+	for i := range visibleRows {
+		idx := i + offset
+		if idx >= total {
+			break
+		}
+
+		item := p.Items[idx]
+		lineY := rect.Y + i
+
+		// Selection cursor indicator
+		prefix := "   "
+		style := normal.Reverse()
+		if idx == p.Selected {
+			prefix = " > "
+			style = normal.Reverse().Bold()
+		}
+
+		// Left side text: Prefix + Label
+		leftText := fmt.Sprintf("%s %s", prefix, item.Label)
+		leftRunes := []rune(leftText)
+
+		if len(leftRunes) > width {
+			leftText = string(leftRunes[:width])
+		}
+		f.Write(rect.X, lineY, leftText, style)
+
+		// Right side text: Detail (e.g. line number or keybinding hint)
+		if item.Detail != "" {
+			detailRunes := []rune(item.Detail)
+			detailX := width - len(detailRunes) - 1
+
+			// Only render detail if it doesn't overlap left text
+			if detailX > len(leftRunes)+2 {
+				f.Write(detailX, lineY, item.Detail, style)
+			}
+		}
 	}
 }

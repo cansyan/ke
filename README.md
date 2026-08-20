@@ -17,8 +17,9 @@ Key bindings:
 - Ctrl+V paste
 - Ctrl+G goto definition
 - Ctrl+P command palette
+	- `@symbol` goto symbol
 	- `:123` goto line 123
-	- `/ls` list buffer
+	- `/format` format file
 - Ctrl+Backspace delete to line start
 - Ctrl+K delete to line end
 - Ctrl+Enter insert newline below

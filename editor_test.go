@@ -306,12 +306,10 @@ func TestReplaceCurrentAndSkip(t *testing.T) {
 	}
 
 	ed.startFind()
-	ed.findInput.Value = "one"
-	ed.findInput.Cursor = 3
+	ed.findInput.SetText("one")
 	ed.updateFind(kero.KeyEvent{Key: kero.KeyEnter})
 	ed.updateFind(kero.KeyEvent{Key: kero.KeyRune, Rune: 'r', Mod: kero.ModCtrl})
-	ed.replaceInput.Value = "1"
-	ed.replaceInput.Cursor = 1
+	ed.replaceInput.SetText("1")
 	ed.updateFind(kero.KeyEvent{Key: kero.KeyEnter})
 
 	if got := ed.Buffer.String(); got != "1 two one three one" {
@@ -335,11 +333,9 @@ func TestReplaceAll(t *testing.T) {
 		Buffer: NewBuffer("Cat\ncatapult\nDOG"),
 	}
 	ed.startFind()
-	ed.findInput.Value = "cat"
-	ed.findInput.Cursor = 3
+	ed.findInput.SetText("cat")
 	ed.updateFind(kero.KeyEvent{Key: kero.KeyRune, Rune: 'r', Mod: kero.ModCtrl})
-	ed.replaceInput.Value = "fox"
-	ed.replaceInput.Cursor = 3
+	ed.replaceInput.SetText("fox")
 	ctrlEnter := kero.KeyEvent{Key: kero.KeyEnter, Mod: kero.ModCtrl}
 	ed.updateFind(ctrlEnter)
 
