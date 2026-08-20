@@ -286,26 +286,14 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 			e.GotoDefinition()
 			centerCursor = true
 			return nil
-		case "ctrl+n":
-			// ctrl+b ctrl+n goto next buffer
-			if e.LastEvent() == "ctrl+b" {
-				e.NextBuffer()
-				return nil
-			}
-			return nil
 		case "ctrl+p":
-			// ctrl+b ctrl+p goto previous buffer
-			if e.LastEvent() == "ctrl+b" {
-				e.PrevBuffer()
-				return nil
-			}
 			e.palette.Open(ctx, e, "")
 			return nil
+		case "ctrl+[":
+			e.PrevBuffer()
+			return nil
 		case "ctrl+]":
-			if v := e.nextDiagnostic(); v.Message != "" {
-				e.Cursor = e.Buffer.ClampPos(Position{Row: v.Row, Col: v.Col})
-				centerCursor = true
-			}
+			e.NextBuffer()
 			return nil
 		case "ctrl+s":
 			return e.save()
@@ -671,7 +659,7 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 		f.Fill(kero.Rect{X: 0, Y: statusY, W: ctx.Width, H: 1}, ' ', statusStyle)
 		f.Write(0, statusY, trimToWidth(status, ctx.Width), statusStyle)
 		if len(e.diags) > 0 {
-			warn := "ctrl+] goto diagnostic"
+			warn := "/diagnostic goto diagnostic"
 			statusWidth := len([]rune(status))
 			f.Write(statusWidth+1, statusY, "| ", statusStyle)
 			eventWidth := len(e.LastEvent())
@@ -2976,14 +2964,13 @@ func (p *Palette) Refresh(ctx *kero.Context, e *Editor) {
 
 	switch {
 	case strings.HasPrefix(input, "@"):
-		// for example @palette.Refresh
-		p.Items = p.buildSymbolItems(ctx, e, strings.TrimPrefix(input, "@"))
+		p.Items = p.symbolItems(ctx, e, strings.TrimPrefix(input, "@"))
 	case strings.HasPrefix(input, ":"):
-		p.Items = p.buildLineItems(e, strings.TrimPrefix(input, ":"))
+		p.Items = p.lineItems(e, strings.TrimPrefix(input, ":"))
 	case strings.HasPrefix(input, "/"):
-		p.Items = p.buildCommandItems(e, strings.TrimPrefix(input, "/"))
+		p.Items = p.commandItems(ctx, e, strings.TrimPrefix(input, "/"))
 	default:
-		p.Items = p.buildFileItems(e, input)
+		p.Items = p.fileItems(e, input)
 	}
 
 	// Reset index bounds
@@ -2993,7 +2980,7 @@ func (p *Palette) Refresh(ctx *kero.Context, e *Editor) {
 }
 
 // Symbol Provider (@)
-func (p *Palette) buildSymbolItems(ctx *kero.Context, e *Editor, query string) []PaletteItem {
+func (p *Palette) symbolItems(ctx *kero.Context, e *Editor, query string) []PaletteItem {
 	if e.Buffer == nil {
 		return nil
 	}
@@ -3004,7 +2991,7 @@ func (p *Palette) buildSymbolItems(ctx *kero.Context, e *Editor, query string) [
 		queries = strings.Split(lowerQuery, " ")
 	}
 
-	symbols := ExtractAllSymbols(e.Buffer.NewReader()) // Uses your AST symbol extractor
+	symbols := ExtractAllSymbols(e.Buffer.NewReader())
 	var items []PaletteItem
 
 	for _, sym := range symbols {
@@ -3038,13 +3025,20 @@ func (p *Palette) buildSymbolItems(ctx *kero.Context, e *Editor, query string) [
 }
 
 // Command Provider (/)
-func (p *Palette) buildCommandItems(_ *Editor, query string) []PaletteItem {
+func (p *Palette) commandItems(ctx *kero.Context, _ *Editor, query string) []PaletteItem {
 	commands := []struct {
 		cmd    string
 		detail string
 		action func(e *Editor)
 	}{
+		// use readable name for cmd, easy to search
 		{"format", "Format file with go/format", func(ed *Editor) { ed.Buffer.Format() }},
+		{"diagnostic", "Goto diagnostic", func(e *Editor) {
+			if d := e.nextDiagnostic(); d.Message != "" {
+				e.Cursor = e.Buffer.ClampPos(Position{Row: d.Row, Col: d.Col})
+				e.showCursorCenter(ctx)
+			}
+		}},
 	}
 
 	var items []PaletteItem
@@ -3067,7 +3061,7 @@ func (p *Palette) buildCommandItems(_ *Editor, query string) []PaletteItem {
 }
 
 // Goto Line Provider (:)
-func (p *Palette) buildLineItems(e *Editor, query string) []PaletteItem {
+func (p *Palette) lineItems(e *Editor, query string) []PaletteItem {
 	if query == "" || e.Buffer == nil {
 		return nil
 	}
@@ -3081,8 +3075,6 @@ func (p *Palette) buildLineItems(e *Editor, query string) []PaletteItem {
 	return []PaletteItem{
 		{
 			Label: fmt.Sprintf("Go to line %d", lineNum),
-			// Detail: string(e.Lines[targetRow]),
-			// Kind:   "line",
 			Action: func(ed *Editor) {
 				ed.recordJump()
 				ed.Cursor = Position{Row: targetRow, Col: 0}
@@ -3117,7 +3109,7 @@ func (e *Editor) updatePalette(ctx *kero.Context, ev kero.KeyEvent) {
 }
 
 // File Provider (Default mode when no prefix like '@', ':', or '/' is typed)
-func (p *Palette) buildFileItems(e *Editor, query string) []PaletteItem {
+func (p *Palette) fileItems(e *Editor, query string) []PaletteItem {
 	var items []PaletteItem
 	lowerQuery := strings.ToLower(query)
 
