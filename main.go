@@ -3153,9 +3153,18 @@ func (p *Palette) buildFileItems(e *Editor, query string) []PaletteItem {
 			return nil
 		}
 
-		// Skip hidden directories (.git, .build, etc.) and vendor/node_modules
+		name := d.Name()
+		// Skip hidden files and directories (.git, .env, .build, etc.)
+		if strings.HasPrefix(name, ".") && name != "." {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
+		// Skip heavy dependency directories
 		if d.IsDir() {
-			if (strings.HasPrefix(d.Name(), ".") && d.Name() != ".") || d.Name() == "vendor" || d.Name() == "node_modules" {
+			if name == "vendor" || name == "node_modules" {
 				return filepath.SkipDir
 			}
 			return nil
