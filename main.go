@@ -26,13 +26,6 @@ import (
 	"github.com/cansyan/kero"
 )
 
-var pairMatch = map[rune]rune{
-	'(': ')',
-	'[': ']',
-	'{': '}',
-	'"': '"',
-}
-
 // parsePathArg parses an argument of the form "path", "path:row", or
 // "path:row:col". row and col are 1-based and converted to 0-based.
 func parsePathArg(arg string) (path string, row, col int) {
@@ -346,10 +339,12 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 			break
 		}
 		e.insertRune(key.Rune)
+		/* annoying...
 		if closing, ok := pairMatch[key.Rune]; ok && !e.pasting {
 			e.insertRune(closing)
 			e.Cursor = e.Buffer.PrevPos(e.Cursor)
 		}
+		*/
 	case kero.KeyEnter:
 		if e.hasSelect() {
 			e.deleteSelect()
@@ -3057,6 +3052,12 @@ func (p *Palette) commandItems(_ *Editor, query string) []PaletteItem {
 		{"jump forward", "ctrl+shift+-", func(e *Editor) {
 			e.JumpForward()
 			e.showCursorCenter()
+		}},
+		{"next buffer", "ctrl+]", func(e *Editor) {
+			e.NextBuffer()
+		}},
+		{"prev buffer", "ctrl+[", func(e *Editor) {
+			e.PrevBuffer()
 		}},
 	}
 
