@@ -35,6 +35,9 @@ Key bindings:
 - Ctrl+] next buffer
 - Ctrl+- jump back
 - Ctrl+Shift+- jump forward
+- Ctrl+N trigger completion
+	- Up/Down navigate
+	- Tab/Enter complete
 - Alt+Left move cursor to start of current/previous word
 - Alt+Right move cursor to end of current/next word
 - Alt+Backspace delete word backwards

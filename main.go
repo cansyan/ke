@@ -126,6 +126,87 @@ type Editor struct {
 	gutterW int
 
 	jumps JumpList
+
+	completion Completion
+}
+
+type Completion struct {
+	Active bool
+	Index  int
+	Items  []SymbolLocation
+}
+
+func (c *Completion) Refresh(src any, query string) {
+	results := ExtractAllSymbols(src)
+	if len(results) == 0 {
+		return
+	}
+
+	b := findQueryIgnoreCase(query)
+	items := make([]SymbolLocation, 0, len(results))
+	for _, s := range results {
+		if !b {
+			if strings.Contains(s.Name, query) {
+				items = append(items, s)
+			}
+		} else {
+			if strings.Contains(strings.ToLower(s.Name), strings.ToLower(query)) {
+				items = append(items, s)
+			}
+		}
+	}
+	c.Items = items
+	c.Index = 0
+}
+
+func (c *Completion) Next() {
+	if len(c.Items) == 0 {
+		return
+	}
+	c.Index = (c.Index + 1) % len(c.Items)
+}
+
+func (c *Completion) Prev() {
+	if len(c.Items) == 0 {
+		return
+	}
+	c.Index = (c.Index - 1 + len(c.Items)) % len(c.Items)
+}
+
+func (e *Editor) drawCompletion(f *kero.Frame) {
+	if len(e.completion.Items) == 0 {
+		return
+	}
+
+	visibleRows := min(len(e.completion.Items), 10)
+	var maxWidth int
+	for i := range e.completion.Items {
+		if width := len([]rune(e.completion.Items[i].String())); width > maxWidth {
+			maxWidth = width
+		}
+	}
+
+	// Calculate scrolling offset to keep selected item inside dropdown viewport
+	offset := 0
+	if e.completion.Index >= visibleRows {
+		offset = e.completion.Index - visibleRows + 1
+	}
+
+	var normal kero.Style
+	x := e.gutterW + e.VisualPos(e.Cursor).Col - e.LeftCol
+	y := e.Cursor.Row - e.TopRow
+	indicator := " >"
+	rect := kero.Rect{X: x, Y: y - visibleRows, W: len(indicator) + maxWidth + 1, H: visibleRows}
+	f.Fill(rect, ' ', normal.Reverse())
+	for i := range visibleRows {
+		y := rect.Y + i
+		prefix := indicator
+		if i+offset != e.completion.Index {
+			prefix = "  "
+		}
+		label := prefix + e.completion.Items[i+offset].String()
+		f.Write(rect.X, y, label, normal.Reverse())
+	}
 }
 
 type diagResult struct {
@@ -250,21 +331,36 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 	}
 
 	var centerCursor bool
+	var completing bool // mark whether showing completion on keystroke
 	defer func() {
 		if centerCursor {
 			e.showCursorCenter()
 		} else {
 			e.showCursor()
 		}
+
+		e.completion.Active = completing
 	}()
 
 	switch key.Key {
 	case kero.KeyRune:
 		switch key.String() {
+		case "ctrl+n":
+			start, end := e.WordBounds(e.PrevPos(e.Cursor))
+			word := e.GetRange(start, end)
+			e.completion.Refresh(e.Buffer.NewReader(), word)
+			if len(e.completion.Items) == 1 {
+				// only 1 alternative, apply it early
+				cursor := e.DeleteRange(start, end)
+				e.Cursor = e.Insert(cursor, e.completion.Items[e.completion.Index].Name)
+				e.markDirty()
+				return nil
+			}
+			completing = len(e.completion.Items) > 0
 		case "ctrl+-":
 			e.JumpBack()
 			centerCursor = true
-		case "ctrl+shift+-":
+		case "ctrl+shift+-", "ctrl+_":
 			e.JumpForward()
 			centerCursor = true
 		case "ctrl+w":
@@ -339,13 +435,21 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 			break
 		}
 		e.insertRune(key.Rune)
-		/* annoying...
-		if closing, ok := pairMatch[key.Rune]; ok && !e.pasting {
-			e.insertRune(closing)
-			e.Cursor = e.Buffer.PrevPos(e.Cursor)
+		if e.completion.Active {
+			start, end := e.WordBounds(e.PrevPos(e.Cursor))
+			word := e.GetRange(start, end)
+			e.completion.Refresh(e.Buffer.NewReader(), word)
+			completing = len(e.completion.Items) > 0
 		}
-		*/
 	case kero.KeyEnter:
+		if e.completion.Active {
+			start, end := e.WordBounds(e.PrevPos(e.Cursor))
+			cursor := e.DeleteRange(start, end)
+			e.Cursor = e.Insert(cursor, e.completion.Items[e.completion.Index].Name)
+			e.markDirty()
+			return nil
+		}
+
 		if e.hasSelect() {
 			e.deleteSelect()
 		}
@@ -400,6 +504,14 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 		}
 		e.markDirty()
 	case kero.KeyTab:
+		if e.completion.Active {
+			start, end := e.WordBounds(e.PrevPos(e.Cursor))
+			cursor := e.DeleteRange(start, end)
+			e.Cursor = e.Insert(cursor, e.completion.Items[e.completion.Index].Name)
+			e.markDirty()
+			break
+		}
+
 		if key.Mod&kero.ModShift != 0 {
 			e.unindentSelectOrLine()
 			break
@@ -487,6 +599,11 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 			}
 			e.moveUp()
 		default:
+			if e.completion.Active {
+				e.completion.Prev()
+				completing = true
+				return nil
+			}
 			e.moveUp()
 		}
 	case kero.KeyDown:
@@ -504,6 +621,11 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 			}
 			e.moveDown()
 		default:
+			if e.completion.Active {
+				e.completion.Next()
+				completing = true
+				return nil
+			}
 			e.moveDown()
 		}
 	case kero.KeyHome:
@@ -516,12 +638,18 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 	case kero.KeyEnd:
 		e.Cursor = e.Buffer.LineEnd(e.Cursor)
 	case kero.KeyPgUp:
+		e.recordJump()
 		e.Cursor.Row -= e.bufferH()
 		e.Cursor = e.Buffer.ClampPos(e.Cursor)
 	case kero.KeyPgDown:
+		e.recordJump()
 		e.Cursor.Row += e.bufferH()
 		e.Cursor = e.Buffer.ClampPos(e.Cursor)
 	case kero.KeyEsc:
+		if e.completion.Active {
+			e.completion.Active = false
+			return nil
+		}
 		e.clearSelect()
 	}
 	return nil
@@ -571,7 +699,9 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 		if v, ok := e.diagnosticForLine(lineIndex); ok {
 			red := kero.NewStyle().Foreground(kero.ColorRed)
 			f.Write(0, y, "x", red)
-			f.Write(gutterW+len(visPadded)+2, y, v.Message, red)
+			//f.Write(gutterW+len(visPadded)+2, y, v.Message, red)
+			dx := max(gutterW+len(visPadded), ctx.Width-len(v.Message))
+			f.Write(dx, y, v.Message, red)
 		}
 
 		// highlight selection if any
@@ -659,7 +789,7 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 		f.Fill(kero.Rect{X: 0, Y: statusY, W: ctx.Width, H: 1}, ' ', statusStyle)
 		f.Write(0, statusY, trimToWidth(status, ctx.Width), statusStyle)
 		if len(e.diags) > 0 {
-			warn := "/diagnostic goto diagnostic"
+			warn := fmt.Sprintf("%d diagnostic", len(e.diags))
 			statusWidth := len([]rune(status))
 			f.Write(statusWidth+1, statusY, "| ", statusStyle)
 			eventWidth := len(e.LastEvent())
@@ -694,6 +824,10 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 			messageStyle = messageStyle.Foreground(kero.ColorRed)
 		}
 		f.Write(0, messageY, trimToWidth(" "+e.message, ctx.Width), messageStyle)
+	}
+
+	if e.completion.Active {
+		e.drawCompletion(f)
 	}
 }
 
@@ -882,7 +1016,7 @@ func (e *Editor) save() error {
 	}
 
 	if _, err := e.Buffer.Format(); err != nil {
-		return err
+		log.Print(err)
 	}
 
 	if err := e.Buffer.Save(); err != nil {
@@ -1399,17 +1533,6 @@ func (e *Editor) GotoDefinition() {
 	// Jump editor cursor (converting back to 0-based)
 	e.Cursor.Row = res.Line - 1
 	e.Cursor.Col = res.Column - 1
-}
-
-func (e *Editor) GotoSymbol(name string) {
-	loc, found := FindSymbolLoc(e.Buffer.NewReader(), name)
-	if !found {
-		return
-	}
-
-	// Move cursor (converting 1-based line/col to 0-based)
-	e.Cursor.Row = loc.Line - 1
-	e.Cursor.Col = loc.Column - 1
 }
 
 // TextInput is a small editable single-line text widget.
@@ -2535,15 +2658,24 @@ func positionToPos(fset *token.FileSet, file *ast.File, line, col int) token.Pos
 }
 
 type SymbolLocation struct {
-	Name   string
-	Kind   string // "func", "type", "struct", "var", "const"
-	Line   int    // 1-based
-	Column int    // 1-based
+	Name     string
+	Receiver string
+	Kind     string // "func", "method", "type", "struct", "var", "const"
+	Line     int    // 1-based
+	Column   int    // 1-based
+}
+
+// combines receiver and symbol name
+func (s SymbolLocation) String() string {
+	if s.Receiver == "" {
+		return s.Name
+	}
+	return fmt.Sprintf("(%s).%s", s.Receiver, s.Name)
 }
 
 // FindSymbolLoc finds the location of a top-level symbol matching exactName.
 // src can be string, []byte, or io.Reader.
-func FindSymbolLoc(src any, exactName string) (SymbolLocation, bool) {
+func FindSymbolLoc(src any, exactName string) (SymbolLocation, bool) { // TODO
 	symbols := ExtractAllSymbols(src)
 	for _, sym := range symbols {
 		if sym.Name == exactName {
@@ -2569,22 +2701,20 @@ func ExtractAllSymbols(src any) []SymbolLocation {
 		case *ast.FuncDecl:
 			pos := fset.Position(d.Name.Pos())
 			kind := "func"
-			name := d.Name.Name
 
 			// Extract receiver type if this function is a method
+			var recv string
 			if d.Recv != nil && len(d.Recv.List) > 0 {
 				kind = "method"
-				recvType := formatReceiver(d.Recv.List[0].Type)
-				if recvType != "" {
-					name = fmt.Sprintf("(%s).%s", recvType, d.Name.Name)
-				}
+				recv = formatReceiver(d.Recv.List[0].Type)
 			}
 
 			results = append(results, SymbolLocation{
-				Name:   name,
-				Kind:   kind,
-				Line:   pos.Line,
-				Column: pos.Column,
+				Name:     d.Name.Name,
+				Receiver: recv,
+				Kind:     kind,
+				Line:     pos.Line,
+				Column:   pos.Column,
 			})
 
 		case *ast.GenDecl:
@@ -3000,7 +3130,7 @@ func (p *Palette) symbolItems(e *Editor, query string) []PaletteItem {
 		if query != "" {
 			match := true
 			for _, q := range queries {
-				if !strings.Contains(strings.ToLower(sym.Name), q) {
+				if !strings.Contains(strings.ToLower(sym.String()), q) {
 					match = false
 					break
 				}
@@ -3012,7 +3142,7 @@ func (p *Palette) symbolItems(e *Editor, query string) []PaletteItem {
 
 		symPos := Position{Row: sym.Line - 1, Col: sym.Column - 1}
 		items = append(items, PaletteItem{
-			Label: sym.Name,
+			Label: sym.String(),
 			// Detail: fmt.Sprintf("Line %d", sym.Line),
 			// Kind: sym.Kind,
 			Action: func(ed *Editor) {
