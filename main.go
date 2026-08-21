@@ -693,7 +693,7 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 			return
 		}
 		if e.message == "" {
-			e.message = "^S save | ^W close | ^Q quit | ^F find | ^G definition | ^R symbols | ^] diagnostic"
+			e.message = "^S save | ^W close | ^Q quit | ^F find | ^P palette | ^G definition | ^R symbols"
 		}
 		if strings.HasPrefix(e.message, "error:") || strings.HasPrefix(e.message, "warn:") {
 			messageStyle = messageStyle.Foreground(kero.ColorRed)
@@ -3097,6 +3097,7 @@ func (p *Palette) lineItems(e *Editor, query string) []PaletteItem {
 			Action: func(ed *Editor) {
 				ed.recordJump()
 				ed.Cursor = Position{Row: targetRow, Col: 0}
+				ed.showCursorCenter()
 			},
 		},
 	}
@@ -3220,7 +3221,8 @@ func (e *Editor) drawPalette(f *kero.Frame, y, width int) {
 	p := &e.palette
 
 	// 1. Render input line at row y
-	p.Input.Draw(f, kero.Rect{X: 0, Y: y, W: width, H: 1}, normal)
+	f.Fill(kero.Rect{X: 0, Y: y, W: width, H: 1}, ' ', normal.Reverse())
+	p.Input.Draw(f, kero.Rect{X: 1, Y: y, W: width, H: 1}, normal.Reverse())
 
 	// 2. Calculate visible window bounds
 	total := len(p.Items)
