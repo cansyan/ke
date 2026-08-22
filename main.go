@@ -234,11 +234,11 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 		return nil
 	}
 
+	defer e.showCursor()
 	if e.saveAs {
 		return e.updateSaveAs(key)
 	}
 	if e.finding {
-		defer e.showCursor()
 		return e.updateFind(key)
 	}
 	if e.palette.Active {
@@ -246,15 +246,8 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 		return nil
 	}
 
-	var centerCursor bool
 	var completing bool // mark whether showing completion on keystroke
 	defer func() {
-		if centerCursor {
-			e.showCursorCenter()
-		} else {
-			e.showCursor()
-		}
-
 		e.completion.Active = completing
 	}()
 
@@ -276,10 +269,10 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 			completing = len(c.Items) > 0
 		case "ctrl+-":
 			e.JumpBack()
-			centerCursor = true
+			e.showCursorCenter()
 		case "ctrl+shift+-", "ctrl+_":
 			e.JumpForward()
-			centerCursor = true
+			e.showCursorCenter()
 		case "ctrl+w":
 			if e.Dirty && !(e.LastEvent() == "ctrl+w") {
 				e.message = "warn: unsaved changes, press ctrl+s to save or ctrl+w again to close"
@@ -295,7 +288,7 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 		case "ctrl+g":
 			e.recordJump()
 			e.GotoDefinition()
-			centerCursor = true
+			e.showCursorCenter()
 			return nil
 		case "ctrl+p":
 			e.palette.Open(ctx, e, "")
@@ -1328,6 +1321,7 @@ func isGoFile(path string) bool {
 
 // showCursor adjusts TopRow and LeftCol to ensure the cursor is within
 // the visible viewport.
+// It does nothing if called after showCursorCenter()
 func (e *Editor) showCursor() {
 	bufH := e.bufferH()
 	if bufH <= 0 {
