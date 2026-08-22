@@ -130,90 +130,6 @@ type Editor struct {
 	completion Completion
 }
 
-type Completion struct {
-	Active bool
-	Index  int
-	Items  []SymbolLocation
-}
-
-func (c *Completion) Refresh(src any, query string) {
-	results := ExtractAllSymbols(src)
-	if len(results) == 0 {
-		return
-	}
-
-	b := findQueryIgnoreCase(query)
-	items := make([]SymbolLocation, 0, len(results))
-	for _, s := range results {
-		if !b {
-			if strings.Contains(s.Name, query) {
-				items = append(items, s)
-			}
-		} else {
-			if strings.Contains(strings.ToLower(s.Name), strings.ToLower(query)) {
-				items = append(items, s)
-			}
-		}
-	}
-	c.Items = items
-	c.Index = 0
-}
-
-func (c *Completion) Next() {
-	if len(c.Items) == 0 {
-		return
-	}
-	c.Index = (c.Index + 1) % len(c.Items)
-}
-
-func (c *Completion) Prev() {
-	if len(c.Items) == 0 {
-		return
-	}
-	c.Index = (c.Index - 1 + len(c.Items)) % len(c.Items)
-}
-
-func (e *Editor) drawCompletion(f *kero.Frame) {
-	if len(e.completion.Items) == 0 {
-		return
-	}
-
-	visibleRows := min(len(e.completion.Items), 10)
-	var maxWidth int
-	for i := range e.completion.Items {
-		if width := len([]rune(e.completion.Items[i].String())); width > maxWidth {
-			maxWidth = width
-		}
-	}
-
-	// Calculate scrolling offset to keep selected item inside dropdown viewport
-	offset := 0
-	if e.completion.Index >= visibleRows {
-		offset = e.completion.Index - visibleRows + 1
-	}
-
-	var normal kero.Style
-	x := e.gutterW + e.VisualPos(e.Cursor).Col - e.LeftCol
-	y := e.Cursor.Row - e.TopRow
-	indicator := " >"
-	rect := kero.Rect{X: x, Y: y - visibleRows, W: len(indicator) + maxWidth + 1, H: visibleRows}
-	f.Fill(rect, ' ', normal.Reverse())
-	for i := range visibleRows {
-		y := rect.Y + i
-		prefix := indicator
-		if i+offset != e.completion.Index {
-			prefix = "  "
-		}
-		label := prefix + e.completion.Items[i+offset].String()
-		f.Write(rect.X, y, label, normal.Reverse())
-	}
-}
-
-type diagResult struct {
-	version     uint64
-	diagnostics []Diagnostic
-}
-
 func (e *Editor) Init(ctx *kero.Context) error {
 	e.Width, e.Height = ctx.Width, ctx.Height
 	e.showCursor()
@@ -348,15 +264,16 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 		case "ctrl+n":
 			start, end := e.WordBounds(e.PrevPos(e.Cursor))
 			word := e.GetRange(start, end)
-			e.completion.Refresh(e.Buffer.NewReader(), word)
-			if len(e.completion.Items) == 1 {
+			c:=e.completion
+			c.Refresh(e.Buffer.NewReader(), word)
+			if len(c.Items) == 1 {
 				// only 1 alternative, apply it early
 				cursor := e.DeleteRange(start, end)
-				e.Cursor = e.Insert(cursor, e.completion.Items[e.completion.Index].Name)
+				e.Cursor = e.Insert(cursor, c.Items[c.Index].Name)
 				e.markDirty()
 				return nil
 			}
-			completing = len(e.completion.Items) > 0
+			completing = len(c.Items) > 0
 		case "ctrl+-":
 			e.JumpBack()
 			centerCursor = true
@@ -419,7 +336,12 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 			e.selectLine()
 			return nil
 		case "ctrl+k":
-			e.deleteToLineEnd()
+			if e.hasSelect() {
+				e.deleteSelect()
+				return nil
+			}
+			e.Cursor = e.Buffer.DeleteRange(e.Cursor, e.Buffer.LineEnd(e.Cursor))
+			e.markDirty()
 			return nil
 		case "ctrl+a":
 			p := e.Buffer.LineStartNonSpace(e.Cursor)
@@ -431,10 +353,15 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 		case "ctrl+e":
 			e.Cursor = e.Buffer.LineEnd(e.Cursor)
 		}
+
 		if key.Mod != 0 {
 			break
 		}
-		e.insertRune(key.Rune)
+		if e.hasSelect() {
+			e.deleteSelect()
+		}
+		e.Cursor = e.Buffer.Insert(e.Cursor, string([]rune{key.Rune}))
+		e.markDirty()
 		if e.completion.Active {
 			start, end := e.WordBounds(e.PrevPos(e.Cursor))
 			word := e.GetRange(start, end)
@@ -522,8 +449,10 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 				e.indentSelect()
 				break
 			}
+			e.deleteSelect()
 		}
-		e.insertRune('\t')
+		e.Cursor = e.Insert(e.Cursor, "\t")
+		e.markDirty()
 	case kero.KeyBackspace:
 		if e.hasSelect() {
 			e.deleteSelect()
@@ -1119,7 +1048,10 @@ func (e *Editor) updateFind(ev kero.KeyEvent) error {
 			return nil
 		case kero.KeyEnter:
 			if ev.Mod&kero.ModCtrl != 0 {
-				return e.replaceAll()
+				e.replaceAll()
+				e.finding = false
+				e.replacing = false
+				return nil
 			}
 			return e.replaceCurrent()
 		}
@@ -1282,23 +1214,6 @@ func (e *Editor) replaceAll() error {
 	return nil
 }
 
-func (e *Editor) insertRune(r rune) {
-	if e.hasSelect() {
-		e.deleteSelect()
-	}
-	e.Cursor = e.Buffer.Insert(e.Cursor, string([]rune{r}))
-	e.markDirty()
-}
-
-func (e *Editor) deleteToLineEnd() {
-	if e.hasSelect() {
-		e.deleteSelect()
-		return
-	}
-	e.Cursor = e.Buffer.DeleteRange(e.Cursor, e.Buffer.LineEnd(e.Cursor))
-	e.markDirty()
-}
-
 func (e *Editor) moveLeft() {
 	e.Cursor = e.Buffer.PrevPos(e.Cursor)
 }
@@ -1329,6 +1244,11 @@ func (e *Editor) markDirty() {
 	if isGoFile(e.Path) {
 		e.debounceDiagnose()
 	}
+}
+
+type diagResult struct {
+	version     uint64
+	diagnostics []Diagnostic
 }
 
 // debounceDiagnose is In-memory, fast syntax and type checking
@@ -1629,9 +1549,15 @@ func (t *TextInput) Update(ev kero.Event) {
 	}
 }
 
+// toggleReverse flips the reverse attribute bit.
+func toggleReverse(s kero.Style) kero.Style {
+	s.Attr = s.Attr ^ kero.AttrReverse
+	return s
+}
+
 // Draw renders the text input and its cursor.
 func (t TextInput) Draw(f *kero.Frame, r kero.Rect, s kero.Style) {
-	cursorStyle := s.Reverse().Foreground(kero.ColorRed)
+	cursorStyle := toggleReverse(s)
 
 	if t.SelectAll && len(t.runes) > 0 {
 		for i, ch := range t.runes {
@@ -3410,5 +3336,85 @@ func (e *Editor) drawPalette(f *kero.Frame, y, width int) {
 				f.Write(detailX, lineY, item.Detail, style)
 			}
 		}
+	}
+}
+
+type Completion struct {
+	Active bool
+	Index  int
+	Items  []SymbolLocation
+}
+
+func (c *Completion) Refresh(src any, query string) {
+	results := ExtractAllSymbols(src)
+	if len(results) == 0 {
+		return
+	}
+
+	b := findQueryIgnoreCase(query)
+	items := make([]SymbolLocation, 0, len(results))
+	for _, s := range results {
+		if !b {
+			if strings.Contains(s.Name, query) {
+				items = append(items, s)
+			}
+		} else {
+			if strings.Contains(strings.ToLower(s.Name), strings.ToLower(query)) {
+				items = append(items, s)
+			}
+		}
+	}
+	c.Items = items
+	c.Index = 0
+}
+
+func (c *Completion) Next() {
+	if len(c.Items) == 0 {
+		return
+	}
+	c.Index = (c.Index + 1) % len(c.Items)
+}
+
+func (c *Completion) Prev() {
+	if len(c.Items) == 0 {
+		return
+	}
+	c.Index = (c.Index - 1 + len(c.Items)) % len(c.Items)
+}
+
+func (e *Editor) drawCompletion(f *kero.Frame) {
+	if len(e.completion.Items) == 0 {
+		return
+	}
+
+	c := e.completion
+	visibleRows := min(len(c.Items), 10)
+	var maxWidth int
+	for i := range c.Items {
+		if width := len([]rune(c.Items[i].String())); width > maxWidth {
+			maxWidth = width
+		}
+	}
+
+	// Calculate scrolling offset to keep selected item inside dropdown viewport
+	offset := 0
+	if c.Index >= visibleRows {
+		offset = c.Index - visibleRows + 1
+	}
+
+	var normal kero.Style
+	x := e.gutterW + e.VisualPos(e.Cursor).Col - e.LeftCol
+	y := e.Cursor.Row - e.TopRow
+	indicator := " >"
+	rect := kero.Rect{X: x, Y: y - visibleRows, W: len(indicator) + maxWidth + 1, H: visibleRows}
+	f.Fill(rect, ' ', normal.Reverse())
+	for i := range visibleRows {
+		y := rect.Y + i
+		prefix := indicator
+		if i+offset != c.Index {
+			prefix = "  "
+		}
+		label := prefix + c.Items[i+offset].String()
+		f.Write(rect.X, y, label, normal.Reverse())
 	}
 }
