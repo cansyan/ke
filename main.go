@@ -264,7 +264,7 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 		case "ctrl+n":
 			start, end := e.WordBounds(e.PrevPos(e.Cursor))
 			word := e.GetRange(start, end)
-			c:=e.completion
+			c := &e.completion
 			c.Refresh(e.Buffer.NewReader(), word)
 			if len(c.Items) == 1 {
 				// only 1 alternative, apply it early
@@ -3405,16 +3405,15 @@ func (e *Editor) drawCompletion(f *kero.Frame) {
 	var normal kero.Style
 	x := e.gutterW + e.VisualPos(e.Cursor).Col - e.LeftCol
 	y := e.Cursor.Row - e.TopRow
-	indicator := " >"
-	rect := kero.Rect{X: x, Y: y - visibleRows, W: len(indicator) + maxWidth + 1, H: visibleRows}
+	w := maxWidth + 3 // 2 for indicator, 1 for right padding
+	rect := kero.Rect{X: x, Y: y - visibleRows, W: w, H: visibleRows}
 	f.Fill(rect, ' ', normal.Reverse())
 	for i := range visibleRows {
 		y := rect.Y + i
-		prefix := indicator
-		if i+offset != c.Index {
-			prefix = "  "
+		if i+offset == c.Index {
+			f.Write(rect.X, y, " >"+c.Items[i+offset].String(), normal.Reverse().Bold())
+		} else {
+			f.Write(rect.X, y, "  "+c.Items[i+offset].String(), normal.Reverse())
 		}
-		label := prefix + c.Items[i+offset].String()
-		f.Write(rect.X, y, label, normal.Reverse())
 	}
 }
