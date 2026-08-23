@@ -1333,60 +1333,10 @@ func isGoFile(path string) bool {
 	return strings.EqualFold(filepath.Ext(path), ".go")
 }
 
-// showCursor adjusts TopRow and LeftCol to ensure the cursor is within
-// the visible viewport.
-// It does nothing if called after showCursorCenter()
-func (e *Editor) showCursor() {
-	bufH := e.bufferH()
-	if bufH <= 0 {
-		return
-	}
-
+// scroll vertically to ensure cursor visible
+func (e *Editor) scrollV(margin int) {
 	// 1. Vertical Scrolling (Row)
-	maxTopRow := e.Cursor.Row - (bufH - 1)
-	if e.TopRow < maxTopRow {
-		e.TopRow = maxTopRow
-	}
-
-	// Ensure cursor is below the top margin
-	minTopRow := e.Cursor.Row
-	if e.TopRow > minTopRow {
-		e.TopRow = minTopRow
-	}
-
-	// Clamp to top boundary
-	if e.TopRow < 0 {
-		e.TopRow = 0
-	}
-	// 2. Horizontal Scrolling (Column)
-	textW := e.Width - lineNumberW(len(e.Lines)) - 2
-	textW = max(1, textW)
-
-	visualCursor := e.VisualPos(e.Cursor)
-	if visualCursor.Col < e.LeftCol {
-		e.LeftCol = visualCursor.Col
-	} else if visualCursor.Col >= e.LeftCol+textW {
-		e.LeftCol = visualCursor.Col - textW + 1
-	}
-
-	if e.LeftCol < 0 {
-		e.LeftCol = 0
-	}
-}
-
-// showCursor adjusts TopRow and LeftCol to ensure the cursor is at
-// the center of visible viewport.
-func (e *Editor) showCursorCenter() {
-	bufH := e.bufferH()
-	if bufH <= 0 {
-		return
-	}
-
-	margin := bufH / 2
-
-	// 1. Vertical Scrolling (Row)
-	// Ensure cursor is above the bottom margin
-	maxTopRow := e.Cursor.Row - (bufH - 1 - margin)
+	maxTopRow := e.Cursor.Row - (e.bufferH() - margin)
 	if e.TopRow < maxTopRow {
 		e.TopRow = maxTopRow
 	}
@@ -1401,8 +1351,10 @@ func (e *Editor) showCursorCenter() {
 	if e.TopRow < 0 {
 		e.TopRow = 0
 	}
+}
 
-	// 2. Horizontal Scrolling (Column)
+// scroll horizontally to ensure cursor visible
+func (e *Editor) scrollH() {
 	textW := e.Width - lineNumberW(len(e.Lines)) - 2
 	textW = max(1, textW)
 
@@ -1417,6 +1369,34 @@ func (e *Editor) showCursorCenter() {
 	if e.LeftCol < 0 {
 		e.LeftCol = 0
 	}
+}
+
+// showCursor adjusts TopRow and LeftCol to ensure the cursor is within
+// the visible viewport.
+// It does nothing if called after showCursorCenter()
+func (e *Editor) showCursor() {
+	bufH := e.bufferH()
+	if bufH <= 0 {
+		return
+	}
+
+	e.scrollV(1)
+	e.scrollH()
+}
+
+// showCursorCenter ensures the cursor is within viewport.
+// If cursor's row is visible, it shows naturally, without vertical scroll;
+// Otherwise, it scroll the viewport to center the cursor.
+func (e *Editor) showCursorCenter() {
+	bufH := e.bufferH()
+	if bufH <= 0 {
+		return
+	}
+
+	if e.Cursor.Row < e.TopRow || e.Cursor.Row >= e.TopRow+bufH-1 {
+		e.scrollV(bufH / 2)
+	}
+	e.scrollH()
 }
 
 // buffer height = app height - 2
@@ -3246,6 +3226,7 @@ func (p *Palette) fileItems(e *Editor, query string) []PaletteItem {
 				ed.recordJump()
 				ed.active = bufIdx
 				ed.Buffer = ed.buffers[bufIdx]
+				e.diags = nil
 			},
 		})
 	}
