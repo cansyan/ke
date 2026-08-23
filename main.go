@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"go/ast"
 	"go/format"
@@ -133,6 +134,8 @@ type Editor struct {
 
 	renaming    bool
 	renameInput TextInput
+
+	locations LocationList
 }
 
 func (e *Editor) Init(ctx *kero.Context) error {
@@ -306,10 +309,10 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 			e.palette.Open(ctx, e, "")
 			return nil
 		case "ctrl+[":
-			e.PrevBuffer()
+			handlePrevLocation(e)
 			return nil
 		case "ctrl+]":
-			e.NextBuffer()
+			handleNextLocation(e)
 			return nil
 		case "ctrl+s":
 			return e.save()
@@ -584,6 +587,10 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 			e.completion.Active = false
 			return nil
 		}
+		if e.locations.Active {
+			e.locations.Active = false
+			return nil
+		}
 		e.clearSelect()
 	}
 	return nil
@@ -753,6 +760,10 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 		}
 		if e.palette.Active {
 			e.drawPalette(f, messageY, ctx.Width)
+			return
+		}
+		if e.locations.Active {
+			e.drawLocationList(f, messageY, ctx.Width)
 			return
 		}
 		if e.message == "" {
@@ -3125,6 +3136,10 @@ func (p *Palette) commandItems(_ *Editor, query string) []PaletteItem {
 			}
 			e.startRename()
 		}},
+		{"LSP: reference", "", handleLSPRef},
+		{"toggle location list", "", func(e *Editor) { e.locations.Active = !e.locations.Active }},
+		{"next location", "ctrl+]", handleNextLocation},
+		{"prev location", "ctrl+[", handlePrevLocation},
 	}
 
 	var items []PaletteItem
@@ -3529,32 +3544,214 @@ func handleLSPDef(e *Editor) {
 		return
 	}
 	log.Printf("run %q in %.2fs:\n%s", cmd, time.Since(now).Seconds(), string(out))
-	parts := strings.Split(string(out), ":")
-	if len(parts) < 3 {
-		return
-	}
-	path := parts[0]
-	var row int
-	lineNo, err := strconv.Atoi(parts[1])
+	p, err := ParsePositionLSP(string(out))
 	if err != nil {
+		log.Print(err)
 		return
-	}
-	row = lineNo - 1
-	var col int
-	if startCol, _, ok := strings.Cut(parts[2], "-"); ok {
-		i, err := strconv.Atoi(startCol)
-		if err != nil {
-			return
-		}
-		col = i - 1
 	}
 
 	e.recordJump()
-	if err := e.OpenFile(path); err != nil {
+	if err := e.OpenFile(p.Path); err != nil {
 		log.Print(err)
 		e.message = err.Error()
 		return
 	}
-	e.Cursor = Position{Row: row, Col: col}
+	e.Cursor = Position{Row: p.Line - 1, Col: p.StartColumn - 1}
+	e.showCursorCenter()
+}
+
+type LocationList struct {
+	Active bool
+	Index  int
+	Items  []PositionLSP
+}
+
+func (ls *LocationList) Next() PositionLSP {
+	if len(ls.Items) == 0 {
+		return PositionLSP{}
+	}
+	if len(ls.Items) == 1 {
+		return ls.Items[0]
+	}
+	ls.Index = (ls.Index + 1) % len(ls.Items)
+	return ls.Items[ls.Index]
+}
+
+func (ls *LocationList) Prev() PositionLSP {
+	if len(ls.Items) == 0 {
+		return PositionLSP{}
+	}
+	if len(ls.Items) == 1 {
+		return ls.Items[0]
+	}
+	ls.Index = (ls.Index - 1 + len(ls.Items)) % len(ls.Items)
+	return ls.Items[ls.Index]
+}
+
+type PositionLSP struct {
+	Path        string
+	Line        int // starts at 1
+	StartColumn int // starts at 1, measured in bytes of the UTF-8 encoding
+	EndColumn   int
+}
+
+func ParsePositionLSP(s string) (PositionLSP, error) {
+	parts := strings.Split(s, ":")
+	if len(parts) < 3 {
+		return PositionLSP{}, errors.New("unknown position: " + s)
+	}
+	path := parts[0]
+	lineNo, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return PositionLSP{}, err
+	}
+	segments := strings.Split(parts[2], "-")
+	if len(segments) != 2 {
+		return PositionLSP{}, errors.New("unknown position: " + s)
+	}
+	startCol, err := strconv.Atoi(segments[0])
+	if err != nil {
+		return PositionLSP{}, err
+	}
+	endCol, err := strconv.Atoi(segments[1])
+	if err != nil {
+		return PositionLSP{}, err
+	}
+	return PositionLSP{Path: path, Line: lineNo, StartColumn: startCol, EndColumn: endCol}, nil
+}
+
+// returns a readable string representation, the Row and
+func (p PositionLSP) String() string {
+	return fmt.Sprintf("%s:%d:%d-%d", p.Path, p.Line, p.StartColumn, p.EndColumn)
+}
+
+// For example, run:
+//
+//	gopls references main.go:34:2
+//
+// ouput:
+//
+//	/Users/cse/code/ke/main.go:35:9-14
+//	/Users/cse/code/ke/main.go:39:9-14
+//
+// Positions within files are specified as file.go:line:column triples,
+// where the line and column start at 1, and columns are measured in bytes of the UTF-8 encoding.
+// More details see https://go.dev/gopls/command-line
+func handleLSPRef(e *Editor) {
+	if !isGoFile(e.Path) {
+		return
+	}
+	// flush buffer to disk before running gopls
+	if e.Buffer.Dirty {
+		if err := e.Buffer.Save(); err != nil {
+			log.Print(err)
+			e.message = err.Error()
+			return
+		}
+	}
+
+	now := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "gopls", "references", fmt.Sprintf("%s:%d:%d",
+		e.Path, e.Cursor.Row+1, e.Cursor.Col+1))
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		log.Print(err)
+		e.message = err.Error()
+		return
+	}
+	log.Printf("run %q in %.2fs:\n%s", cmd, time.Since(now).Seconds(), string(out))
+	rawLines := strings.Split(string(out), "\n")
+	if len(rawLines) == 0 {
+		return
+	}
+	locations := make([]PositionLSP, 0, len(rawLines))
+	for _, line := range rawLines {
+		p, err := ParsePositionLSP(line)
+		if err != nil {
+			continue
+		}
+		locations = append(locations, p)
+	}
+	e.locations = LocationList{Active: true, Items: locations}
+}
+
+// drawLocationList renders the input field and popup overlay menu above row y.
+func (e *Editor) drawLocationList(f *kero.Frame, y, width int) {
+	if !e.locations.Active {
+		return
+	}
+
+	style := kero.NewStyle().Reverse()
+
+	// Calculate visible window bounds
+	total := len(e.locations.Items)
+	if total == 0 {
+		return
+	}
+	visibleRows := min(total, 10)
+
+	// Calculate scrolling offset to keep selected item inside dropdown viewport
+	offset := 0
+	if e.locations.Index >= visibleRows {
+		offset = e.locations.Index - visibleRows + 1
+	}
+
+	// 3. Fill background for dropdown overlay rendered directly above row y
+	headerRow := 1
+	rect := kero.Rect{X: 0, Y: y - visibleRows, W: width, H: visibleRows + headerRow}
+	f.Fill(rect, ' ', style)
+	// 4. Render header
+	f.Write(rect.X, rect.Y, "References:", style)
+
+	// 5. Render item rows
+	for i := range visibleRows {
+		idx := i + offset
+		if idx >= total {
+			break
+		}
+
+		item := e.locations.Items[idx]
+		lineY := rect.Y + headerRow + i
+
+		indicator := "  "
+		itemStyle := style
+		if idx == e.locations.Index {
+			indicator = " >"
+			itemStyle = itemStyle.Bold()
+		}
+
+		text := fmt.Sprintf("%s %s: %s", indicator, filepath.Base(item.Path), string(e.Lines[item.Line-1]))
+		runes := []rune(text)
+
+		if len(runes) > width {
+			text = string(runes[:width])
+		}
+		f.Write(rect.X, lineY, text, itemStyle)
+	}
+}
+
+func handleNextLocation(e *Editor) {
+	p := e.locations.Next()
+	e.recordJump()
+	if err := e.OpenFile(p.Path); err != nil {
+		log.Print(err)
+		e.message = err.Error()
+		return
+	}
+	e.Cursor = Position{Row: p.Line - 1, Col: p.StartColumn - 1}
+	e.showCursorCenter()
+}
+
+func handlePrevLocation(e *Editor) {
+	p := e.locations.Prev()
+	e.recordJump()
+	if err := e.OpenFile(p.Path); err != nil {
+		log.Print(err)
+		e.message = err.Error()
+		return
+	}
+	e.Cursor = Position{Row: p.Line - 1, Col: p.StartColumn - 1}
 	e.showCursorCenter()
 }
