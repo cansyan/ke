@@ -299,6 +299,9 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 			e.GotoDefinition()
 			e.showCursorCenter()
 			return nil
+		case "ctrl+shift+g":
+			handleLSPDef(e)
+			return nil
 		case "ctrl+p":
 			e.palette.Open(ctx, e, "")
 			return nil
@@ -3115,7 +3118,7 @@ func (p *Palette) commandItems(_ *Editor, query string) []PaletteItem {
 		{"prev buffer", "", func(e *Editor) {
 			e.PrevBuffer()
 		}},
-		{"LSP: definition", "", handleLSPDef},
+		{"LSP: definition", "ctrl+shift+g", handleLSPDef},
 		{"LSP: rename", "", func(e *Editor) {
 			if !isGoFile(e.Path) {
 				return
@@ -3256,21 +3259,20 @@ func (p *Palette) fileItems(e *Editor, query string) []PaletteItem {
 		}
 
 		// Don't re-add files already listed as open buffers
-		if openPaths[path] {
+		absPath, _ := filepath.Abs(path)
+		if openPaths[absPath] {
 			return nil
 		}
 
-		cleanPath := filepath.Clean(path)
-		if query != "" && !strings.Contains(strings.ToLower(cleanPath), lowerQuery) {
+		if query != "" && !strings.Contains(strings.ToLower(absPath), lowerQuery) {
 			return nil
 		}
 
-		filePath := cleanPath
 		items = append(items, PaletteItem{
-			Label: filepath.Base(filePath),
+			Label: filepath.Base(absPath),
 			Action: func(ed *Editor) {
 				ed.recordJump()
-				ed.OpenFile(filePath)
+				ed.OpenFile(absPath)
 			},
 		})
 
