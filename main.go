@@ -260,7 +260,7 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 			c := &e.completion
 			c.Refresh(e.Buffer.NewReader(), word)
 			if len(c.Items) == 1 {
-				// only 1 alternative, apply it early
+				// only 1 candidates, apply it early
 				cursor := e.DeleteRange(start, end)
 				e.Cursor = e.Insert(cursor, c.Items[c.Index].Name)
 				e.markDirty()
@@ -869,8 +869,7 @@ func (e *Editor) deleteSelect() {
 	if !e.hasSelect() {
 		return
 	}
-	start, end := orderPos(e.SelAnchor, e.Cursor)
-	e.Cursor = e.Buffer.DeleteRange(start, end)
+	e.Cursor = e.Buffer.DeleteRange(e.SelAnchor, e.Cursor)
 	e.Selecting = false
 	e.markDirty()
 }
@@ -1173,13 +1172,11 @@ func (e *Editor) replaceCurrent() error {
 		return nil
 	}
 
-	start := e.findMatchStart
-	replacedEnd := e.Buffer.DeleteRange(start, e.findMatchEnd)
-	replacedEnd = e.Buffer.Insert(replacedEnd, e.replaceInput.String())
+	replacedEnd := e.ReplaceRange(e.findMatchStart, e.findMatchEnd, e.replaceInput.String())
 	e.markDirty()
 	e.Cursor = replacedEnd
 	e.findMatch = false
-	if e.replaceInput.String() == query && replacedEnd.Col < e.Buffer.LineEnd(replacedEnd).Col {
+	if e.replaceInput.String() == query && replacedEnd.Col < e.LineEnd(replacedEnd).Col {
 		replacedEnd.Col++
 		e.Cursor = replacedEnd
 	}
@@ -1605,10 +1602,10 @@ func (t TextInput) Draw(f *kero.Frame, r kero.Rect, s kero.Style) {
 	}
 }
 
-// Position represents the buffer character index
+// Position represents coordinate within a file
 type Position struct {
 	Row int // line index, starting at 0
-	Col int // column index, starting at 0
+	Col int // rune index within the line, starting at 0
 }
 
 type Buffer struct {
@@ -1695,7 +1692,7 @@ func (b *Buffer) String() string {
 	return sb.String()
 }
 
-// InsertAt inserts text at the given position and returns the new cursor position.
+// Insert inserts text at the given position and returns the new cursor position.
 func (b *Buffer) Insert(p Position, text string) Position {
 	if p.Row < 0 || p.Row >= len(b.Lines) {
 		return p
@@ -1709,59 +1706,69 @@ func (b *Buffer) Insert(p Position, text string) Position {
 		p.Col = len(line)
 	}
 
-	insertLines := strings.Split(text, "\n")
+	prefix := string(line[:p.Col])
+	suffix := string(line[p.Col:])
+	newLines := strings.Split(prefix+text+suffix, "\n")
 
 	// Single-line insertion fast path
-	if len(insertLines) == 1 {
-		runesToInsert := []rune(insertLines[0])
-		newLine := make([]rune, 0, len(line)+len(runesToInsert))
-		newLine = append(newLine, line[:p.Col]...)
-		newLine = append(newLine, runesToInsert...)
-		newLine = append(newLine, line[p.Col:]...)
-
-		b.Lines[p.Row] = newLine
-
+	if len(newLines) == 1 {
+		b.Lines[p.Row] = []rune(newLines[0])
 		return Position{
 			Row: p.Row,
-			Col: p.Col + len(runesToInsert),
+			Col: p.Col + len([]rune(text)),
 		}
 	}
 
-	// Multi-line insertion path
-	prefix := line[:p.Col]
-	suffix := line[p.Col:]
-
-	firstInsert := []rune(insertLines[0])
-	lastInsert := []rune(insertLines[len(insertLines)-1])
-
-	// First line gets prefix + first line of inserted text
-	firstLine := append([]rune{}, prefix...)
-	firstLine = append(firstLine, firstInsert...)
-
-	// Last line gets last line of inserted text + suffix
-	lastLine := append([]rune{}, lastInsert...)
-	lastLine = append(lastLine, suffix...)
-
-	// Prepare middle lines (if any)
-	newSegment := make([][]rune, 0, len(insertLines))
-	newSegment = append(newSegment, firstLine)
-
-	for i := 1; i < len(insertLines)-1; i++ {
-		newSegment = append(newSegment, []rune(insertLines[i]))
+	updated := make([][]rune, 0, len(b.Lines)+len(newLines)-1)
+	updated = append(updated, b.Lines[:p.Row]...)
+	for i := range newLines {
+		updated = append(updated, []rune(newLines[i]))
 	}
-	newSegment = append(newSegment, lastLine)
+	updated = append(updated, b.Lines[p.Row+1:]...)
 
-	// Replace target line with the expanded multi-line segment
-	finalLines := make([][]rune, 0, len(b.Lines)+len(insertLines)-1)
-	finalLines = append(finalLines, b.Lines[:p.Row]...)
-	finalLines = append(finalLines, newSegment...)
-	finalLines = append(finalLines, b.Lines[p.Row+1:]...)
-
-	b.Lines = finalLines
+	b.Lines = updated
 
 	return Position{
-		Row: p.Row + len(insertLines) - 1,
-		Col: len(lastInsert),
+		Row: p.Row + len(newLines) - 1,
+		Col: len([]rune(newLines[len(newLines)-1])) - len([]rune(suffix)),
+	}
+}
+
+func (b *Buffer) ReplaceRange(start, end Position, newText string) Position {
+	// Boundary safety checks
+	if start.Row < 0 || start.Row >= len(b.Lines) {
+		return start
+	}
+	if end.Row >= len(b.Lines) {
+		end.Row = len(b.Lines) - 1
+		end.Col = len(b.Lines[end.Row])
+	}
+
+	// 1. Extract prefix before startCol and suffix after endCol
+	prefix := string(b.Lines[start.Row])[:start.Col]
+	suffix := string(b.Lines[end.Row])[end.Col:]
+
+	// 2. Split replacement text into lines
+	newLines := strings.Split(prefix+newText+suffix, "\n")
+
+	// 3. inline replace, return early
+	if start.Row == end.Row && len(newLines) == 1 {
+		b.Lines[start.Row] = []rune(newLines[0])
+		return Position{Row: start.Row, Col: start.Col + len([]rune(newText))}
+	}
+
+	// 4. Splice newLines into b.Lines slice, replacing range [startLine : endLine+1]
+	updated := make([][]rune, 0, len(b.Lines)-(end.Row-start.Row+1)+len(newLines))
+	updated = append(updated, b.Lines[:start.Row]...)
+	for i := range newLines {
+		updated = append(updated, []rune(newLines[i]))
+	}
+	updated = append(updated, b.Lines[end.Row+1:]...)
+
+	b.Lines = updated
+	return Position{
+		Row: start.Row + len(newLines) - 1,
+		Col: len([]rune(newLines[len(newLines)-1])) - len([]rune(suffix)),
 	}
 }
 
@@ -1834,7 +1841,6 @@ func (b *Buffer) GetRange(p1, p2 Position) string {
 // DeleteRange removes text between two positions [p1, p2) and returns the new cursor position.
 func (b *Buffer) DeleteRange(p1, p2 Position) Position {
 	start, end := orderPos(b.ClampPos(p1), b.ClampPos(p2))
-
 	if start == end {
 		return start
 	}
