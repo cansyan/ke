@@ -56,10 +56,15 @@ Mouse motions:
 - mouse_left_drag expand selection
 - ctrl+mouse_left_release goto definition
 
-Design Choices:
+Technical decisions:
 - using key ctrl+[, ctrl+d, ctrl+c is ok with Kitty protocol enabled
 - future key chords, Ctrl+K or Ctrl+X as leader key are good, but both taken. 
 - did consider Ctrl+Shift+P for command palette, but the key combo seems unreliable in practice
 - early version should keep things tiny, avoid duplicate selection, mutilple cursor, undo/redo
 - using / as command prefix is more convenient than > (shift+.)
 - in-process semantics checking ignores external file/module, benefits instant feedback
+- about LSP, it's convenient to use gopls cli commands, skipping massive details of LSP communications. 
+	Though running external commands increases latency, but still worth.
+
+TODO:
+- implement a location list, fill with Reference, Diagnostic, navigate with key ctrl+[ and ctrl+]

@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"fmt"
 	"go/ast"
 	"go/format"
@@ -14,6 +15,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -128,6 +130,9 @@ type Editor struct {
 	jumps JumpList
 
 	completion Completion
+
+	renaming    bool
+	renameInput TextInput
 }
 
 func (e *Editor) Init(ctx *kero.Context) error {
@@ -243,6 +248,10 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 	}
 	if e.palette.Active {
 		e.updatePalette(key)
+		return nil
+	}
+	if e.renaming {
+		e.updateRename(key)
 		return nil
 	}
 
@@ -735,6 +744,10 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 			e.drawFind(f, messageY, ctx.Width)
 			return
 		}
+		if e.renaming {
+			e.drawRename(f, messageY, ctx.Width)
+			return
+		}
 		if e.palette.Active {
 			e.drawPalette(f, messageY, ctx.Width)
 			return
@@ -976,7 +989,11 @@ func (e *Editor) finishSaveAs() error {
 		return nil
 	}
 
-	e.Path = path
+	p, err := filepath.Abs(path)
+	if err != nil {
+		return err
+	}
+	e.Path = p
 	e.saveAs = false
 	return e.save()
 }
@@ -1609,7 +1626,7 @@ type Position struct {
 }
 
 type Buffer struct {
-	Path   string
+	Path   string   // absolute path
 	Lines  [][]rune // Using [][]rune handles multi-byte UTF-8 correctly
 	Cursor Position
 	Dirty  bool
@@ -2700,14 +2717,14 @@ func formatReceiver(expr ast.Expr) string {
 
 // OpenFile loads a file into memory or focuses it if already loaded.
 func (e *Editor) OpenFile(path string) error {
-	var buf *Buffer
-
-	if path != "" {
-		path = filepath.Clean(path)
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return err
 	}
+
 	// switch to existing buffer
 	for i, buf := range e.buffers {
-		if buf.Path == path {
+		if buf.Path == absPath {
 			e.active = i
 			e.Buffer = buf
 			e.diags = nil
@@ -2718,8 +2735,7 @@ func (e *Editor) OpenFile(path string) error {
 		}
 	}
 
-	var err error
-	buf, err = loadBuffer(path)
+	buf, err := loadBuffer(absPath)
 	if err != nil {
 		return err
 	}
@@ -2785,12 +2801,16 @@ func loadBuffer(path string) (*Buffer, error) {
 		}, nil
 	}
 
-	cleanPath := filepath.Clean(path)
-	file, err := os.Open(cleanPath)
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return nil, err
+	}
+
+	file, err := os.Open(absPath)
 	if os.IsNotExist(err) {
 		// New/unsaved file: initialize with one empty line
 		return &Buffer{
-			Path:  cleanPath,
+			Path:  absPath,
 			Lines: [][]rune{[]rune("")},
 		}, nil
 	} else if err != nil {
@@ -2809,7 +2829,7 @@ func loadBuffer(path string) (*Buffer, error) {
 	}
 
 	return &Buffer{
-		Path:  cleanPath,
+		Path:  absPath,
 		Lines: lines,
 	}, nil
 }
@@ -3109,17 +3129,32 @@ func (p *Palette) commandItems(_ *Editor, query string) []PaletteItem {
 			e.JumpForward()
 			e.showCursorCenter()
 		}},
-		{"next buffer", "ctrl+]", func(e *Editor) {
+		{"next buffer", "", func(e *Editor) {
 			e.NextBuffer()
 		}},
-		{"prev buffer", "ctrl+[", func(e *Editor) {
+		{"prev buffer", "", func(e *Editor) {
 			e.PrevBuffer()
+		}},
+		{"LSP: definition", "", handleLSPDef},
+		{"LSP: rename", "", func(e *Editor) {
+			if !isGoFile(e.Path) {
+				return
+			}
+			e.startRename()
 		}},
 	}
 
 	var items []PaletteItem
 	for _, c := range commands {
-		if query != "" && !strings.Contains(c.cmd, query) {
+		match := true
+		parts := strings.Fields(query)
+		for _, q := range parts {
+			if !strings.Contains(strings.ToLower(c.cmd), strings.ToLower(q)) {
+				match = false
+				break
+			}
+		}
+		if !match {
 			continue
 		}
 
@@ -3416,4 +3451,127 @@ func (e *Editor) drawCompletion(f *kero.Frame) {
 			f.Write(rect.X, y, "  "+c.Items[i+offset].String(), normal.Reverse())
 		}
 	}
+}
+
+func (e *Editor) startRename() {
+	e.renaming = true
+	start, end := e.Buffer.WordBounds(e.Cursor)
+	symbol := e.Buffer.GetRange(start, end)
+	e.renameInput.SetTextAndSelectAll(symbol)
+}
+
+func (e *Editor) updateRename(ev kero.KeyEvent) {
+	switch ev.Key {
+	case kero.KeyEsc:
+		e.renaming = false
+	case kero.KeyEnter:
+		newName := e.renameInput.String()
+		// try save
+		if e.Buffer.Dirty {
+			if err := e.Buffer.Save(); err != nil {
+				log.Print(err)
+				e.message = err.Error()
+				return
+			}
+		}
+
+		now := time.Now()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		// gopls rename helper/helper.go:8:6 Foo
+		cmd := exec.CommandContext(ctx, "gopls", "rename", fmt.Sprintf("%s:%d:%d",
+			e.Path, e.Cursor.Row+1, e.Cursor.Col+1), newName)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			log.Print(err)
+			e.message = err.Error()
+			return
+		}
+		log.Printf("run %q in %.2fs", cmd, time.Since(now).Seconds())
+
+		// reset buffer
+		rawLines := strings.Split(string(out), "\n")
+		lines := make([][]rune, len(rawLines))
+		for i, l := range rawLines {
+			lines[i] = []rune(l)
+		}
+		e.Buffer.Lines = lines
+		e.Cursor = e.Buffer.ClampPos(e.Cursor)
+		e.diags = nil
+		log.Print("update buffer")
+		e.renaming = false
+		e.Buffer.Dirty = true
+	default:
+		e.renameInput.Update(ev)
+	}
+}
+
+func (e *Editor) drawRename(f *kero.Frame, y int, width int) {
+	normal := kero.NewStyle()
+	prompt := " Rename: "
+	f.Write(0, y, trimToWidth(prompt, width), normal)
+	inputX := len([]rune(prompt))
+	if inputX >= width {
+		return
+	}
+	e.renameInput.Draw(f, kero.Rect{X: inputX, Y: y, W: width - inputX, H: 1}, normal)
+}
+
+func handleLSPDef(e *Editor) {
+	if !isGoFile(e.Path) {
+		return
+	}
+	// flush buffer to disk before running gopls
+	if e.Buffer.Dirty {
+		if err := e.Buffer.Save(); err != nil {
+			log.Print(err)
+			e.message = err.Error()
+			return
+		}
+	}
+
+	// For example, run:
+	//   gopls definition main.go:33:2
+	// ouput:
+	//   /Users/cse/code/ke/main.go:33:2-7: defined here as var parts []string
+	now := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "gopls", "definition", fmt.Sprintf("%s:%d:%d",
+		e.Path, e.Cursor.Row+1, e.Cursor.Col+1))
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		log.Print(err)
+		e.message = err.Error()
+		return
+	}
+	log.Printf("run %q in %.2fs:\n%s", cmd, time.Since(now).Seconds(), string(out))
+	parts := strings.Split(string(out), ":")
+	if len(parts) < 3 {
+		return
+	}
+	path := parts[0]
+	var row int
+	lineNo, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return
+	}
+	row = lineNo - 1
+	var col int
+	if startCol, _, ok := strings.Cut(parts[2], "-"); ok {
+		i, err := strconv.Atoi(startCol)
+		if err != nil {
+			return
+		}
+		col = i - 1
+	}
+
+	e.recordJump()
+	if err := e.OpenFile(path); err != nil {
+		log.Print(err)
+		e.message = err.Error()
+		return
+	}
+	e.Cursor = Position{Row: row, Col: col}
+	e.showCursorCenter()
 }
