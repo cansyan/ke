@@ -3757,22 +3757,24 @@ func handleLSPRef(e *Editor) {
 
 // drawLocationList renders the input field and popup overlay menu above row y.
 func (e *Editor) drawLocationList(f *kero.Frame, y, width int) {
-	if !e.locations.Active {
+	loc := e.locations
+	if !loc.Active || len(loc.Items) == 0 {
 		return
 	}
 
 	style := kero.NewStyle().Reverse()
 
 	// Calculate visible window bounds
-	total := len(e.locations.Items)
-	visibleRows := e.locations.VisibleRows()
+	total := len(loc.Items)
+	visibleRows := loc.VisibleRows()
 
 	// 3. Fill background for dropdown overlay rendered directly above row y
 	headerRow := 1
 	rect := kero.Rect{X: 0, Y: y - visibleRows, W: width, H: visibleRows + headerRow}
 	f.Fill(rect, ' ', style)
 	// 4. Render header
-	start, end := e.WordBounds(e.Cursor)
+	start := Position{Row: loc.Items[0].Line - 1, Col: loc.Items[0].StartColumn - 1}
+	end := Position{Row: loc.Items[0].Line - 1, Col: loc.Items[0].EndColumn - 1}
 	query := e.GetRange(start, end)
 	f.Write(rect.X, rect.Y, fmt.Sprintf(" %d references for %q", total, query), style)
 
@@ -3793,17 +3795,17 @@ func (e *Editor) drawLocationList(f *kero.Frame, y, width int) {
 
 	// 5. Render item rows
 	for i := range visibleRows {
-		idx := i + e.locations.Offset
+		idx := i + loc.Offset
 		if idx >= total {
 			break
 		}
 
-		item := e.locations.Items[idx]
+		item := loc.Items[idx]
 		lineY := rect.Y + headerRow + i
 
 		indicator := "  "
 		itemStyle := style
-		if idx == e.locations.Index {
+		if idx == loc.Index {
 			indicator = " >"
 			itemStyle = itemStyle.Bold()
 		}
@@ -3825,6 +3827,9 @@ func (e *Editor) drawLocationList(f *kero.Frame, y, width int) {
 }
 
 func handleNextLocation(e *Editor) {
+	if len(e.locations.Items) == 0 {
+		return
+	}
 	p := e.locations.Next()
 	e.recordJump()
 	if err := e.OpenFile(p.Path); err != nil {
@@ -3837,6 +3842,9 @@ func handleNextLocation(e *Editor) {
 }
 
 func handlePrevLocation(e *Editor) {
+	if len(e.locations.Items) == 0 {
+		return
+	}
 	p := e.locations.Prev()
 	e.recordJump()
 	if err := e.OpenFile(p.Path); err != nil {

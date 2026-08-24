@@ -66,5 +66,3 @@ Technical decisions:
 - about LSP, it's convenient to use gopls cli commands, skipping massive details of LSP communications. 
 	Though running external commands increases latency, but still worth.
 
-TODO:
-- implement a location list, fill with Reference, Diagnostic, navigate with key ctrl+[ and ctrl+]
