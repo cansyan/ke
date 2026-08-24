@@ -31,8 +31,8 @@ Key bindings:
 - Ctrl+A or Home move cursor to line start
 - Ctrl+E or End move cursor to line end
 - Ctrl+W close buffer
-- Ctrl+[ previous buffer
-- Ctrl+] next buffer
+- Ctrl+[ goto previous item of location list
+- Ctrl+] goto next item of location list
 - Ctrl+- jump back
 - Ctrl+Shift+- jump forward
 - Ctrl+N trigger completion
