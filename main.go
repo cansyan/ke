@@ -1419,6 +1419,9 @@ func (e *Editor) bufferH() int {
 	if h < 0 {
 		return 0
 	}
+	if e.locations.Active {
+		h -= min(len(e.locations.Items), 10)
+	}
 	return h
 }
 
@@ -3703,7 +3706,9 @@ func (e *Editor) drawLocationList(f *kero.Frame, y, width int) {
 	rect := kero.Rect{X: 0, Y: y - visibleRows, W: width, H: visibleRows + headerRow}
 	f.Fill(rect, ' ', style)
 	// 4. Render header
-	f.Write(rect.X, rect.Y, "References:", style)
+	start, end := e.WordBounds(e.Cursor)
+	query := e.GetRange(start, end)
+	f.Write(rect.X, rect.Y, fmt.Sprintf(" %d references for %q", total, query), style)
 
 	// 5. Render item rows
 	for i := range visibleRows {
@@ -3722,7 +3727,7 @@ func (e *Editor) drawLocationList(f *kero.Frame, y, width int) {
 			itemStyle = itemStyle.Bold()
 		}
 
-		text := fmt.Sprintf("%s %s: %s", indicator, filepath.Base(item.Path), string(e.Lines[item.Line-1]))
+		text := fmt.Sprintf("%s %s:%d:%d: %s", indicator, filepath.Base(item.Path), item.Line, item.StartColumn, string(e.Lines[item.Line-1]))
 		runes := []rune(text)
 
 		if len(runes) > width {
