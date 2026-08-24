@@ -190,30 +190,57 @@ func (e *Editor) cursorFromMouse(m kero.MouseEvent) Position {
 func (e *Editor) handleMouse(m kero.MouseEvent) error {
 	switch m.Button {
 	case kero.MouseWheelUp:
-		e.TopRow = max(0, e.TopRow-1)
+		if m.Y < e.bufferH() {
+			e.TopRow = max(0, e.TopRow-1)
+			return nil
+		}
+		if e.locations.Active {
+			e.locations.Offset = max(0, e.locations.Offset-1)
+		}
 	case kero.MouseWheelDown:
-		e.TopRow = min(e.TopRow+1, len(e.Lines)-e.bufferH())
+		if m.Y < e.bufferH() {
+			e.TopRow = min(e.TopRow+1, len(e.Lines)-e.bufferH())
+			return nil
+		}
+		if e.locations.Active {
+			loc := e.locations
+			e.locations.Offset = min(loc.Offset+1, len(loc.Items)-loc.VisibleRows())
+		}
 	case kero.MouseLeft:
 		switch m.Action {
 		case kero.MousePress:
-			if m.Y >= e.bufferH() {
-				// out of viewport
+			if m.Y < e.bufferH() {
+				e.Cursor = e.cursorFromMouse(m)
+				if e.hasSelect() {
+					e.clearSelect()
+				}
 				return nil
 			}
-			e.Cursor = e.cursorFromMouse(m)
-			if e.hasSelect() {
-				e.clearSelect()
+			if e.locations.Active {
+				index := m.Y - e.bufferH() - 1 + e.locations.Offset
+				if index < 0 || index >= len(e.locations.Items) {
+					return nil
+				}
+				e.recordJump()
+				e.locations.Index = index
+				p := e.locations.Items[index]
+				if err := e.OpenFile(p.Path); err != nil {
+					log.Print(err)
+					e.message = err.Error()
+					return nil
+				}
+				e.Cursor = Position{Row: p.Line - 1, Col: p.StartColumn - 1}
+				e.showCursorCenter()
 			}
 		case kero.MouseRelease:
-			if m.Y >= e.bufferH() {
-				// out of viewport
+			if m.Y < e.bufferH() {
+				// ctrl+mouse_left_release goto definition
+				if m.Mod == kero.ModCtrl {
+					e.recordJump()
+					e.GotoDefinition()
+					e.showCursorCenter()
+				}
 				return nil
-			}
-			// ctrl+mouse_left_release goto definition
-			if m.Mod == kero.ModCtrl {
-				e.recordJump()
-				e.GotoDefinition()
-				e.showCursorCenter()
 			}
 		case kero.MouseDrag:
 			if last, ok := e.lastEvent.(kero.MouseEvent); ok &&
@@ -1636,7 +1663,7 @@ type Buffer struct {
 	SelAnchor Position // selection at [e.selAnchor, e.pos)
 }
 
-func NewBuffer(content string) *Buffer {
+func BufferFromString(content string) *Buffer {
 	rawLines := strings.Split(content, "\n")
 	lines := make([][]rune, len(rawLines))
 	for i, l := range rawLines {
@@ -2732,7 +2759,7 @@ func (e *Editor) OpenFile(path string) error {
 		}
 	}
 
-	buf, err := loadBuffer(absPath)
+	buf, err := BufferFromFile(absPath)
 	if err != nil {
 		return err
 	}
@@ -2788,9 +2815,9 @@ func (e *Editor) PrevBuffer() {
 	}
 }
 
-// loadBuffer opens a file and prepares a Buffer struct.
+// BufferFromFile opens a file and prepares a Buffer struct.
 // If the file does not exist, it creates a new empty buffer associated with that path.
-func loadBuffer(path string) (*Buffer, error) {
+func BufferFromFile(path string) (*Buffer, error) {
 	if path == "" {
 		return &Buffer{
 			Path:  "",
@@ -3479,8 +3506,15 @@ func (e *Editor) updateRename(ev kero.KeyEvent) {
 		now := time.Now()
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		// gopls rename helper/helper.go:8:6 Foo
-		cmd := exec.CommandContext(ctx, "gopls", "rename", fmt.Sprintf("%s:%d:%d",
+		/*
+			For example run:
+				gopls rename -w -l main.go:1639:6 NewBufferX
+			Output:
+				/Users/aha/code/ke/editor_test.go
+				/Users/aha/code/ke/buffer_test.go
+				/Users/aha/code/ke/main.go
+		*/
+		cmd := exec.CommandContext(ctx, "gopls", "rename", "-w", "-l", fmt.Sprintf("%s:%d:%d",
 			e.Path, e.Cursor.Row+1, e.Cursor.Col+1), newName)
 		out, err := cmd.CombinedOutput()
 		if err != nil {
@@ -3488,20 +3522,33 @@ func (e *Editor) updateRename(ev kero.KeyEvent) {
 			e.message = err.Error()
 			return
 		}
-		log.Printf("run %q in %.2fs", cmd, time.Since(now).Seconds())
+		log.Printf("run %q in %.2fs:\n%s", cmd, time.Since(now).Seconds(), string(out))
 
-		// reset buffer
-		rawLines := strings.Split(string(out), "\n")
-		lines := make([][]rune, len(rawLines))
-		for i, l := range rawLines {
-			lines[i] = []rune(l)
+		// reload buffer
+		editedFiles := strings.Split(string(out), "\n")
+		for i := range editedFiles {
+			for j := range e.buffers {
+				oldBuf := e.buffers[j]
+				if oldBuf.Path != editedFiles[i] {
+					continue
+				}
+				newBuf, err := BufferFromFile(editedFiles[i])
+				if err != nil {
+					log.Print(err)
+					continue
+				}
+				newBuf.Cursor = newBuf.ClampPos(oldBuf.Cursor)
+				newBuf.TopRow = oldBuf.TopRow
+				newBuf.LeftCol = oldBuf.LeftCol
+				e.buffers[j] = newBuf
+				if j == e.active {
+					e.Buffer = newBuf
+				}
+				break
+			}
 		}
-		e.Buffer.Lines = lines
-		e.Cursor = e.Buffer.ClampPos(e.Cursor)
 		e.diags = nil
-		log.Print("update buffer")
 		e.renaming = false
-		e.Buffer.Dirty = true
 	default:
 		e.renameInput.Update(ev)
 	}
@@ -3564,30 +3611,58 @@ func handleLSPDef(e *Editor) {
 }
 
 type LocationList struct {
-	Active bool
-	Index  int
-	Items  []PositionLSP
+	Active  bool
+	Index   int
+	Items   []PositionLSP
+	Offset  int // vertical scrolling
+	MaxRows int // UI render cap (e.g., 10 items)
+}
+
+func (ls *LocationList) VisibleRows() int {
+	maxRows := ls.MaxRows
+	if maxRows == 0 {
+		maxRows = 10
+	}
+	return min(len(ls.Items), maxRows)
 }
 
 func (ls *LocationList) Next() PositionLSP {
-	if len(ls.Items) == 0 {
+	total := len(ls.Items)
+	if total == 0 {
 		return PositionLSP{}
 	}
-	if len(ls.Items) == 1 {
+	if total == 1 {
 		return ls.Items[0]
 	}
-	ls.Index = (ls.Index + 1) % len(ls.Items)
+	ls.Index = (ls.Index + 1) % total
+
+	// Calculate scrolling offset to keep selected item inside dropdown viewport
+	visibleRows := ls.VisibleRows()
+	offset := 0
+	if ls.Index >= visibleRows {
+		offset = ls.Index - visibleRows + 1
+	}
+	ls.Offset = offset
 	return ls.Items[ls.Index]
 }
 
 func (ls *LocationList) Prev() PositionLSP {
-	if len(ls.Items) == 0 {
+	total := len(ls.Items)
+	if total == 0 {
 		return PositionLSP{}
 	}
-	if len(ls.Items) == 1 {
+	if total == 1 {
 		return ls.Items[0]
 	}
-	ls.Index = (ls.Index - 1 + len(ls.Items)) % len(ls.Items)
+	ls.Index = (ls.Index - 1 + total) % total
+
+	// Calculate scrolling offset to keep selected item inside dropdown viewport
+	visibleRows := ls.VisibleRows()
+	offset := 0
+	if ls.Index >= visibleRows {
+		offset = ls.Index - visibleRows + 1
+	}
+	ls.Offset = offset
 	return ls.Items[ls.Index]
 }
 
@@ -3677,7 +3752,7 @@ func handleLSPRef(e *Editor) {
 		}
 		locations = append(locations, p)
 	}
-	e.locations = LocationList{Active: true, Items: locations}
+	e.locations = LocationList{Active: true, Items: locations, MaxRows: 10}
 }
 
 // drawLocationList renders the input field and popup overlay menu above row y.
@@ -3690,16 +3765,7 @@ func (e *Editor) drawLocationList(f *kero.Frame, y, width int) {
 
 	// Calculate visible window bounds
 	total := len(e.locations.Items)
-	if total == 0 {
-		return
-	}
-	visibleRows := min(total, 10)
-
-	// Calculate scrolling offset to keep selected item inside dropdown viewport
-	offset := 0
-	if e.locations.Index >= visibleRows {
-		offset = e.locations.Index - visibleRows + 1
-	}
+	visibleRows := e.locations.VisibleRows()
 
 	// 3. Fill background for dropdown overlay rendered directly above row y
 	headerRow := 1
@@ -3710,9 +3776,24 @@ func (e *Editor) drawLocationList(f *kero.Frame, y, width int) {
 	query := e.GetRange(start, end)
 	f.Write(rect.X, rect.Y, fmt.Sprintf(" %d references for %q", total, query), style)
 
+	buffers := e.buffers
+	getBuffer := func(path string) (*Buffer, error) {
+		for _, b := range buffers {
+			if b.Path == path {
+				return b, nil
+			}
+		}
+		b, err := BufferFromFile(path)
+		if err != nil {
+			return nil, err
+		}
+		buffers = append(buffers, b)
+		return b, nil
+	}
+
 	// 5. Render item rows
 	for i := range visibleRows {
-		idx := i + offset
+		idx := i + e.locations.Offset
 		if idx >= total {
 			break
 		}
@@ -3727,7 +3808,13 @@ func (e *Editor) drawLocationList(f *kero.Frame, y, width int) {
 			itemStyle = itemStyle.Bold()
 		}
 
-		text := fmt.Sprintf("%s %s:%d:%d: %s", indicator, filepath.Base(item.Path), item.Line, item.StartColumn, string(e.Lines[item.Line-1]))
+		buf, err := getBuffer(item.Path)
+		if err != nil {
+			log.Print(err)
+			continue
+		}
+		text := fmt.Sprintf("%s %s:%d:%d: %s", indicator, filepath.Base(item.Path), item.Line,
+			item.StartColumn, string(buf.Lines[item.Line-1]))
 		runes := []rune(text)
 
 		if len(runes) > width {

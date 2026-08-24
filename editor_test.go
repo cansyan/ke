@@ -8,7 +8,7 @@ import (
 )
 
 func TestDisplayColumn(t *testing.T) {
-	b := NewBuffer("a\tbc")
+	b := BufferFromString("a\tbc")
 	if got := b.VisualPos(Position{Col: 2}); got.Col != 4 {
 		t.Fatalf("VisualPos(Position{Row: 0, Col: 2}) = %+v, want col 4", got)
 	}
@@ -37,7 +37,7 @@ func TestCheckGoSemantics(t *testing.T) {
 }
 
 func TestEnsureCursorVisible_WithTabs(t *testing.T) {
-	buf := NewBuffer("\thello world")
+	buf := BufferFromString("\thello world")
 	buf.Cursor = Position{Row: 0, Col: 0}
 	// Mock width = 10 (marker + line number + space leaves textW = 7)
 	ed := &Editor{Buffer: buf, Width: 10, Height: 10}
@@ -65,7 +65,7 @@ func TestEnsureCursorVisible_WithTabs(t *testing.T) {
 }
 
 func TestMoveUpMoveDown_WithTabs(t *testing.T) {
-	buf := NewBuffer("\thello\nabcdefg")
+	buf := BufferFromString("\thello\nabcdefg")
 	buf.Cursor = Position{Row: 0, Col: 1} // on 'h' (display col 4)
 	ed := &Editor{
 		Buffer: buf,
@@ -91,7 +91,7 @@ func TestMoveUpMoveDown_WithTabs(t *testing.T) {
 }
 
 func TestTab_MultiLineSelection(t *testing.T) {
-	buf := NewBuffer("first line\nsecond line\nthird line")
+	buf := BufferFromString("first line\nsecond line\nthird line")
 	buf.Selecting = true
 	buf.SelAnchor = Position{Row: 0, Col: 2}
 	buf.Cursor = Position{Row: 1, Col: 6}
@@ -128,7 +128,7 @@ func TestTab_MultiLineSelection(t *testing.T) {
 }
 
 func TestTab_SingleLineSelection(t *testing.T) {
-	buf := NewBuffer("hello world")
+	buf := BufferFromString("hello world")
 	buf.Selecting = true
 	buf.SelAnchor = Position{Row: 0, Col: 0}
 	buf.Cursor = Position{Row: 0, Col: 5}
@@ -154,7 +154,7 @@ func TestTab_SingleLineSelection(t *testing.T) {
 }
 
 func TestShiftTab_UnindentSelection(t *testing.T) {
-	buf := NewBuffer("\tfirst line\n    second line\nthird line")
+	buf := BufferFromString("\tfirst line\n    second line\nthird line")
 	buf.Cursor = Position{Row: 1, Col: 7}
 	buf.Selecting = true
 	buf.SelAnchor = Position{Row: 0, Col: 3}
@@ -191,7 +191,7 @@ func TestShiftTab_UnindentSelection(t *testing.T) {
 }
 
 func TestShiftTab_UnindentLineWithoutSelection(t *testing.T) {
-	buf := NewBuffer("\thello world")
+	buf := BufferFromString("\thello world")
 	buf.Cursor = Position{Row: 0, Col: 6}
 	ed := &Editor{
 		Buffer: buf,
@@ -214,7 +214,7 @@ func TestShiftTab_UnindentLineWithoutSelection(t *testing.T) {
 }
 
 func TestStartSelectLine(t *testing.T) {
-	buf := NewBuffer("first line\nsecond line\nthird line")
+	buf := BufferFromString("first line\nsecond line\nthird line")
 	buf.Cursor = Position{Row: 0, Col: 3}
 	ed := &Editor{
 		Buffer: buf,
@@ -246,7 +246,7 @@ func TestStartSelectLine(t *testing.T) {
 }
 
 func TestWordUnderCursor(t *testing.T) {
-	buf := NewBuffer("func (e *Editor) finishCommand() error {")
+	buf := BufferFromString("func (e *Editor) finishCommand() error {")
 	buf.Cursor = Position{Row: 0, Col: 20} // on 'f' in finishCommand
 	ed := &Editor{
 		Buffer: buf,
@@ -262,7 +262,7 @@ func TestWordUnderCursor(t *testing.T) {
 }
 
 func TestGotoDefinition(t *testing.T) {
-	buf := NewBuffer(strings.Join([]string{
+	buf := BufferFromString(strings.Join([]string{
 		"package main",
 		"",
 		"type Editor struct {",
@@ -295,7 +295,7 @@ func TestGotoDefinition(t *testing.T) {
 }
 
 func TestReplaceCurrentAndSkip(t *testing.T) {
-	buf := NewBuffer("one two one three one")
+	buf := BufferFromString("one two one three one")
 	buf.Cursor = Position{Row: 0, Col: 0}
 	ed := &Editor{
 		Buffer: buf,
@@ -326,7 +326,7 @@ func TestReplaceCurrentAndSkip(t *testing.T) {
 
 func TestReplaceAll(t *testing.T) {
 	ed := &Editor{
-		Buffer: NewBuffer("Cat\ncatapult\nDOG"),
+		Buffer: BufferFromString("Cat\ncatapult\nDOG"),
 	}
 	ed.startFind()
 	ed.findInput.SetText("cat")

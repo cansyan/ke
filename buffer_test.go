@@ -3,7 +3,7 @@ package main
 import "testing"
 
 func TestFindNextWrapsWithinStartingLine(t *testing.T) {
-	buffer := NewBuffer("target middle\nother line")
+	buffer := BufferFromString("target middle\nother line")
 
 	start, end, ok := buffer.FindNext("target", Position{Row: 0, Col: 7})
 	if !ok {
@@ -16,7 +16,7 @@ func TestFindNextWrapsWithinStartingLine(t *testing.T) {
 }
 
 func TestFindPrevWrapsWithinStartingLine(t *testing.T) {
-	buffer := NewBuffer("target middle\nother line")
+	buffer := BufferFromString("target middle\nother line")
 
 	start, end, ok := buffer.FindPrev("target", Position{Row: 0, Col: 6})
 	if !ok {
@@ -29,7 +29,7 @@ func TestFindPrevWrapsWithinStartingLine(t *testing.T) {
 }
 
 func TestFindIgnoresCase(t *testing.T) {
-	buffer := NewBuffer("Target middle TARGET")
+	buffer := BufferFromString("Target middle TARGET")
 
 	start, end, ok := buffer.FindNextIgnoreCase("target", Position{Row: 0, Col: 0})
 	if !ok || start != (Position{Row: 0, Col: 0}) || end != (Position{Row: 0, Col: 6}) {
@@ -43,7 +43,7 @@ func TestFindIgnoresCase(t *testing.T) {
 }
 
 func TestFindAndReplaceAllAreCaseSensitive(t *testing.T) {
-	buffer := NewBuffer("Target target TARGET")
+	buffer := BufferFromString("Target target TARGET")
 
 	if _, _, ok := buffer.FindNext("target", Position{Row: 0, Col: 0}); !ok {
 		t.Fatal("FindNext() did not find the exact-case match")
