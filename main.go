@@ -3477,8 +3477,8 @@ func (ls *LocationList) Prev() Location {
 type Location struct {
 	Path  string
 	Start struct {
-		Line   int // starts at 1
-		Column int // starts at 1, measured in bytes of the UTF-8 encoding
+		Line   int // line number, starting at 1
+		Column int // column number, starting at 1 (byte count)
 	}
 	End struct{ Line, Column int }
 }
@@ -3513,25 +3513,27 @@ func ParseLocation(s string) (Location, error) {
 	return loc, nil
 }
 
-// convert 1-base byte offset of the UTF-8 encoding to 0-base rune index
-func byteOffsetToRuneIndex(line []rune, offset int) int {
+// convert 1-base column number (byte count) to 0-base rune index
+func byteColumnToRuneIndex(line string, column int) int {
 	var o int
-	for i, r := range line {
+	runes := []rune(line)
+	for i, r := range runes {
 		o += utf8.RuneLen(r)
-		if o >= offset {
+		if o >= column {
 			return i
 		}
 	}
-	return len(line) - 1
+	return len(runes) - 1
 }
 
-// convert 0-base rune index to 1-base byte offset of the UTF-8 encoding
-func runeIndexToByteOffset(line []rune, index int) int {
-	var offset int
+// convert 0-base rune index to 1-base column number (byte count)
+func runeIndexToByteColumn(line string, index int) int {
+	runes := []rune(line)
+	var column int
 	for i := range index {
-		offset += utf8.RuneLen(line[i])
+		column += utf8.RuneLen(runes[i])
 	}
-	return offset
+	return column
 }
 
 func (e *Editor) gotoLocation(l Location) {
@@ -3544,7 +3546,7 @@ func (e *Editor) gotoLocation(l Location) {
 	}
 	e.Cursor = Position{
 		Row: l.Start.Line - 1,
-		Col: byteOffsetToRuneIndex(e.Lines[l.Start.Line-1], l.Start.Column),
+		Col: byteColumnToRuneIndex(string(e.Lines[l.Start.Line-1]), l.Start.Column),
 	}
 	e.showCursorCenter()
 }
@@ -3661,9 +3663,10 @@ func (e *Editor) drawLocationList(f *kero.Frame, y, width int) {
 			continue
 		}
 
-		col := byteOffsetToRuneIndex(buf.Lines[item.Start.Line-1], item.Start.Column)
+		line := string(buf.Lines[item.Start.Line-1])
+		columnNo := byteColumnToRuneIndex(line, item.Start.Column) + 1
 		text := fmt.Sprintf("%s %s:%d:%d: %s", indicator, filepath.Base(item.Path), item.Start.Line,
-			col+1, string(buf.Lines[item.Start.Line-1]))
+			columnNo, line)
 		runes := []rune(text)
 
 		if len(runes) > width {
