@@ -63,6 +63,4 @@ Technical decisions:
 - early version should keep things tiny, avoid duplicate selection, mutilple cursor, undo/redo
 - using / as command prefix is more convenient than > (shift+.)
 - in-process semantics checking ignores external file/module, benefits instant feedback
-- about LSP, it's convenient to use gopls cli commands, skipping massive details of LSP communications. 
-	Though running external commands increases latency, but still worth.
-
+- using gopls cli commands, skipping massive details of LSP communications.

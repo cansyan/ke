@@ -197,6 +197,9 @@ func (e *Editor) handleMouse(m kero.MouseEvent) error {
 		if e.locations.Active {
 			e.locations.Offset = max(0, e.locations.Offset-1)
 		}
+		if e.palette.Active {
+			e.palette.Index = max(0, e.palette.Index-1)
+		}
 	case kero.MouseWheelDown:
 		if m.Y < e.bufferH() {
 			e.TopRow = min(e.TopRow+1, len(e.Lines)-e.bufferH())
@@ -205,6 +208,10 @@ func (e *Editor) handleMouse(m kero.MouseEvent) error {
 		if e.locations.Active {
 			loc := e.locations
 			e.locations.Offset = min(loc.Offset+1, len(loc.Items)-loc.VisibleRows())
+		}
+		if e.palette.Active {
+			p := e.palette
+			e.palette.Index = min(p.Index+1, len(p.Items)-min(len(p.Items), p.MaxRows))
 		}
 	case kero.MouseLeft:
 		switch m.Action {
@@ -217,12 +224,21 @@ func (e *Editor) handleMouse(m kero.MouseEvent) error {
 				return nil
 			}
 			if e.locations.Active {
-				index := m.Y - e.bufferH() - 1 + e.locations.Offset
+				index := m.Y - e.bufferH() - 1 + e.locations.Offset // minus 1 for header
 				if index < 0 || index >= len(e.locations.Items) {
 					return nil
 				}
 				e.locations.Index = index
 				e.gotoLocation(e.locations.Items[index])
+			}
+			if e.palette.Active && len(e.palette.Items) > 0 {
+				index := m.Y - e.bufferH() + e.palette.Offset
+				if index < 0 || index >= len(e.palette.Items) {
+					return nil
+				}
+				action := e.palette.Items[index].Action
+				e.palette.Close()
+				action(e) // Run selected action
 			}
 		case kero.MouseRelease:
 			if m.Y < e.bufferH() {
@@ -318,6 +334,9 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 			GotoDefinition(e)
 			return nil
 		case "ctrl+p":
+			if e.locations.Active {
+				e.locations.Active = false
+			}
 			e.palette.Open(ctx, e, "")
 			return nil
 		case "ctrl+[":
@@ -1438,7 +1457,10 @@ func (e *Editor) bufferH() int {
 		return 0
 	}
 	if e.locations.Active {
-		h -= min(len(e.locations.Items), 10)
+		h -= min(len(e.locations.Items), e.locations.MaxRows)
+	}
+	if e.palette.Active {
+		h -= min(len(e.palette.Items), e.palette.MaxRows)
 	}
 	return h
 }
@@ -2839,11 +2861,12 @@ type PaletteItem struct {
 
 // Palette manages state, input handling, and item rendering for the overlay.
 type Palette struct {
-	Active   bool
-	Input    TextInput
-	Items    []PaletteItem
-	Selected int // Highlighted item index
-	MaxRows  int // UI render cap (e.g., 10 items)
+	Active  bool
+	Input   TextInput
+	Items   []PaletteItem
+	Index   int // selected item
+	Offset  int // scrolling offset
+	MaxRows int // UI render cap (e.g., 10 items)
 }
 
 // Open initializes the palette with a starting prefix ("@", ":", "/", or "").
@@ -2852,7 +2875,7 @@ func (p *Palette) Open(ctx *kero.Context, e *Editor, prefix string) {
 	p.Input.Reset()
 	p.Input.SetText(prefix)
 	p.Input.Placeholder = "search file (@symbol, /command or :line)"
-	p.Selected = 0
+	p.Index = 0
 	p.MaxRows = 10
 	p.Refresh(e)
 }
@@ -2861,7 +2884,7 @@ func (p *Palette) Close() {
 	p.Active = false
 	p.Input.Reset()
 	p.Items = nil
-	p.Selected = 0
+	p.Index = 0
 }
 
 // Refresh updates p.Items based on the current input value.
@@ -2880,8 +2903,8 @@ func (p *Palette) Refresh(e *Editor) {
 	}
 
 	// Reset index bounds
-	if p.Selected >= len(p.Items) {
-		p.Selected = max(0, len(p.Items)-1)
+	if p.Index >= len(p.Items) {
+		p.Index = max(0, len(p.Items)-1)
 	}
 }
 
@@ -3038,16 +3061,35 @@ func (e *Editor) updatePalette(ev kero.KeyEvent) {
 	case kero.KeyEsc:
 		e.palette.Close()
 	case kero.KeyDown:
-		if len(e.palette.Items) > 0 {
-			e.palette.Selected = (e.palette.Selected + 1) % len(e.palette.Items)
+		total := len(e.palette.Items)
+		if total == 0 {
+			return
 		}
+		e.palette.Index = (e.palette.Index + 1) % total
+		// Calculate scrolling offset to keep selected item inside dropdown viewport
+		visibleRows := min(total, e.palette.MaxRows)
+		offset := 0
+		if e.palette.Index >= visibleRows {
+			offset = e.palette.Index - visibleRows + 1
+		}
+		e.palette.Offset = offset
 	case kero.KeyUp:
-		if len(e.palette.Items) > 0 {
-			e.palette.Selected = (e.palette.Selected - 1 + len(e.palette.Items)) % len(e.palette.Items)
+		total := len(e.palette.Items)
+		if total == 0 {
+			return
 		}
+		e.palette.Index = (e.palette.Index - 1 + total) % total
+		e.palette.Index = (e.palette.Index + 1) % total
+		// Calculate scrolling offset to keep selected item inside dropdown viewport
+		visibleRows := min(total, e.palette.MaxRows)
+		offset := 0
+		if e.palette.Index >= visibleRows {
+			offset = e.palette.Index - visibleRows + 1
+		}
+		e.palette.Offset = offset
 	case kero.KeyEnter:
-		if len(e.palette.Items) > 0 && e.palette.Selected < len(e.palette.Items) {
-			action := e.palette.Items[e.palette.Selected].Action
+		if len(e.palette.Items) > 0 && e.palette.Index < len(e.palette.Items) {
+			action := e.palette.Items[e.palette.Index].Action
 			e.palette.Close()
 			action(e) // Run selected action
 		}
@@ -3162,19 +3204,13 @@ func (e *Editor) drawPalette(f *kero.Frame, y, width int) {
 
 	visibleRows := min(total, p.MaxRows)
 
-	// Calculate scrolling offset to keep selected item inside dropdown viewport
-	offset := 0
-	if p.Selected >= visibleRows {
-		offset = p.Selected - visibleRows + 1
-	}
-
 	// 3. Fill background for dropdown overlay rendered directly above row y
 	rect := kero.Rect{X: 0, Y: y - visibleRows, W: width, H: visibleRows}
 	f.Fill(rect, ' ', normal.Reverse())
 
 	// 4. Render item rows
 	for i := range visibleRows {
-		idx := i + offset
+		idx := i + p.Offset
 		if idx >= total {
 			break
 		}
@@ -3185,7 +3221,7 @@ func (e *Editor) drawPalette(f *kero.Frame, y, width int) {
 		// Selection cursor indicator
 		prefix := "  "
 		style := normal.Reverse()
-		if idx == p.Selected {
+		if idx == p.Index {
 			prefix = " >"
 			style = normal.Reverse().Bold()
 		}
