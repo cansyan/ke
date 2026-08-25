@@ -88,7 +88,7 @@ func main() {
 
 // Editor implements kero.App interface
 type Editor struct {
-	*Buffer // alias to the buffers[active], make refactor easier
+	*Buffer // short path to the buffers[active]
 	buffers []*Buffer
 	active  int // index of currently active buffer
 	Width   int
@@ -236,9 +236,7 @@ func (e *Editor) handleMouse(m kero.MouseEvent) error {
 			if m.Y < e.bufferH() {
 				// ctrl+mouse_left_release goto definition
 				if m.Mod == kero.ModCtrl {
-					e.recordJump()
-					e.GotoDefinition()
-					e.showCursorCenter()
+					GotoDefinition(e)
 				}
 				return nil
 			}
@@ -325,21 +323,16 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 		case "ctrl+r":
 			e.palette.Open(ctx, e, "@")
 		case "ctrl+g":
-			e.recordJump()
-			e.GotoDefinition()
-			e.showCursorCenter()
-			return nil
-		case "ctrl+shift+g":
-			handleLSPDef(e)
+			GotoDefinition(e)
 			return nil
 		case "ctrl+p":
 			e.palette.Open(ctx, e, "")
 			return nil
 		case "ctrl+[":
-			handlePrevLocation(e)
+			gotoPrevLocation(e)
 			return nil
 		case "ctrl+]":
-			handleNextLocation(e)
+			gotoNextLocation(e)
 			return nil
 		case "ctrl+s":
 			return e.save()
@@ -1473,20 +1466,6 @@ func trimToWidth(s string, width int) string {
 	return string(runes[:width])
 }
 
-func (e *Editor) GotoDefinition() {
-	reader := e.Buffer.NewReader()
-
-	// Convert internal 0-based cursor to 1-based for go/token
-	res := FindDefinitionLoc(reader, e.Cursor.Row+1, e.Cursor.Col+1)
-	if !res.Found {
-		return // Symbol definition not found in current file
-	}
-
-	// Jump editor cursor (converting back to 0-based)
-	e.Cursor.Row = res.Line - 1
-	e.Cursor.Col = res.Column - 1
-}
-
 // TextInput is a small editable single-line text widget.
 type TextInput struct {
 	runes       []rune
@@ -2464,166 +2443,6 @@ func CheckSemantics(filename string, src any) []Diagnostic {
 	return diags
 }
 
-// DefinitionResult holds the target location for a definition jump.
-type DefinitionResult struct {
-	Found  bool
-	Line   int // 1-based
-	Column int // 1-based
-}
-
-// FindDefinitionLoc returns the target definition line/col for the identifier
-// at the given cursor position (1-based line, 1-based col).
-func FindDefinitionLoc(src any, cursorLine, cursorCol int) DefinitionResult {
-	fset := token.NewFileSet()
-	// src can be string, []byte, or io.Reader
-	file, err := parser.ParseFile(fset, "buffer.go", src, parser.SkipObjectResolution)
-	if err != nil && file == nil {
-		return DefinitionResult{}
-	}
-
-	targetPos := positionToPos(fset, file, cursorLine, cursorCol)
-	if !targetPos.IsValid() {
-		return DefinitionResult{}
-	}
-
-	// 1. Find the *ast.Ident under the cursor
-	var targetIdent *ast.Ident
-	ast.Inspect(file, func(n ast.Node) bool {
-		if n == nil {
-			return true
-		}
-		if n.Pos() <= targetPos && targetPos <= n.End() {
-			if ident, ok := n.(*ast.Ident); ok {
-				targetIdent = ident
-			}
-			return true
-		}
-		return false
-	})
-
-	if targetIdent == nil {
-		return DefinitionResult{}
-	}
-
-	// 2. Find declaration by inspecting the AST scopes explicitly
-	declPos := findDeclarationPos(file, targetIdent)
-	if !declPos.IsValid() {
-		return DefinitionResult{}
-	}
-
-	pos := fset.Position(declPos)
-	return DefinitionResult{
-		Found:  true,
-		Line:   pos.Line,
-		Column: pos.Column,
-	}
-}
-
-// findDeclarationPos replaces the deprecated Ident.Obj lookup by walking
-// local function scopes and top-level declarations in the file.
-func findDeclarationPos(file *ast.File, target *ast.Ident) token.Pos {
-	name := target.Name
-	var match token.Pos
-
-	// Step A: Search for local variables / parameters inside the enclosing function
-	ast.Inspect(file, func(n ast.Node) bool {
-		fn, ok := n.(*ast.FuncDecl)
-		if !ok {
-			return true
-		}
-
-		// Check if target is inside this function body
-		if fn.Pos() <= target.Pos() && target.Pos() <= fn.End() {
-			// Check function parameters and return values
-			if fn.Type != nil && fn.Type.Params != nil {
-				for _, param := range fn.Type.Params.List {
-					for _, id := range param.Names {
-						if id.Name == name {
-							match = id.Pos()
-							return false
-						}
-					}
-				}
-			}
-
-			// Check local variable assignments inside function body
-			ast.Inspect(fn.Body, func(bodyNode ast.Node) bool {
-				switch stmt := bodyNode.(type) {
-				case *ast.AssignStmt: // e.g. x := 10 or x, y := 1, 2
-					for _, lh := range stmt.Lhs {
-						if id, ok := lh.(*ast.Ident); ok && id.Name == name {
-							if id.Pos() <= target.Pos() { // Defined before or at target
-								match = id.Pos()
-								return false
-							}
-						}
-					}
-				case *ast.ValueSpec: // e.g. var x int
-					for _, id := range stmt.Names {
-						if id.Name == name {
-							match = id.Pos()
-							return false
-						}
-					}
-				}
-				return match == token.NoPos
-			})
-
-			return false
-		}
-		return true
-	})
-
-	if match.IsValid() {
-		return match
-	}
-
-	// Step B: Search top-level file declarations (funcs, structs, types, consts, vars)
-	for _, decl := range file.Decls {
-		switch d := decl.(type) {
-		case *ast.FuncDecl:
-			if d.Name.Name == name {
-				return d.Name.Pos()
-			}
-		case *ast.GenDecl:
-			for _, spec := range d.Specs {
-				switch s := spec.(type) {
-				case *ast.TypeSpec:
-					if s.Name.Name == name {
-						return s.Name.Pos()
-					}
-					// If searching for a struct field name
-					if st, ok := s.Type.(*ast.StructType); ok {
-						for _, field := range st.Fields.List {
-							for _, id := range field.Names {
-								if id.Name == name {
-									return id.Pos()
-								}
-							}
-						}
-					}
-				case *ast.ValueSpec:
-					for _, id := range s.Names {
-						if id.Name == name {
-							return id.Pos()
-						}
-					}
-				}
-			}
-		}
-	}
-
-	return token.NoPos
-}
-
-func positionToPos(fset *token.FileSet, file *ast.File, line, col int) token.Pos {
-	tf := fset.File(file.Pos())
-	if tf == nil || line < 1 || line > tf.LineCount() {
-		return token.NoPos
-	}
-	return tf.LineStart(line) + token.Pos(col-1)
-}
-
 type SymbolLocation struct {
 	Name     string
 	Receiver string
@@ -2638,18 +2457,6 @@ func (s SymbolLocation) String() string {
 		return s.Name
 	}
 	return fmt.Sprintf("(%s).%s", s.Receiver, s.Name)
-}
-
-// FindSymbolLoc finds the location of a top-level symbol matching exactName.
-// src can be string, []byte, or io.Reader.
-func FindSymbolLoc(src any, exactName string) (SymbolLocation, bool) { // TODO
-	symbols := ExtractAllSymbols(src)
-	for _, sym := range symbols {
-		if sym.Name == exactName {
-			return sym, true
-		}
-	}
-	return SymbolLocation{}, false
 }
 
 // ExtractAllSymbols collects all top-level symbols in the file.
@@ -3134,11 +2941,6 @@ func (p *Palette) commandItems(_ *Editor, query string) []PaletteItem {
 	}{
 		// use readable name for cmd, easy to search
 		{"format", "", func(e *Editor) { e.Buffer.Format() }},
-		{"goto definition", "ctrl+g", func(e *Editor) {
-			e.recordJump()
-			e.GotoDefinition()
-			e.showCursorCenter()
-		}},
 		{"goto diagnostic", "", func(e *Editor) {
 			if d := e.nextDiagnostic(); d.Message != "" {
 				e.Cursor = e.Buffer.ClampPos(Position{Row: d.Row, Col: d.Col})
@@ -3159,17 +2961,17 @@ func (p *Palette) commandItems(_ *Editor, query string) []PaletteItem {
 		{"prev buffer", "", func(e *Editor) {
 			e.PrevBuffer()
 		}},
-		{"LSP: definition", "ctrl+shift+g", handleLSPDef},
+		{"LSP: definition", "ctrl+g", GotoDefinition},
 		{"LSP: rename", "", func(e *Editor) {
 			if !isGoFile(e.Path) {
 				return
 			}
 			e.startRename()
 		}},
-		{"LSP: reference", "", handleLSPRef},
+		{"LSP: reference", "", findReference},
 		{"toggle location list", "", func(e *Editor) { e.locations.Active = !e.locations.Active }},
-		{"next location", "ctrl+]", handleNextLocation},
-		{"prev location", "ctrl+[", handlePrevLocation},
+		{"next location", "ctrl+]", gotoNextLocation},
+		{"prev location", "ctrl+[", gotoPrevLocation},
 	}
 
 	var items []PaletteItem
@@ -3565,7 +3367,7 @@ func (e *Editor) drawRename(f *kero.Frame, y int, width int) {
 	e.renameInput.Draw(f, kero.Rect{X: inputX, Y: y, W: width - inputX, H: 1}, normal)
 }
 
-func handleLSPDef(e *Editor) {
+func GotoDefinition(e *Editor) {
 	if !isGoFile(e.Path) {
 		return
 	}
@@ -3616,6 +3418,11 @@ type LocationList struct {
 	Items   []PositionLSP
 	Offset  int // vertical scrolling
 	MaxRows int // UI render cap (e.g., 10 items)
+	Header  string
+}
+
+func NewLocationList(header string, items []PositionLSP) LocationList {
+	return LocationList{Active: true, Header: header, Items: items, MaxRows: 10}
 }
 
 func (ls *LocationList) VisibleRows() int {
@@ -3715,7 +3522,7 @@ func (p PositionLSP) String() string {
 // Positions within files are specified as file.go:line:column triples,
 // where the line and column start at 1, and columns are measured in bytes of the UTF-8 encoding.
 // More details see https://go.dev/gopls/command-line
-func handleLSPRef(e *Editor) {
+func findReference(e *Editor) {
 	if !isGoFile(e.Path) {
 		return
 	}
@@ -3752,7 +3559,9 @@ func handleLSPRef(e *Editor) {
 		}
 		locations = append(locations, p)
 	}
-	e.locations = LocationList{Active: true, Items: locations, MaxRows: 10}
+	start, end := e.Buffer.WordBounds(e.Cursor)
+	header := fmt.Sprintf("found %d references for %q", len(locations), e.Buffer.GetRange(start, end))
+	e.locations = NewLocationList(header, locations)
 }
 
 // drawLocationList renders the input field and popup overlay menu above row y.
@@ -3773,10 +3582,7 @@ func (e *Editor) drawLocationList(f *kero.Frame, y, width int) {
 	rect := kero.Rect{X: 0, Y: y - visibleRows, W: width, H: visibleRows + headerRow}
 	f.Fill(rect, ' ', style)
 	// 4. Render header
-	start := Position{Row: loc.Items[0].Line - 1, Col: loc.Items[0].StartColumn - 1}
-	end := Position{Row: loc.Items[0].Line - 1, Col: loc.Items[0].EndColumn - 1}
-	query := e.GetRange(start, end)
-	f.Write(rect.X, rect.Y, fmt.Sprintf(" %d references for %q", total, query), style)
+	f.Write(rect.X, rect.Y, loc.Header, style)
 
 	buffers := e.buffers
 	getBuffer := func(path string) (*Buffer, error) {
@@ -3826,7 +3632,7 @@ func (e *Editor) drawLocationList(f *kero.Frame, y, width int) {
 	}
 }
 
-func handleNextLocation(e *Editor) {
+func gotoNextLocation(e *Editor) {
 	if len(e.locations.Items) == 0 {
 		return
 	}
@@ -3841,7 +3647,7 @@ func handleNextLocation(e *Editor) {
 	e.showCursorCenter()
 }
 
-func handlePrevLocation(e *Editor) {
+func gotoPrevLocation(e *Editor) {
 	if len(e.locations.Items) == 0 {
 		return
 	}

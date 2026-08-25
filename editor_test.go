@@ -1,7 +1,6 @@
 package main
 
 import (
-	"strings"
 	"testing"
 
 	"github.com/cansyan/kero"
@@ -258,39 +257,6 @@ func TestWordUnderCursor(t *testing.T) {
 	word := ed.Buffer.GetRange(start, end)
 	if word != "finishCommand" {
 		t.Fatalf("wordAt(%+v, %+v) = %q, want %q", ed.Cursor.Row, ed.Cursor.Col, word, "finishCommand")
-	}
-}
-
-func TestGotoDefinition(t *testing.T) {
-	buf := BufferFromString(strings.Join([]string{
-		"package main",
-		"",
-		"type Editor struct {",
-		"}",
-		"",
-		"func (e *Editor) finishCommand() error {",
-		"    return nil",
-		"}",
-		"",
-		"func main() {",
-		"    e := &Editor{}",
-		"    e.finishCommand()",
-		"}",
-	}, "\n"))
-	buf.Cursor = Position{Row: 11, Col: 7} // line with e.finishCommand(), on finishCommand
-	ed := &Editor{
-		Buffer: buf,
-	}
-
-	ctx := &kero.Context{Width: 80, Height: 24}
-
-	ev := kero.KeyEvent{Key: kero.KeyRune, Rune: 'g', Mod: kero.ModCtrl}
-	if err := ed.Update(ctx, ev); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	if ed.Cursor.Row != 5 {
-		t.Errorf("ed.pos.Row = %d, want 5 (line of func (e *Editor) finishCommand)", ed.Cursor.Row)
 	}
 }
 
