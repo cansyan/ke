@@ -221,16 +221,8 @@ func (e *Editor) handleMouse(m kero.MouseEvent) error {
 				if index < 0 || index >= len(e.locations.Items) {
 					return nil
 				}
-				e.recordJump()
 				e.locations.Index = index
-				p := e.locations.Items[index]
-				if err := e.OpenFile(p.Path); err != nil {
-					log.Print(err)
-					e.message = err.Error()
-					return nil
-				}
-				e.Cursor = Position{Row: p.Line - 1, Col: p.StartColumn - 1}
-				e.showCursorCenter()
+				e.gotoLocation(e.locations.Items[index])
 			}
 		case kero.MouseRelease:
 			if m.Y < e.bufferH() {
@@ -329,10 +321,16 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 			e.palette.Open(ctx, e, "")
 			return nil
 		case "ctrl+[":
-			gotoPrevLocation(e)
+			if len(e.locations.Items) <= 1 {
+				return nil
+			}
+			e.gotoLocation(e.locations.Prev())
 			return nil
 		case "ctrl+]":
-			gotoNextLocation(e)
+			if len(e.locations.Items) <= 1 {
+				return nil
+			}
+			e.gotoLocation(e.locations.Next())
 			return nil
 		case "ctrl+s":
 			return e.save()
@@ -2970,8 +2968,18 @@ func (p *Palette) commandItems(_ *Editor, query string) []PaletteItem {
 		}},
 		{"LSP: reference", "", findReference},
 		{"toggle location list", "", func(e *Editor) { e.locations.Active = !e.locations.Active }},
-		{"next location", "ctrl+]", gotoNextLocation},
-		{"prev location", "ctrl+[", gotoPrevLocation},
+		{"next location", "ctrl+]", func(e *Editor) {
+			if len(e.locations.Items) <= 1 {
+				return
+			}
+			e.gotoLocation(e.locations.Next())
+		}},
+		{"prev location", "ctrl+[", func(e *Editor) {
+			if len(e.locations.Items) <= 1 {
+				return
+			}
+			e.gotoLocation(e.locations.Prev())
+		}},
 	}
 
 	var items []PaletteItem
@@ -3396,32 +3404,24 @@ func GotoDefinition(e *Editor) {
 		return
 	}
 	log.Printf("run %q in %.2fs:\n%s", cmd, time.Since(now).Seconds(), string(out))
-	p, err := ParsePositionLSP(string(out))
+	l, err := ParseLocation(string(out))
 	if err != nil {
 		log.Print(err)
 		return
 	}
-
-	e.recordJump()
-	if err := e.OpenFile(p.Path); err != nil {
-		log.Print(err)
-		e.message = err.Error()
-		return
-	}
-	e.Cursor = Position{Row: p.Line - 1, Col: p.StartColumn - 1}
-	e.showCursorCenter()
+	e.gotoLocation(l)
 }
 
 type LocationList struct {
 	Active  bool
 	Index   int
-	Items   []PositionLSP
+	Items   []Location
 	Offset  int // vertical scrolling
 	MaxRows int // UI render cap (e.g., 10 items)
 	Header  string
 }
 
-func NewLocationList(header string, items []PositionLSP) LocationList {
+func NewLocationList(header string, items []Location) LocationList {
 	return LocationList{Active: true, Header: header, Items: items, MaxRows: 10}
 }
 
@@ -3433,10 +3433,10 @@ func (ls *LocationList) VisibleRows() int {
 	return min(len(ls.Items), maxRows)
 }
 
-func (ls *LocationList) Next() PositionLSP {
+func (ls *LocationList) Next() Location {
 	total := len(ls.Items)
 	if total == 0 {
-		return PositionLSP{}
+		return Location{}
 	}
 	if total == 1 {
 		return ls.Items[0]
@@ -3453,10 +3453,10 @@ func (ls *LocationList) Next() PositionLSP {
 	return ls.Items[ls.Index]
 }
 
-func (ls *LocationList) Prev() PositionLSP {
+func (ls *LocationList) Prev() Location {
 	total := len(ls.Items)
 	if total == 0 {
-		return PositionLSP{}
+		return Location{}
 	}
 	if total == 1 {
 		return ls.Items[0]
@@ -3473,41 +3473,80 @@ func (ls *LocationList) Prev() PositionLSP {
 	return ls.Items[ls.Index]
 }
 
-type PositionLSP struct {
-	Path        string
-	Line        int // starts at 1
-	StartColumn int // starts at 1, measured in bytes of the UTF-8 encoding
-	EndColumn   int
+// Location represents a specific span of text or a point tied to a specific file.
+type Location struct {
+	Path  string
+	Start struct {
+		Line   int // starts at 1
+		Column int // starts at 1, measured in bytes of the UTF-8 encoding
+	}
+	End struct{ Line, Column int }
 }
 
-func ParsePositionLSP(s string) (PositionLSP, error) {
+func ParseLocation(s string) (Location, error) {
 	parts := strings.Split(s, ":")
 	if len(parts) < 3 {
-		return PositionLSP{}, errors.New("unknown position: " + s)
+		return Location{}, errors.New("unknown position: " + s)
 	}
 	path := parts[0]
 	lineNo, err := strconv.Atoi(parts[1])
 	if err != nil {
-		return PositionLSP{}, err
+		return Location{}, err
 	}
 	segments := strings.Split(parts[2], "-")
 	if len(segments) != 2 {
-		return PositionLSP{}, errors.New("unknown position: " + s)
+		return Location{}, errors.New("unknown position: " + s)
 	}
 	startCol, err := strconv.Atoi(segments[0])
 	if err != nil {
-		return PositionLSP{}, err
+		return Location{}, err
 	}
 	endCol, err := strconv.Atoi(segments[1])
 	if err != nil {
-		return PositionLSP{}, err
+		return Location{}, err
 	}
-	return PositionLSP{Path: path, Line: lineNo, StartColumn: startCol, EndColumn: endCol}, nil
+	loc := Location{Path: path}
+	loc.Start.Line = lineNo
+	loc.Start.Column = startCol
+	loc.End.Line = lineNo
+	loc.End.Column = endCol
+	return loc, nil
 }
 
-// returns a readable string representation, the Row and
-func (p PositionLSP) String() string {
-	return fmt.Sprintf("%s:%d:%d-%d", p.Path, p.Line, p.StartColumn, p.EndColumn)
+// convert 1-base byte offset of the UTF-8 encoding to 0-base rune index
+func byteOffsetToRuneIndex(line []rune, offset int) int {
+	var o int
+	for i, r := range line {
+		o += utf8.RuneLen(r)
+		if o >= offset {
+			return i
+		}
+	}
+	return len(line) - 1
+}
+
+// convert 0-base rune index to 1-base byte offset of the UTF-8 encoding
+func runeIndexToByteOffset(line []rune, index int) int {
+	var offset int
+	for i := range index {
+		offset += utf8.RuneLen(line[i])
+	}
+	return offset
+}
+
+func (e *Editor) gotoLocation(l Location) {
+	e.recordJump()
+	err := e.OpenFile(l.Path)
+	if err != nil {
+		log.Print(err)
+		e.message = err.Error()
+		return
+	}
+	e.Cursor = Position{
+		Row: l.Start.Line - 1,
+		Col: byteOffsetToRuneIndex(e.Lines[l.Start.Line-1], l.Start.Column),
+	}
+	e.showCursorCenter()
 }
 
 // For example, run:
@@ -3551,9 +3590,9 @@ func findReference(e *Editor) {
 	if len(rawLines) == 0 {
 		return
 	}
-	locations := make([]PositionLSP, 0, len(rawLines))
+	locations := make([]Location, 0, len(rawLines))
 	for _, line := range rawLines {
-		p, err := ParsePositionLSP(line)
+		p, err := ParseLocation(line)
 		if err != nil {
 			continue
 		}
@@ -3621,8 +3660,10 @@ func (e *Editor) drawLocationList(f *kero.Frame, y, width int) {
 			log.Print(err)
 			continue
 		}
-		text := fmt.Sprintf("%s %s:%d:%d: %s", indicator, filepath.Base(item.Path), item.Line,
-			item.StartColumn, string(buf.Lines[item.Line-1]))
+
+		col := byteOffsetToRuneIndex(buf.Lines[item.Start.Line-1], item.Start.Column)
+		text := fmt.Sprintf("%s %s:%d:%d: %s", indicator, filepath.Base(item.Path), item.Start.Line,
+			col+1, string(buf.Lines[item.Start.Line-1]))
 		runes := []rune(text)
 
 		if len(runes) > width {
@@ -3630,34 +3671,4 @@ func (e *Editor) drawLocationList(f *kero.Frame, y, width int) {
 		}
 		f.Write(rect.X, lineY, text, itemStyle)
 	}
-}
-
-func gotoNextLocation(e *Editor) {
-	if len(e.locations.Items) == 0 {
-		return
-	}
-	p := e.locations.Next()
-	e.recordJump()
-	if err := e.OpenFile(p.Path); err != nil {
-		log.Print(err)
-		e.message = err.Error()
-		return
-	}
-	e.Cursor = Position{Row: p.Line - 1, Col: p.StartColumn - 1}
-	e.showCursorCenter()
-}
-
-func gotoPrevLocation(e *Editor) {
-	if len(e.locations.Items) == 0 {
-		return
-	}
-	p := e.locations.Prev()
-	e.recordJump()
-	if err := e.OpenFile(p.Path); err != nil {
-		log.Print(err)
-		e.message = err.Error()
-		return
-	}
-	e.Cursor = Position{Row: p.Line - 1, Col: p.StartColumn - 1}
-	e.showCursorCenter()
 }
