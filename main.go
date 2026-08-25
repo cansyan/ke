@@ -117,7 +117,7 @@ type Editor struct {
 	// optional: record the time of last key, make it expire after a while
 	lastEvent kero.Event
 
-	diags       []Diagnostic
+	diags       scanner.ErrorList
 	diagTimer   *time.Timer
 	diagChan    chan diagResult
 	diagVersion atomic.Uint64
@@ -329,6 +329,9 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 			}
 			e.CloseBuffer()
 		case "ctrl+r":
+			if e.locations.Active {
+				e.locations.Active = false
+			}
 			e.palette.Open(ctx, e, "@")
 		case "ctrl+g":
 			GotoDefinition(e)
@@ -339,18 +342,19 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 			}
 			e.palette.Open(ctx, e, "")
 			return nil
-		case "ctrl+[":
-			if len(e.locations.Items) <= 1 {
-				return nil
-			}
-			e.gotoLocation(e.locations.Prev())
-			return nil
 		case "ctrl+]":
+			e.gotoDiagnostic()
+			return nil
+		case "ctrl+shift+]":
 			if len(e.locations.Items) <= 1 {
 				return nil
 			}
 			e.gotoLocation(e.locations.Next())
-			return nil
+		case "ctrl+shift+[":
+			if len(e.locations.Items) <= 1 {
+				return nil
+			}
+			e.gotoLocation(e.locations.Prev())
 		case "ctrl+s":
 			return e.save()
 		case "ctrl+f":
@@ -674,12 +678,12 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 		// draw the line
 		f.Write(gutterW, y, visPadded, textStyle)
 
-		if v, ok := e.diagnosticForLine(lineIndex); ok {
+		if v := e.diagnosticForLine(lineIndex); v != nil {
 			red := kero.NewStyle().Foreground(kero.ColorRed)
 			f.Write(0, y, "x", red)
 			//f.Write(gutterW+len(visPadded)+2, y, v.Message, red)
-			dx := max(gutterW+len(visPadded), ctx.Width-len(v.Message))
-			f.Write(dx, y, v.Message, red)
+			dx := max(gutterW+len(visPadded), ctx.Width-len(v.Msg))
+			f.Write(dx, y, v.Msg, red)
 		}
 
 		// highlight selection if any
@@ -1305,8 +1309,8 @@ func (e *Editor) markDirty() {
 }
 
 type diagResult struct {
-	version     uint64
-	diagnostics []Diagnostic
+	version uint64
+	errs    scanner.ErrorList
 }
 
 // debounceDiagnose is In-memory, fast syntax and type checking
@@ -1327,8 +1331,8 @@ func (e *Editor) debounceDiagnose() {
 	filename := e.Path
 	src := e.Buffer.NewReader()
 	e.diagTimer = time.AfterFunc(300*time.Millisecond, func() {
-		diags := CheckSemantics(filename, src)
-		result := diagResult{version: version, diagnostics: diags}
+		errs := CheckSemantics(filename, src)
+		result := diagResult{version: version, errs: errs}
 		select {
 		case <-e.diagChan:
 		default:
@@ -1348,7 +1352,7 @@ func (e *Editor) applyDiagnostic() {
 		select {
 		case result := <-e.diagChan:
 			if result.version == e.diagVersion.Load() {
-				e.diags = result.diagnostics
+				e.diags = result.errs
 			}
 		default:
 			return
@@ -1356,28 +1360,39 @@ func (e *Editor) applyDiagnostic() {
 	}
 }
 
-func (e *Editor) diagnosticForLine(row int) (Diagnostic, bool) {
+func (e *Editor) diagnosticForLine(row int) *scanner.Error {
 	for _, d := range e.diags {
-		if d.Row == row {
-			return d, true
-		}
-	}
-	return Diagnostic{}, false
-}
-
-func (e *Editor) nextDiagnostic() Diagnostic {
-	if len(e.diags) == 0 {
-		return Diagnostic{}
-	}
-
-	for _, d := range e.diags {
-		if d.Row > e.Cursor.Row ||
-			(d.Row == e.Cursor.Row && d.Col > e.Cursor.Col) {
+		if d.Pos.Line-1 == row {
 			return d
 		}
 	}
+	return nil
+}
 
-	return e.diags[0]
+func (e *Editor) gotoDiagnostic() {
+	if len(e.diags) == 0 {
+		return
+	}
+
+	// find next diagnostic
+	var err *scanner.Error
+	for _, d := range e.diags {
+		dRow := d.Pos.Line - 1
+		dCol := byteColumnToRuneIndex(string(e.Lines[dRow]), d.Pos.Column)
+		if dRow > e.Cursor.Row ||
+			(dRow == e.Cursor.Row && dCol > e.Cursor.Col) {
+			err = d
+			break
+		}
+	}
+	if err == nil {
+		err = e.diags[0]
+	}
+
+	dRow := err.Pos.Line - 1
+	dCol := byteColumnToRuneIndex(string(e.Lines[dRow]), err.Pos.Column)
+	e.Cursor = e.Buffer.ClampPos(Position{Row: dRow, Col: dCol})
+	e.showCursorCenter()
 }
 
 func isGoFile(path string) bool {
@@ -2377,38 +2392,26 @@ func (b *Buffer) Format() (bool, error) {
 	return true, nil
 }
 
-type Diagnostic struct {
-	Row     int // start from 0
-	Col     int // start from 0
-	Message string
-}
-
 // CheckSemantics checks syntax and type error.
 // filename is used for position resolution (e.g., "main.go").
 // src can be a string, []byte, or io.Reader.
 //
 // It responds instantly (~5–20ms), as a tradeoff,
 // external module imports are not resolved and are filtered out.
-func CheckSemantics(filename string, src any) []Diagnostic {
+func CheckSemantics(filename string, src any) scanner.ErrorList {
 	fset := token.NewFileSet()
 	// 1. Parse AST with comments and full error reporting
 	file, err := parser.ParseFile(fset, filename, src, parser.AllErrors)
 
-	var diags []Diagnostic
+	var errs scanner.ErrorList
 
 	// 2. Collect syntax errors first
 	if err != nil {
 		if scannerErrs, ok := err.(scanner.ErrorList); ok {
-			for _, e := range scannerErrs {
-				diags = append(diags, Diagnostic{
-					Row:     e.Pos.Line - 1,
-					Col:     e.Pos.Column - 1,
-					Message: e.Msg,
-				})
-			}
+			return scannerErrs
 		}
 		// If syntax is broken, return early (type checking invalid AST causes redundant noise)
-		return diags
+		return errs
 	}
 
 	// 3. Configure type checker for semantic validation
@@ -2431,11 +2434,7 @@ func CheckSemantics(filename string, src any) []Diagnostic {
 				}
 
 				pos := fset.Position(typeErr.Pos)
-				diags = append(diags, Diagnostic{
-					Row:     pos.Line - 1,
-					Col:     pos.Column - 1,
-					Message: typeErr.Msg,
-				})
+				errs.Add(pos, typeErr.Msg)
 			}
 		},
 	}
@@ -2460,7 +2459,7 @@ func CheckSemantics(filename string, src any) []Diagnostic {
 		_, _ = conf.Check(pkgName, fset, []*ast.File{currentFileAST, otherFileAST1, otherFileAST2}, info)
 	*/
 
-	return diags
+	return errs
 }
 
 type SymbolLocation struct {
@@ -2568,14 +2567,17 @@ func formatReceiver(expr ast.Expr) string {
 
 // OpenFile loads a file into memory or focuses it if already loaded.
 func (e *Editor) OpenFile(path string) error {
-	absPath, err := filepath.Abs(path)
-	if err != nil {
-		return err
+	if path != "" {
+		absPath, err := filepath.Abs(path)
+		if err != nil {
+			return err
+		}
+		path = absPath
 	}
 
 	// switch to existing buffer
 	for i, buf := range e.buffers {
-		if buf.Path == absPath {
+		if buf.Path == path {
 			e.active = i
 			e.Buffer = buf
 			e.diags = nil
@@ -2586,7 +2588,7 @@ func (e *Editor) OpenFile(path string) error {
 		}
 	}
 
-	buf, err := BufferFromFile(absPath)
+	buf, err := BufferFromFile(path)
 	if err != nil {
 		return err
 	}
@@ -2962,11 +2964,8 @@ func (p *Palette) commandItems(_ *Editor, query string) []PaletteItem {
 	}{
 		// use readable name for cmd, easy to search
 		{"format", "", func(e *Editor) { e.Buffer.Format() }},
-		{"goto diagnostic", "", func(e *Editor) {
-			if d := e.nextDiagnostic(); d.Message != "" {
-				e.Cursor = e.Buffer.ClampPos(Position{Row: d.Row, Col: d.Col})
-				e.showCursorCenter()
-			}
+		{"goto diagnostic", "ctrl+]", func(e *Editor) {
+			e.gotoDiagnostic()
 		}},
 		{"jump back", "ctrl+-", func(e *Editor) {
 			e.JumpBack()
@@ -2990,14 +2989,14 @@ func (p *Palette) commandItems(_ *Editor, query string) []PaletteItem {
 			e.startRename()
 		}},
 		{"LSP: reference", "", findReference},
-		{"toggle location list", "", func(e *Editor) { e.locations.Active = !e.locations.Active }},
-		{"next location", "ctrl+]", func(e *Editor) {
+		{"list location", "", func(e *Editor) { e.locations.Active = !e.locations.Active }},
+		{"next location", "ctrl+shift+]", func(e *Editor) {
 			if len(e.locations.Items) <= 1 {
 				return
 			}
 			e.gotoLocation(e.locations.Next())
 		}},
-		{"prev location", "ctrl+[", func(e *Editor) {
+		{"prev location", "ctrl+shift+[", func(e *Editor) {
 			if len(e.locations.Items) <= 1 {
 				return
 			}
@@ -3511,12 +3510,8 @@ func (ls *LocationList) Prev() Location {
 
 // Location represents a specific span of text or a point tied to a specific file.
 type Location struct {
-	Path  string
-	Start struct {
-		Line   int // line number, starting at 1
-		Column int // column number, starting at 1 (byte count)
-	}
-	End struct{ Line, Column int }
+	Start token.Position
+	End   token.Position
 }
 
 func ParseLocation(s string) (Location, error) {
@@ -3541,11 +3536,10 @@ func ParseLocation(s string) (Location, error) {
 	if err != nil {
 		return Location{}, err
 	}
-	loc := Location{Path: path}
-	loc.Start.Line = lineNo
-	loc.Start.Column = startCol
-	loc.End.Line = lineNo
-	loc.End.Column = endCol
+	loc := Location{
+		Start: token.Position{Filename: path, Line: lineNo, Column: startCol},
+		End:   token.Position{Filename: path, Line: lineNo, Column: endCol},
+	}
 	return loc, nil
 }
 
@@ -3574,7 +3568,7 @@ func runeIndexToByteColumn(line string, index int) int {
 
 func (e *Editor) gotoLocation(l Location) {
 	e.recordJump()
-	err := e.OpenFile(l.Path)
+	err := e.OpenFile(l.Start.Filename)
 	if err != nil {
 		log.Print(err)
 		e.message = err.Error()
@@ -3637,7 +3631,7 @@ func findReference(e *Editor) {
 		locations = append(locations, p)
 	}
 	start, end := e.Buffer.WordBounds(e.Cursor)
-	header := fmt.Sprintf("found %d references for %q", len(locations), e.Buffer.GetRange(start, end))
+	header := fmt.Sprintf("%d references for %q", len(locations), e.Buffer.GetRange(start, end))
 	e.locations = NewLocationList(header, locations)
 }
 
@@ -3693,16 +3687,15 @@ func (e *Editor) drawLocationList(f *kero.Frame, y, width int) {
 			itemStyle = itemStyle.Bold()
 		}
 
-		buf, err := getBuffer(item.Path)
+		buf, err := getBuffer(item.Start.Filename)
 		if err != nil {
 			log.Print(err)
 			continue
 		}
 
 		line := string(buf.Lines[item.Start.Line-1])
-		columnNo := byteColumnToRuneIndex(line, item.Start.Column) + 1
-		text := fmt.Sprintf("%s %s:%d:%d: %s", indicator, filepath.Base(item.Path), item.Start.Line,
-			columnNo, line)
+		text := fmt.Sprintf("%s %s:%d:%d: %s", indicator, filepath.Base(item.Start.Filename), item.Start.Line,
+			item.Start.Column, line)
 		runes := []rune(text)
 
 		if len(runes) > width {

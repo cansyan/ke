@@ -27,10 +27,10 @@ func TestCheckGoSemantics(t *testing.T) {
 	if len(diagnostics) == 0 {
 		t.Fatal("CheckSemantics returned no diagnostic for invalid Go")
 	}
-	if diagnostics[0].Row != 2 {
-		t.Errorf("vet line = %d, want 2", diagnostics[0].Row)
+	if diagnostics[0].Pos.Line != 3 {
+		t.Errorf("vet line = %d, want 3", diagnostics[0].Pos.Line)
 	}
-	if diagnostics[0].Message == "" {
+	if diagnostics[0].Msg == "" {
 		t.Error("vet message is empty")
 	}
 }
