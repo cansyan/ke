@@ -332,7 +332,7 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 			if e.locations.Active {
 				e.locations.Active = false
 			}
-			e.palette.Open(ctx, e, "@")
+			e.palette.Open(e, "@")
 		case "ctrl+g":
 			GotoDefinition(e)
 			return nil
@@ -340,7 +340,7 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 			if e.locations.Active {
 				e.locations.Active = false
 			}
-			e.palette.Open(ctx, e, "")
+			e.palette.Open(e, "")
 			return nil
 		case "ctrl+]":
 			e.gotoDiagnostic()
@@ -808,7 +808,7 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 			return
 		}
 		if e.message == "" {
-			e.message = "^S save | ^W close | ^Q quit | ^F find | ^P palette | ^G definition | ^R symbols"
+			e.message = "^S save | ^W close | ^Q quit | ^F find | ^P palette"
 		}
 		if strings.HasPrefix(e.message, "error:") || strings.HasPrefix(e.message, "warn:") {
 			messageStyle = messageStyle.Foreground(kero.ColorRed)
@@ -2462,7 +2462,7 @@ func CheckSemantics(filename string, src any) scanner.ErrorList {
 	return errs
 }
 
-type SymbolLocation struct {
+type SymbolPosition struct {
 	Name     string
 	Receiver string
 	Kind     string // "func", "method", "type", "struct", "var", "const"
@@ -2471,23 +2471,23 @@ type SymbolLocation struct {
 }
 
 // combines receiver and symbol name
-func (s SymbolLocation) String() string {
+func (s SymbolPosition) String() string {
 	if s.Receiver == "" {
 		return s.Name
 	}
 	return fmt.Sprintf("(%s).%s", s.Receiver, s.Name)
 }
 
-// ExtractAllSymbols collects all top-level symbols in the file.
+// ExtractSymbols collects all top-level symbols in the file.
 // Useful for fuzzy finding or symbol pickers.
-func ExtractAllSymbols(src any) []SymbolLocation {
+func ExtractSymbols(src any) []SymbolPosition {
 	fset := token.NewFileSet()
 	file, err := parser.ParseFile(fset, "buffer.go", src, 0)
 	if err != nil && file == nil {
 		return nil
 	}
 
-	var results []SymbolLocation
+	var results []SymbolPosition
 
 	for _, decl := range file.Decls {
 		switch d := decl.(type) {
@@ -2502,7 +2502,7 @@ func ExtractAllSymbols(src any) []SymbolLocation {
 				recv = formatReceiver(d.Recv.List[0].Type)
 			}
 
-			results = append(results, SymbolLocation{
+			results = append(results, SymbolPosition{
 				Name:     d.Name.Name,
 				Receiver: recv,
 				Kind:     kind,
@@ -2521,7 +2521,7 @@ func ExtractAllSymbols(src any) []SymbolLocation {
 					} else if _, ok := s.Type.(*ast.InterfaceType); ok {
 						kind = "interface"
 					}
-					results = append(results, SymbolLocation{
+					results = append(results, SymbolPosition{
 						Name:   s.Name.Name,
 						Kind:   kind,
 						Line:   pos.Line,
@@ -2535,7 +2535,7 @@ func ExtractAllSymbols(src any) []SymbolLocation {
 					}
 					for _, name := range s.Names {
 						pos := fset.Position(name.Pos())
-						results = append(results, SymbolLocation{
+						results = append(results, SymbolPosition{
 							Name:   name.Name,
 							Kind:   kind,
 							Line:   pos.Line,
@@ -2872,7 +2872,7 @@ type Palette struct {
 }
 
 // Open initializes the palette with a starting prefix ("@", ":", "/", or "").
-func (p *Palette) Open(ctx *kero.Context, e *Editor, prefix string) {
+func (p *Palette) Open(e *Editor, prefix string) {
 	p.Active = true
 	p.Input.Reset()
 	p.Input.SetText(prefix)
@@ -2922,7 +2922,7 @@ func (p *Palette) symbolItems(e *Editor, query string) []PaletteItem {
 		queries = strings.Split(lowerQuery, " ")
 	}
 
-	symbols := ExtractAllSymbols(e.Buffer.NewReader())
+	symbols := ExtractSymbols(e.Buffer.NewReader())
 	var items []PaletteItem
 
 	for _, sym := range symbols {
@@ -2940,14 +2940,16 @@ func (p *Palette) symbolItems(e *Editor, query string) []PaletteItem {
 			}
 		}
 
-		symPos := Position{Row: sym.Line - 1, Col: sym.Column - 1}
 		items = append(items, PaletteItem{
 			Label: sym.String(),
 			// Detail: fmt.Sprintf("Line %d", sym.Line),
 			// Kind: sym.Kind,
 			Action: func(ed *Editor) {
 				ed.recordJump()
-				ed.Cursor = symPos
+				ed.Cursor = Position{
+					Row: sym.Line - 1,
+					Col: byteColumnToRuneIndex(string(e.Lines[sym.Line-1]), sym.Column),
+				}
 				e.showCursorCenter()
 			},
 		})
@@ -3001,6 +3003,9 @@ func (p *Palette) commandItems(_ *Editor, query string) []PaletteItem {
 				return
 			}
 			e.gotoLocation(e.locations.Prev())
+		}},
+		{"symbols", "ctrl+r", func(e *Editor) {
+			e.palette.Open(e, "@")
 		}},
 	}
 
@@ -3249,17 +3254,17 @@ func (e *Editor) drawPalette(f *kero.Frame, y, width int) {
 type Completion struct {
 	Active bool
 	Index  int
-	Items  []SymbolLocation
+	Items  []SymbolPosition
 }
 
 func (c *Completion) Refresh(src any, query string) {
-	results := ExtractAllSymbols(src)
+	results := ExtractSymbols(src)
 	if len(results) == 0 {
 		return
 	}
 
 	b := findQueryIgnoreCase(query)
-	items := make([]SymbolLocation, 0, len(results))
+	items := make([]SymbolPosition, 0, len(results))
 	for _, s := range results {
 		if !b {
 			if strings.Contains(s.Name, query) {
@@ -3347,7 +3352,6 @@ func (e *Editor) updateRename(ev kero.KeyEvent) {
 			}
 		}
 
-		now := time.Now()
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		/*
@@ -3366,14 +3370,14 @@ func (e *Editor) updateRename(ev kero.KeyEvent) {
 			e.message = err.Error()
 			return
 		}
-		log.Printf("run %q in %.2fs:\n%s", cmd, time.Since(now).Seconds(), string(out))
+		// log.Printf("run %q in %.2fs:\n%s", cmd, time.Since(now).Seconds(), string(out))
 
 		// reload buffer
 		editedFiles := strings.Split(string(out), "\n")
 		for i := range editedFiles {
 			for j := range e.buffers {
-				oldBuf := e.buffers[j]
-				if oldBuf.Path != editedFiles[i] {
+				buf := e.buffers[j]
+				if buf.Path != editedFiles[i] {
 					continue
 				}
 				newBuf, err := BufferFromFile(editedFiles[i])
@@ -3381,9 +3385,9 @@ func (e *Editor) updateRename(ev kero.KeyEvent) {
 					log.Print(err)
 					continue
 				}
-				newBuf.Cursor = newBuf.ClampPos(oldBuf.Cursor)
-				newBuf.TopRow = oldBuf.TopRow
-				newBuf.LeftCol = oldBuf.LeftCol
+				newBuf.Cursor = newBuf.ClampPos(buf.Cursor)
+				newBuf.TopRow = buf.TopRow
+				newBuf.LeftCol = buf.LeftCol
 				e.buffers[j] = newBuf
 				if j == e.active {
 					e.Buffer = newBuf
@@ -3605,7 +3609,6 @@ func findReference(e *Editor) {
 		}
 	}
 
-	now := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "gopls", "references", fmt.Sprintf("%s:%d:%d",
@@ -3616,7 +3619,7 @@ func findReference(e *Editor) {
 		e.message = err.Error()
 		return
 	}
-	log.Printf("run %q in %.2fs:\n%s", cmd, time.Since(now).Seconds(), string(out))
+	//log.Printf("run %q in %.2fs:\n%s", cmd, time.Since(now).Seconds(), string(out))
 	rawLines := strings.Split(string(out), "\n")
 	if len(rawLines) == 0 {
 		return
