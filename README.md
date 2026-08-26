@@ -8,7 +8,6 @@ Key bindings:
 		- Enter replace current match and move to the next match
 		- Ctrl+Enter replace all matches
 		- Tab skip current match and move to the next match
-- Ctrl+R symbol picker
 - Shift+Up/Down/Left/Right start selection
 	- Ctrl+D select word under cursor
 	- Ctrl+L expand selection to line
@@ -17,13 +16,11 @@ Key bindings:
 - Ctrl+V paste
 - Ctrl+G goto definition
 - Ctrl+P command palette
-	- `@symbol` goto symbol
-	- `:123` goto line 123
-	- `/format` format file
-	- `/goto definition`
-	- `/goto diagnostic`
-	- `/jump back`
-	- `/jump forward`
+	- `/command` command picker
+	- `@symbol` symbol picker
+	- `:linenumber` goto line
+- Ctrl+Shift+P command picker
+- Ctrl+R symbol picker
 - Ctrl+Backspace delete to line start
 - Ctrl+K delete to line end
 - Ctrl+Enter insert newline below
@@ -31,8 +28,9 @@ Key bindings:
 - Ctrl+A or Home move cursor to line start
 - Ctrl+E or End move cursor to line end
 - Ctrl+W close buffer
-- Ctrl+[ goto previous item of location list
-- Ctrl+] goto next item of location list
+- Ctrl+] goto next diagnostic
+- Ctrl+Shift+[ goto previous reference
+- Ctrl+Shift+] goto next reference
 - Ctrl+- jump back
 - Ctrl+Shift+- jump forward
 - Ctrl+N trigger completion
@@ -59,7 +57,6 @@ Mouse motions:
 Technical decisions:
 - using key ctrl+[, ctrl+d, ctrl+c is ok with Kitty protocol enabled
 - future key chords, Ctrl+K or Ctrl+X as leader key are good, but both taken. 
-- did consider Ctrl+Shift+P for command palette, but the key combo seems unreliable in practice
 - early version should keep things tiny, avoid duplicate selection, mutilple cursor, undo/redo
 - using / as command prefix is more convenient than > (shift+.)
 - in-process semantics checking ignores external file/module, benefits instant feedback

@@ -21,6 +21,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unicode"
@@ -341,6 +342,12 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 				e.locations.Active = false
 			}
 			e.palette.Open(e, "")
+			return nil
+		case "ctrl+shift+p":
+			if e.locations.Active {
+				e.locations.Active = false
+			}
+			e.palette.Open(e, "/")
 			return nil
 		case "ctrl+]":
 			e.gotoDiagnostic()
@@ -2479,7 +2486,7 @@ func (s SymbolPosition) String() string {
 }
 
 // ExtractSymbols collects all top-level symbols in the file.
-// Useful for fuzzy finding or symbol pickers.
+// It is in-memory and fast, intended for completion.
 func ExtractSymbols(src any) []SymbolPosition {
 	fset := token.NewFileSet()
 	file, err := parser.ParseFile(fset, "buffer.go", src, 0)
@@ -2869,6 +2876,8 @@ type Palette struct {
 	Index   int // selected item
 	Offset  int // scrolling offset
 	MaxRows int // UI render cap (e.g., 10 items)
+	symbols []SymbolPosition
+	onceSym sync.Once
 }
 
 // Open initializes the palette with a starting prefix ("@", ":", "/", or "").
@@ -2922,10 +2931,10 @@ func (p *Palette) symbolItems(e *Editor, query string) []PaletteItem {
 		queries = strings.Split(lowerQuery, " ")
 	}
 
-	symbols := ExtractSymbols(e.Buffer.NewReader())
+	p.onceSym.Do(func() { p.symbols = FileSymbols(e) })
 	var items []PaletteItem
 
-	for _, sym := range symbols {
+	for _, sym := range p.symbols {
 
 		if query != "" {
 			match := true
@@ -2941,8 +2950,8 @@ func (p *Palette) symbolItems(e *Editor, query string) []PaletteItem {
 		}
 
 		items = append(items, PaletteItem{
-			Label: sym.String(),
-			// Detail: fmt.Sprintf("Line %d", sym.Line),
+			Label:  sym.String(),
+			Detail: sym.Kind,
 			// Kind: sym.Kind,
 			Action: func(ed *Editor) {
 				ed.recordJump()
@@ -2965,10 +2974,6 @@ func (p *Palette) commandItems(_ *Editor, query string) []PaletteItem {
 		action func(e *Editor)
 	}{
 		// use readable name for cmd, easy to search
-		{"format", "", func(e *Editor) { e.Buffer.Format() }},
-		{"goto diagnostic", "ctrl+]", func(e *Editor) {
-			e.gotoDiagnostic()
-		}},
 		{"jump back", "ctrl+-", func(e *Editor) {
 			e.JumpBack()
 			e.showCursorCenter()
@@ -2983,14 +2988,21 @@ func (p *Palette) commandItems(_ *Editor, query string) []PaletteItem {
 		{"prev buffer", "", func(e *Editor) {
 			e.PrevBuffer()
 		}},
-		{"LSP: definition", "ctrl+g", GotoDefinition},
-		{"LSP: rename", "", func(e *Editor) {
+		{"LSP: find references", "", findReferences},
+		{"LSP: format file", "", func(e *Editor) { e.Buffer.Format() }},
+		{"LSP: goto definition", "ctrl+g", GotoDefinition},
+		{"LSP: goto diagnostic", "ctrl+]", func(e *Editor) {
+			e.gotoDiagnostic()
+		}},
+		{"LSP: goto symbol", "ctrl+r", func(e *Editor) {
+			e.palette.Open(e, "@")
+		}},
+		{"LSP: rename symbol", "", func(e *Editor) {
 			if !isGoFile(e.Path) {
 				return
 			}
 			e.startRename()
 		}},
-		{"LSP: reference", "", findReference},
 		{"list location", "", func(e *Editor) { e.locations.Active = !e.locations.Active }},
 		{"next location", "ctrl+shift+]", func(e *Editor) {
 			if len(e.locations.Items) <= 1 {
@@ -3003,9 +3015,6 @@ func (p *Palette) commandItems(_ *Editor, query string) []PaletteItem {
 				return
 			}
 			e.gotoLocation(e.locations.Prev())
-		}},
-		{"symbols", "ctrl+r", func(e *Editor) {
-			e.palette.Open(e, "@")
 		}},
 	}
 
@@ -3258,6 +3267,7 @@ type Completion struct {
 }
 
 func (c *Completion) Refresh(src any, query string) {
+	// TODO
 	results := ExtractSymbols(src)
 	if len(results) == 0 {
 		return
@@ -3362,6 +3372,7 @@ func (e *Editor) updateRename(ev kero.KeyEvent) {
 				/Users/aha/code/ke/buffer_test.go
 				/Users/aha/code/ke/main.go
 		*/
+		now := time.Now()
 		cmd := exec.CommandContext(ctx, "gopls", "rename", "-w", "-l", fmt.Sprintf("%s:%d:%d",
 			e.Path, e.Cursor.Row+1, e.Cursor.Col+1), newName)
 		out, err := cmd.CombinedOutput()
@@ -3370,7 +3381,7 @@ func (e *Editor) updateRename(ev kero.KeyEvent) {
 			e.message = err.Error()
 			return
 		}
-		// log.Printf("run %q in %.2fs:\n%s", cmd, time.Since(now).Seconds(), string(out))
+		log.Printf("run %q in %.1fs:\n%s", cmd, time.Since(now).Seconds(), string(out))
 
 		// reload buffer
 		editedFiles := strings.Split(string(out), "\n")
@@ -3441,7 +3452,7 @@ func GotoDefinition(e *Editor) {
 		e.message = err.Error()
 		return
 	}
-	log.Printf("run %q in %.2fs:\n%s", cmd, time.Since(now).Seconds(), string(out))
+	log.Printf("run %q in %.1fs:\n%s", cmd, time.Since(now).Seconds(), string(out))
 	l, err := ParseLocation(string(out))
 	if err != nil {
 		log.Print(err)
@@ -3596,7 +3607,7 @@ func (e *Editor) gotoLocation(l Location) {
 // Positions within files are specified as file.go:line:column triples,
 // where the line and column start at 1, and columns are measured in bytes of the UTF-8 encoding.
 // More details see https://go.dev/gopls/command-line
-func findReference(e *Editor) {
+func findReferences(e *Editor) {
 	if !isGoFile(e.Path) {
 		return
 	}
@@ -3611,6 +3622,7 @@ func findReference(e *Editor) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	now := time.Now()
 	cmd := exec.CommandContext(ctx, "gopls", "references", fmt.Sprintf("%s:%d:%d",
 		e.Path, e.Cursor.Row+1, e.Cursor.Col+1))
 	out, err := cmd.CombinedOutput()
@@ -3619,7 +3631,7 @@ func findReference(e *Editor) {
 		e.message = err.Error()
 		return
 	}
-	//log.Printf("run %q in %.2fs:\n%s", cmd, time.Since(now).Seconds(), string(out))
+	log.Printf("run %q in %.1fs:\n%s", cmd, time.Since(now).Seconds(), string(out))
 	rawLines := strings.Split(string(out), "\n")
 	if len(rawLines) == 0 {
 		return
@@ -3655,7 +3667,7 @@ func (e *Editor) drawLocationList(f *kero.Frame, y, width int) {
 	rect := kero.Rect{X: 0, Y: y - visibleRows, W: width, H: visibleRows + headerRow}
 	f.Fill(rect, ' ', style)
 	// 4. Render header
-	f.Write(rect.X, rect.Y, loc.Header, style)
+	f.Write(rect.X+1, rect.Y, loc.Header, style)
 
 	buffers := e.buffers
 	getBuffer := func(path string) (*Buffer, error) {
@@ -3682,10 +3694,10 @@ func (e *Editor) drawLocationList(f *kero.Frame, y, width int) {
 		item := loc.Items[idx]
 		lineY := rect.Y + headerRow + i
 
-		indicator := "  "
+		indicator := " "
 		itemStyle := style
 		if idx == loc.Index {
-			indicator = " >"
+			indicator = ">"
 			itemStyle = itemStyle.Bold()
 		}
 
@@ -3703,6 +3715,68 @@ func (e *Editor) drawLocationList(f *kero.Frame, y, width int) {
 		if len(runes) > width {
 			text = string(runes[:width])
 		}
-		f.Write(rect.X, lineY, text, itemStyle)
+		f.Write(rect.X+1, lineY, text, itemStyle)
 	}
+}
+
+// For example, run:
+//
+//	gopls symbols main.go
+//
+// ouput:
+//
+//	parsePathArg Function 34:6-34:18
+//	main Function 59:6-59:10
+//	Editor Struct 90:6-90:12
+//		Buffer Field 91:3-91:9
+//		Height Field 95:2-95:8
+func FileSymbols(e *Editor) []SymbolPosition {
+	if !isGoFile(e.Path) {
+		return nil
+	}
+	// flush buffer to disk before running gopls
+	if e.Buffer.Dirty {
+		if err := e.Buffer.Save(); err != nil {
+			log.Print(err)
+			e.message = err.Error()
+			return nil
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	now := time.Now()
+	cmd := exec.CommandContext(ctx, "gopls", "symbols", fmt.Sprintf("%s", e.Path))
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		log.Print(err)
+		e.message = err.Error()
+		return nil
+	}
+	log.Printf("run %q in %.1fs", cmd, time.Since(now).Seconds())
+	rawLines := strings.Split(string(out), "\n")
+	if len(rawLines) == 0 {
+		return nil
+	}
+	symbols := make([]SymbolPosition, 0, len(rawLines))
+	for _, line := range rawLines {
+		parts := strings.Fields(line)
+		if len(parts) < 3 {
+			continue
+		}
+		sym := SymbolPosition{
+			Name: parts[0],
+			Kind: parts[1],
+		}
+		rawPos := strings.Split(parts[2], "-")
+		if len(rawPos) != 2 {
+			continue
+		}
+		if parts := strings.Split(rawPos[0], ":"); len(parts) == 2 {
+			sym.Line, _ = strconv.Atoi(parts[0])
+			sym.Column, _ = strconv.Atoi(parts[1])
+		}
+		symbols = append(symbols, sym)
+	}
+	return symbols
 }
