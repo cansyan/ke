@@ -2899,6 +2899,7 @@ func (p *Palette) Open(e *Editor, prefix string) {
 	p.Index = 0
 	p.MaxRows = 10
 	p.symbols = nil
+	p.Offset = 0
 	p.Refresh(e)
 }
 
