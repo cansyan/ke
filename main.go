@@ -198,7 +198,7 @@ func (e *Editor) handleMouse(m kero.MouseEvent) error {
 			e.locations.Offset = max(0, e.locations.Offset-1)
 		}
 		if e.palette.Active {
-			e.palette.Index = max(0, e.palette.Index-1)
+			e.palette.Offset = max(0, e.palette.Offset-1)
 		}
 	case kero.MouseWheelDown:
 		if m.Y < e.bufferH() {
@@ -211,7 +211,7 @@ func (e *Editor) handleMouse(m kero.MouseEvent) error {
 		}
 		if e.palette.Active {
 			p := e.palette
-			e.palette.Index = min(p.Index+1, len(p.Items)-min(len(p.Items), p.MaxRows))
+			e.palette.Offset = min(p.Offset+1, len(p.Items)-min(len(p.Items), p.MaxRows))
 		}
 	case kero.MouseLeft:
 		switch m.Action {
@@ -3078,7 +3078,6 @@ func (e *Editor) updatePalette(ev kero.KeyEvent) {
 			return
 		}
 		e.palette.Index = (e.palette.Index - 1 + total) % total
-		e.palette.Index = (e.palette.Index + 1) % total
 		// Calculate scrolling offset to keep selected item inside dropdown viewport
 		visibleRows := min(total, e.palette.MaxRows)
 		offset := 0
