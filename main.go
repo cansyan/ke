@@ -2896,6 +2896,7 @@ func (p *Palette) Close() {
 	p.Input.Reset()
 	p.Items = nil
 	p.Index = 0
+	p.onceSym = sync.Once{}
 }
 
 // Refresh updates p.Items based on the current input value.
