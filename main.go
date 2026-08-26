@@ -21,7 +21,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 	"unicode"
@@ -1320,8 +1319,8 @@ type diagResult struct {
 	errs    scanner.ErrorList
 }
 
-// debounceDiagnose is In-memory, fast syntax and type checking
-// on current buffer, debounced 300ms on keypress
+// debounceDiagnose makes instant diagnose for dirty buffer,
+// and accurate diagnose for clean file.
 func (e *Editor) debounceDiagnose() {
 	if e.Buffer == nil {
 		return
@@ -1338,7 +1337,19 @@ func (e *Editor) debounceDiagnose() {
 	filename := e.Path
 	src := e.Buffer.NewReader()
 	e.diagTimer = time.AfterFunc(300*time.Millisecond, func() {
-		errs := CheckSemantics(filename, src)
+		var errs []*scanner.Error
+		if e.Buffer.Dirty {
+			// suitable for instant editing
+			errs = CheckSemantics(filename, src)
+		} else {
+			diags, err := CheckFile(e.Path)
+			if err != nil {
+				log.Print(err)
+				e.message = err.Error()
+				return
+			}
+			errs = diags
+		}
 		result := diagResult{version: version, errs: errs}
 		select {
 		case <-e.diagChan:
@@ -2403,7 +2414,7 @@ func (b *Buffer) Format() (bool, error) {
 // filename is used for position resolution (e.g., "main.go").
 // src can be a string, []byte, or io.Reader.
 //
-// It responds instantly (~5–20ms), as a tradeoff,
+// It responds instantly(~5-20ms), as a tradeoff,
 // external module imports are not resolved and are filtered out.
 func CheckSemantics(filename string, src any) scanner.ErrorList {
 	fset := token.NewFileSet()
@@ -2877,7 +2888,6 @@ type Palette struct {
 	Offset  int // scrolling offset
 	MaxRows int // UI render cap (e.g., 10 items)
 	symbols []SymbolPosition
-	onceSym sync.Once
 }
 
 // Open initializes the palette with a starting prefix ("@", ":", "/", or "").
@@ -2888,6 +2898,7 @@ func (p *Palette) Open(e *Editor, prefix string) {
 	p.Input.Placeholder = "search file (@symbol, /command or :line)"
 	p.Index = 0
 	p.MaxRows = 10
+	p.symbols = nil
 	p.Refresh(e)
 }
 
@@ -2896,7 +2907,6 @@ func (p *Palette) Close() {
 	p.Input.Reset()
 	p.Items = nil
 	p.Index = 0
-	p.onceSym = sync.Once{}
 }
 
 // Refresh updates p.Items based on the current input value.
@@ -2932,7 +2942,9 @@ func (p *Palette) symbolItems(e *Editor, query string) []PaletteItem {
 		queries = strings.Split(lowerQuery, " ")
 	}
 
-	p.onceSym.Do(func() { p.symbols = FileSymbols(e) })
+	if p.symbols == nil {
+		p.symbols = FileSymbols(e)
+	}
 	var items []PaletteItem
 
 	for _, sym := range p.symbols {
@@ -2988,6 +3000,14 @@ func (p *Palette) commandItems(_ *Editor, query string) []PaletteItem {
 		}},
 		{"prev buffer", "", func(e *Editor) {
 			e.PrevBuffer()
+		}},
+		{"LSP: check", "", func(e *Editor) {
+			diags, err := CheckFile(e.Path)
+			if err != nil {
+				e.message = err.Error()
+				return
+			}
+			e.diags = diags
 		}},
 		{"LSP: find references", "", findReferences},
 		{"LSP: format file", "", func(e *Editor) { e.Buffer.Format() }},
@@ -3780,4 +3800,47 @@ func FileSymbols(e *Editor) []SymbolPosition {
 		symbols = append(symbols, sym)
 	}
 	return symbols
+}
+
+// CheckFile checks file on disk, make accurate diagnoses.
+func CheckFile(path string) ([]*scanner.Error, error) {
+	if !isGoFile(path) {
+		return nil, errors.New("Go file only")
+	}
+
+	/*
+	   gopls check main.go
+	   /Users/cse/code/ke/main.go:35:2-6: declared and not used: part
+	   /Users/cse/code/ke/main.go:36:9-14: undefined: parts
+	*/
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	now := time.Now()
+	cmd := exec.CommandContext(ctx, "gopls", "check", path)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return nil, err
+	}
+	log.Printf("run %q in %.1fs", cmd, time.Since(now).Seconds())
+	rawLines := strings.Split(string(out), "\n")
+	if len(rawLines) == 0 {
+		return nil, nil
+	}
+	errs := make([]*scanner.Error, 0, len(rawLines))
+	for _, line := range rawLines {
+		before, after, ok := strings.Cut(line, " ")
+		if !ok {
+			continue
+		}
+		loc, err := ParseLocation(before)
+		if err != nil {
+			log.Print(err)
+			continue
+		}
+		errs = append(errs, &scanner.Error{
+			Pos: loc.Start,
+			Msg: after,
+		})
+	}
+	return errs, nil
 }
