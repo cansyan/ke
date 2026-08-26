@@ -168,7 +168,7 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 	case kero.PasteEndEvent:
 		e.pasting = false
 	case kero.MouseEvent:
-		e.handleMouse(ev)
+		e.handleMouse(ctx, ev)
 	case kero.KeyEvent:
 		e.handleKey(ctx, ev)
 	}
@@ -187,21 +187,28 @@ func (e *Editor) cursorFromMouse(m kero.MouseEvent) Position {
 	return e.PosFromVisual(Position{Row: row, Col: displayCol})
 }
 
-func (e *Editor) handleMouse(m kero.MouseEvent) error {
+func (e *Editor) handleMouse(ctx *kero.Context, m kero.MouseEvent) error {
 	switch m.Button {
 	case kero.MouseWheelUp:
 		if m.Y < e.bufferH() {
+			p := e.palette
+			if p.Active && paletteRect(ctx, p).Contains(kero.Point{X: m.X, Y: m.Y}) {
+				e.palette.Offset = max(0, p.Offset-1)
+				return nil
+			}
 			e.TopRow = max(0, e.TopRow-1)
 			return nil
 		}
 		if e.locations.Active {
 			e.locations.Offset = max(0, e.locations.Offset-1)
 		}
-		if e.palette.Active {
-			e.palette.Offset = max(0, e.palette.Offset-1)
-		}
 	case kero.MouseWheelDown:
 		if m.Y < e.bufferH() {
+			p := e.palette
+			if p.Active && paletteRect(ctx, p).Contains(kero.Point{X: m.X, Y: m.Y}) {
+				e.palette.Offset = min(p.Offset+1, p.VisibleRows())
+				return nil
+			}
 			e.TopRow = min(e.TopRow+1, len(e.Lines)-e.bufferH())
 			return nil
 		}
@@ -209,13 +216,26 @@ func (e *Editor) handleMouse(m kero.MouseEvent) error {
 			loc := e.locations
 			e.locations.Offset = min(loc.Offset+1, len(loc.Items)-loc.VisibleRows())
 		}
-		if e.palette.Active {
-			p := e.palette
-			e.palette.Offset = min(p.Offset+1, len(p.Items)-min(len(p.Items), p.MaxRows))
-		}
 	case kero.MouseLeft:
 		switch m.Action {
 		case kero.MousePress:
+			if e.palette.Active {
+				p := e.palette
+				pr := paletteRect(ctx, p)
+				if pr.Contains(kero.Point{X: m.X, Y: m.Y}) {
+					index := m.Y - pr.Y - 1 + e.palette.Offset
+					if index < 0 || index >= len(e.palette.Items) {
+						return nil
+					}
+					action := e.palette.Items[index].Action
+					e.palette.Close()
+					action(e)
+					return nil
+				}
+				// close palette overlay when click outside
+				e.palette.Close()
+			}
+
 			if m.Y < e.bufferH() {
 				e.Cursor = e.cursorFromMouse(m)
 				if e.hasSelect() {
@@ -230,15 +250,6 @@ func (e *Editor) handleMouse(m kero.MouseEvent) error {
 				}
 				e.locations.Index = index
 				e.gotoLocation(e.locations.Items[index])
-			}
-			if e.palette.Active && len(e.palette.Items) > 0 {
-				index := m.Y - e.bufferH() + e.palette.Offset
-				if index < 0 || index >= len(e.palette.Items) {
-					return nil
-				}
-				action := e.palette.Items[index].Action
-				e.palette.Close()
-				action(e) // Run selected action
 			}
 		case kero.MouseRelease:
 			if m.Y < e.bufferH() {
@@ -329,23 +340,14 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 			}
 			e.CloseBuffer()
 		case "ctrl+r":
-			if e.locations.Active {
-				e.locations.Active = false
-			}
 			e.palette.Open(e, "@")
 		case "ctrl+g":
 			GotoDefinition(e)
 			return nil
 		case "ctrl+p":
-			if e.locations.Active {
-				e.locations.Active = false
-			}
 			e.palette.Open(e, "")
 			return nil
 		case "ctrl+shift+p":
-			if e.locations.Active {
-				e.locations.Active = false
-			}
 			e.palette.Open(e, "/")
 			return nil
 		case "ctrl+]":
@@ -643,6 +645,15 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 	return nil
 }
 
+func paletteRect(ctx *kero.Context, p Palette) kero.Rect {
+	rect := kero.Rect{X: (ctx.Width - 60) / 2, Y: 1, W: 60, H: p.VisibleRows() + 1}
+	if rect.X <= 0 {
+		rect.X = ctx.Width / 4
+		rect.W = ctx.Width / 2
+	}
+	return rect
+}
+
 func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 	statusStyle := kero.NewStyle().Reverse()
 	lineNoStyle := kero.NewStyle().Foreground(kero.ColorBlue).Dim()
@@ -793,37 +804,32 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 
 	messageY := ctx.Height - 2
 	if messageY >= 0 {
-		if e.saveAs {
+		switch {
+		case e.saveAs:
 			e.drawSaveAs(f, messageY, ctx.Width)
-			return
-		}
-		if e.finding {
+		case e.finding:
 			e.drawFind(f, messageY, ctx.Width)
-			return
-		}
-		if e.renaming {
+		case e.renaming:
 			e.drawRename(f, messageY, ctx.Width)
-			return
-		}
-		if e.palette.Active {
-			e.drawPalette(f, messageY, ctx.Width)
-			return
-		}
-		if e.locations.Active {
+		case e.locations.Active:
 			e.drawLocationList(f, messageY, ctx.Width)
-			return
+		default:
+			if e.message == "" {
+				e.message = "^S save | ^W close | ^Q quit | ^F find | ^P palette"
+			}
+			if strings.HasPrefix(e.message, "error:") || strings.HasPrefix(e.message, "warn:") {
+				messageStyle = messageStyle.Foreground(kero.ColorRed)
+			}
+			f.Write(0, messageY, trimToWidth(" "+e.message, ctx.Width), messageStyle)
 		}
-		if e.message == "" {
-			e.message = "^S save | ^W close | ^Q quit | ^F find | ^P palette"
-		}
-		if strings.HasPrefix(e.message, "error:") || strings.HasPrefix(e.message, "warn:") {
-			messageStyle = messageStyle.Foreground(kero.ColorRed)
-		}
-		f.Write(0, messageY, trimToWidth(" "+e.message, ctx.Width), messageStyle)
 	}
 
 	if e.completion.Active {
 		e.drawCompletion(f)
+	}
+
+	if e.palette.Active {
+		e.drawPalette(f, paletteRect(ctx, e.palette))
 	}
 }
 
@@ -1491,9 +1497,6 @@ func (e *Editor) bufferH() int {
 	}
 	if e.locations.Active {
 		h -= min(len(e.locations.Items), e.locations.MaxRows)
-	}
-	if e.palette.Active {
-		h -= min(len(e.palette.Items), e.palette.MaxRows)
 	}
 	return h
 }
@@ -3091,6 +3094,10 @@ func (p *Palette) lineItems(e *Editor, query string) []PaletteItem {
 	}
 }
 
+func (p *Palette) VisibleRows() int {
+	return min(len(p.Items), p.MaxRows)
+}
+
 func (e *Editor) updatePalette(ev kero.KeyEvent) {
 	switch ev.Key {
 	case kero.KeyEsc:
@@ -3102,7 +3109,7 @@ func (e *Editor) updatePalette(ev kero.KeyEvent) {
 		}
 		e.palette.Index = (e.palette.Index + 1) % total
 		// Calculate scrolling offset to keep selected item inside dropdown viewport
-		visibleRows := min(total, e.palette.MaxRows)
+		visibleRows := e.palette.VisibleRows()
 		offset := 0
 		if e.palette.Index >= visibleRows {
 			offset = e.palette.Index - visibleRows + 1
@@ -3115,7 +3122,7 @@ func (e *Editor) updatePalette(ev kero.KeyEvent) {
 		}
 		e.palette.Index = (e.palette.Index - 1 + total) % total
 		// Calculate scrolling offset to keep selected item inside dropdown viewport
-		visibleRows := min(total, e.palette.MaxRows)
+		visibleRows := e.palette.VisibleRows()
 		offset := 0
 		if e.palette.Index >= visibleRows {
 			offset = e.palette.Index - visibleRows + 1
@@ -3218,7 +3225,7 @@ func (p *Palette) fileItems(e *Editor, query string) []PaletteItem {
 }
 
 // drawPalette renders the input field and popup overlay menu above row y.
-func (e *Editor) drawPalette(f *kero.Frame, y, width int) {
+func (e *Editor) drawPalette(f *kero.Frame, rect kero.Rect) {
 	if !e.palette.Active {
 		return
 	}
@@ -3226,23 +3233,18 @@ func (e *Editor) drawPalette(f *kero.Frame, y, width int) {
 	normal := kero.NewStyle()
 	p := &e.palette
 
-	// 1. Render input line at row y
-	f.Fill(kero.Rect{X: 0, Y: y, W: width, H: 1}, ' ', normal.Reverse())
-	p.Input.Draw(f, kero.Rect{X: 1, Y: y, W: width, H: 1}, normal.Reverse())
+	// Fill background for dropdown overlay
+	f.Fill(rect, ' ', normal.Reverse())
+	p.Input.Draw(f, kero.Rect{X: rect.X + 1, Y: rect.Y, W: rect.W, H: 1}, normal.Reverse())
 
-	// 2. Calculate visible window bounds
+	// Calculate visible window bounds
 	total := len(p.Items)
 	if total == 0 {
 		return
 	}
+	visibleRows := min(total, rect.H-1)
 
-	visibleRows := min(total, p.MaxRows)
-
-	// 3. Fill background for dropdown overlay rendered directly above row y
-	rect := kero.Rect{X: 0, Y: y - visibleRows, W: width, H: visibleRows}
-	f.Fill(rect, ' ', normal.Reverse())
-
-	// 4. Render item rows
+	// Render item rows
 	for i := range visibleRows {
 		idx := i + p.Offset
 		if idx >= total {
@@ -3250,7 +3252,7 @@ func (e *Editor) drawPalette(f *kero.Frame, y, width int) {
 		}
 
 		item := p.Items[idx]
-		lineY := rect.Y + i
+		lineY := rect.Y + i + 1 // plus 1 because of Input
 
 		// Selection cursor indicator
 		prefix := "  "
@@ -3264,15 +3266,15 @@ func (e *Editor) drawPalette(f *kero.Frame, y, width int) {
 		leftText := fmt.Sprintf("%s %s", prefix, item.Label)
 		leftRunes := []rune(leftText)
 
-		if len(leftRunes) > width {
-			leftText = string(leftRunes[:width])
+		if len(leftRunes) > rect.W {
+			leftText = string(leftRunes[:rect.W])
 		}
 		f.Write(rect.X, lineY, leftText, style)
 
 		// Right side text: Detail (e.g. line number or keybinding hint)
 		if item.Detail != "" {
 			detailRunes := []rune(item.Detail)
-			detailX := width - len(detailRunes) - 1
+			detailX := rect.X + (rect.W - len(detailRunes) - 1)
 
 			// Only render detail if it doesn't overlap left text
 			if detailX > len(leftRunes)+2 {
@@ -3604,11 +3606,13 @@ func runeIndexToByteColumn(line string, index int) int {
 
 func (e *Editor) gotoLocation(l Location) {
 	e.recordJump()
-	err := e.OpenFile(l.Start.Filename)
-	if err != nil {
-		log.Print(err)
-		e.message = err.Error()
-		return
+	if e.Path != l.Start.Filename {
+		err := e.OpenFile(l.Start.Filename)
+		if err != nil {
+			log.Print(err)
+			e.message = err.Error()
+			return
+		}
 	}
 	e.Cursor = Position{
 		Row: l.Start.Line - 1,
