@@ -71,6 +71,7 @@ func main() {
 		log.Fatal(err)
 	}
 	e.Buffer.Cursor = e.Buffer.ClampPos(Position{Row: row, Col: col})
+	e.debounceDiagnose()
 
 	f, err := os.OpenFile("/tmp/ke.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
@@ -102,6 +103,7 @@ type Editor struct {
 
 	// find mode opens a find line at the message area
 	finding        bool
+	findBlur       bool
 	replacing      bool
 	findInput      TextInput
 	replaceInput   TextInput
@@ -125,8 +127,6 @@ type Editor struct {
 	// reports whether the key comes from a paste action,
 	// to distinguish the manual KeyEnter or a pasted \n
 	pasting bool
-
-	gutterW int
 
 	jumps JumpList
 
@@ -168,7 +168,7 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 	case kero.PasteEndEvent:
 		e.pasting = false
 	case kero.MouseEvent:
-		e.handleMouse(ctx, ev)
+		e.handleMouse(ev)
 	case kero.KeyEvent:
 		e.handleKey(ctx, ev)
 	}
@@ -183,16 +183,17 @@ func (e *Editor) cursorFromMouse(m kero.MouseEvent) Position {
 		return e.Cursor
 	}
 
-	displayCol := m.X - e.gutterW + e.LeftCol
+	displayCol := m.X - bufferRect(e).X + e.LeftCol
 	return e.PosFromVisual(Position{Row: row, Col: displayCol})
 }
 
-func (e *Editor) handleMouse(ctx *kero.Context, m kero.MouseEvent) error {
+func (e *Editor) handleMouse(m kero.MouseEvent) error {
+	point := kero.Point{X: m.X, Y: m.Y}
 	switch m.Button {
 	case kero.MouseWheelUp:
-		if m.Y < e.bufferH() {
+		if bufferRect(e).Contains(point) {
 			p := e.palette
-			if p.Active && paletteRect(ctx, p).Contains(kero.Point{X: m.X, Y: m.Y}) {
+			if p.Active && paletteRect(e).Contains(point) {
 				e.palette.Offset = max(0, p.Offset-1)
 				return nil
 			}
@@ -203,13 +204,13 @@ func (e *Editor) handleMouse(ctx *kero.Context, m kero.MouseEvent) error {
 			e.locations.Offset = max(0, e.locations.Offset-1)
 		}
 	case kero.MouseWheelDown:
-		if m.Y < e.bufferH() {
+		if bufferRect(e).Contains(point) {
 			p := e.palette
-			if p.Active && paletteRect(ctx, p).Contains(kero.Point{X: m.X, Y: m.Y}) {
-				e.palette.Offset = min(p.Offset+1, p.VisibleRows())
+			if p.Active && paletteRect(e).Contains(kero.Point{X: m.X, Y: m.Y}) {
+				e.palette.Offset = min(p.Offset+1, len(p.Items)-p.VisibleRows())
 				return nil
 			}
-			e.TopRow = min(e.TopRow+1, len(e.Lines)-e.bufferH())
+			e.TopRow = min(e.TopRow+1, len(e.Lines)-bufferRect(e).H)
 			return nil
 		}
 		if e.locations.Active {
@@ -220,8 +221,7 @@ func (e *Editor) handleMouse(ctx *kero.Context, m kero.MouseEvent) error {
 		switch m.Action {
 		case kero.MousePress:
 			if e.palette.Active {
-				p := e.palette
-				pr := paletteRect(ctx, p)
+				pr := paletteRect(e)
 				if pr.Contains(kero.Point{X: m.X, Y: m.Y}) {
 					index := m.Y - pr.Y - 1 + e.palette.Offset
 					if index < 0 || index >= len(e.palette.Items) {
@@ -236,15 +236,19 @@ func (e *Editor) handleMouse(ctx *kero.Context, m kero.MouseEvent) error {
 				e.palette.Close()
 			}
 
-			if m.Y < e.bufferH() {
+			if bufferRect(e).Contains(point) {
 				e.Cursor = e.cursorFromMouse(m)
 				if e.hasSelect() {
 					e.clearSelect()
 				}
+				if e.finding {
+					// focus out
+					e.findBlur = true
+				}
 				return nil
 			}
 			if e.locations.Active {
-				index := m.Y - e.bufferH() - 1 + e.locations.Offset // minus 1 for header
+				index := m.Y - bufferRect(e).H - 1 + e.locations.Offset // minus 1 for header
 				if index < 0 || index >= len(e.locations.Items) {
 					return nil
 				}
@@ -252,7 +256,7 @@ func (e *Editor) handleMouse(ctx *kero.Context, m kero.MouseEvent) error {
 				e.gotoLocation(e.locations.Items[index])
 			}
 		case kero.MouseRelease:
-			if m.Y < e.bufferH() {
+			if bufferRect(e).Contains(point) {
 				// ctrl+mouse_left_release goto definition
 				if m.Mod == kero.ModCtrl {
 					GotoDefinition(e)
@@ -290,7 +294,7 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 	if e.saveAs {
 		return e.updateSaveAs(key)
 	}
-	if e.finding {
+	if e.finding && !e.findBlur {
 		return e.updateFind(key)
 	}
 	if e.palette.Active {
@@ -353,12 +357,12 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 		case "ctrl+]":
 			e.gotoDiagnostic()
 			return nil
-		case "ctrl+shift+]":
+		case "ctrl+shift+]", "ctrl+}":
 			if len(e.locations.Items) <= 1 {
 				return nil
 			}
 			e.gotoLocation(e.locations.Next())
-		case "ctrl+shift+[":
+		case "ctrl+shift+[", "ctrl+{":
 			if len(e.locations.Items) <= 1 {
 				return nil
 			}
@@ -625,11 +629,11 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 		e.Cursor = e.Buffer.LineEnd(e.Cursor)
 	case kero.KeyPgUp:
 		e.recordJump()
-		e.Cursor.Row -= e.bufferH()
+		e.Cursor.Row -= bufferRect(e).H
 		e.Cursor = e.Buffer.ClampPos(e.Cursor)
 	case kero.KeyPgDown:
 		e.recordJump()
-		e.Cursor.Row += e.bufferH()
+		e.Cursor.Row += bufferRect(e).H
 		e.Cursor = e.Buffer.ClampPos(e.Cursor)
 	case kero.KeyEsc:
 		if e.completion.Active {
@@ -640,16 +644,47 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 			e.locations.Active = false
 			return nil
 		}
+		if e.finding {
+			e.finding = false
+			return nil
+		}
 		e.clearSelect()
 	}
 	return nil
 }
 
-func paletteRect(ctx *kero.Context, p Palette) kero.Rect {
-	rect := kero.Rect{X: (ctx.Width - 60) / 2, Y: 1, W: 60, H: p.VisibleRows() + 1}
+// return the width of line number
+func lineNumberW(lines int) int {
+	width := 1
+	for lines >= 10 {
+		width++
+		lines /= 10
+	}
+	return width
+}
+
+func gutterWidth(lines int) int {
+	return lineNumberW(lines) + 2 // marker, line number, and separator
+}
+
+// helper function to calculate the rectangle of buffer
+func bufferRect(e *Editor) kero.Rect {
+	h := e.Height - 2
+	if h <= 0 {
+		return kero.Rect{}
+	}
+	if e.locations.Active {
+		h -= min(len(e.locations.Items), e.locations.MaxRows)
+	}
+	gutterW := gutterWidth(len(e.Lines))
+	return kero.Rect{X: gutterW, Y: 0, W: e.Width - gutterW, H: h}
+}
+
+func paletteRect(e *Editor) kero.Rect {
+	rect := kero.Rect{X: (e.Width - 60) / 2, Y: 2, W: 60, H: e.palette.VisibleRows() + 1}
 	if rect.X <= 0 {
-		rect.X = ctx.Width / 4
-		rect.W = ctx.Width / 2
+		rect.X = e.Width / 4
+		rect.W = e.Width / 2
 	}
 	return rect
 }
@@ -662,11 +697,9 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 	selectStyle := textStyle.Reverse()
 	messageStyle := kero.NewStyle()
 
-	bufferH := e.bufferH()
+	bRect := bufferRect(e)
 	lineNoW := lineNumberW(len(e.Lines))
-	gutterW := lineNoW + 2 // marker, line number, and separator
-	e.gutterW = gutterW
-	for y := range bufferH {
+	for y := range bRect.H {
 		lineIndex := e.TopRow + y
 		if lineIndex >= len(e.Lines) {
 			f.Write(0, y, "~", lineNoStyle)
@@ -681,25 +714,23 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 
 		srcLine := e.Buffer.Line(lineIndex)
 		fullPadded := padTab(srcLine, 4)
-		limit := max(0, ctx.Width-gutterW)
 
 		// visual part of the padded line
 		var visPadded string
 		if e.LeftCol < len(fullPadded) {
 			visPadded = fullPadded[e.LeftCol:]
 		}
-		if len(visPadded) > limit {
-			visPadded = visPadded[:limit]
+		if len(visPadded) > bRect.W {
+			visPadded = visPadded[:bRect.W]
 		}
 
 		// draw the line
-		f.Write(gutterW, y, visPadded, textStyle)
+		f.Write(bRect.X, y, visPadded, textStyle)
 
 		if v := e.diagnosticForLine(lineIndex); v != nil {
 			red := kero.NewStyle().Foreground(kero.ColorRed)
 			f.Write(0, y, "x", red)
-			//f.Write(gutterW+len(visPadded)+2, y, v.Message, red)
-			dx := max(gutterW+len(visPadded), ctx.Width-len(v.Msg))
+			dx := max(bRect.X+len(visPadded), ctx.Width-len(v.Msg))
 			f.Write(dx, y, v.Msg, red)
 		}
 
@@ -730,11 +761,12 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 
 				for x := startDisplay; x < endDisplay; x++ {
 					ch := rune(visPadded[x])
-					f.Set(gutterW+x, y, ch, selectStyle)
+					f.Set(bRect.X+x, y, ch, selectStyle)
 				}
 			}
 		}
 
+		// highlight finding match
 		if e.finding && e.findMatch && lineIndex == e.findMatchStart.Row && lineIndex == e.findMatchEnd.Row {
 			visStart := e.VisualPos(Position{Row: lineIndex, Col: e.findMatchStart.Col})
 			visEnd := e.VisualPos(Position{Row: lineIndex, Col: e.findMatchEnd.Col})
@@ -744,15 +776,15 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 
 			for x := startDisplay; x < endDisplay; x++ {
 				ch := rune(visPadded[x])
-				f.Set(gutterW+x, y, ch, selectStyle)
+				f.Set(bRect.X+x, y, ch, selectStyle)
 			}
 		}
 	}
 
 	cursorVisPos := e.VisualPos(e.Cursor)
-	cursorX := gutterW + cursorVisPos.Col - e.LeftCol
+	cursorX := bRect.X + cursorVisPos.Col - e.LeftCol
 	cursorY := 0 + e.Cursor.Row - e.TopRow
-	if cursorY >= 0 && cursorY < bufferH && cursorX >= gutterW && cursorX < ctx.Width {
+	if bRect.Contains(kero.Point{X: cursorX, Y: cursorY}) {
 		fullLinePadded := padTab(e.Line(e.Cursor.Row), 4)
 		ch := ' '
 		if cursorVisPos.Col < len(fullLinePadded) {
@@ -829,7 +861,7 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 	}
 
 	if e.palette.Active {
-		e.drawPalette(f, paletteRect(ctx, e.palette))
+		e.drawPalette(f, paletteRect(e))
 	}
 }
 
@@ -1085,6 +1117,7 @@ func (e *Editor) drawSaveAs(f *kero.Frame, y int, width int) {
 // startFind starts a Find prompt, and pre-fill with selection or last query, if any.
 func (e *Editor) startFind() {
 	e.finding = true
+	e.findBlur = false
 	e.replacing = false
 	if e.hasSelect() {
 		e.findInput.SetTextAndSelectAll(e.Buffer.GetRange(e.SelAnchor, e.Cursor))
@@ -1328,7 +1361,7 @@ type diagResult struct {
 // debounceDiagnose makes instant diagnose for dirty buffer,
 // and accurate diagnose for clean file.
 func (e *Editor) debounceDiagnose() {
-	if e.Buffer == nil {
+	if e.Buffer == nil || !isGoFile(e.Buffer.Path) {
 		return
 	}
 
@@ -1348,7 +1381,7 @@ func (e *Editor) debounceDiagnose() {
 			// suitable for instant editing
 			errs = CheckSemantics(filename, src)
 		} else {
-			diags, err := CheckFile(e.Path)
+			diags, err := CheckFile(filename)
 			if err != nil {
 				log.Print(err)
 				e.message = err.Error()
@@ -1426,7 +1459,7 @@ func isGoFile(path string) bool {
 // scroll vertically to ensure cursor visible
 func (e *Editor) scrollV(margin int) {
 	// 1. Vertical Scrolling (Row)
-	maxTopRow := e.Cursor.Row - (e.bufferH() - margin)
+	maxTopRow := e.Cursor.Row - (bufferRect(e).H - margin)
 	if e.TopRow < maxTopRow {
 		e.TopRow = maxTopRow
 	}
@@ -1465,11 +1498,6 @@ func (e *Editor) scrollH() {
 // the visible viewport.
 // It does nothing if called after showCursorCenter()
 func (e *Editor) showCursor() {
-	bufH := e.bufferH()
-	if bufH <= 0 {
-		return
-	}
-
 	e.scrollV(1)
 	e.scrollH()
 }
@@ -1478,7 +1506,7 @@ func (e *Editor) showCursor() {
 // If cursor's row is visible, it shows naturally, without vertical scroll;
 // Otherwise, it scroll the viewport to center the cursor.
 func (e *Editor) showCursorCenter() {
-	bufH := e.bufferH()
+	bufH := bufferRect(e).H
 	if bufH <= 0 {
 		return
 	}
@@ -1487,28 +1515,6 @@ func (e *Editor) showCursorCenter() {
 		e.scrollV(bufH / 2)
 	}
 	e.scrollH()
-}
-
-// buffer height = app height - 2
-func (e *Editor) bufferH() int {
-	h := e.Height - 2
-	if h < 0 {
-		return 0
-	}
-	if e.locations.Active {
-		h -= min(len(e.locations.Items), e.locations.MaxRows)
-	}
-	return h
-}
-
-// return the width of line number
-func lineNumberW(lines int) int {
-	width := 1
-	for lines >= 10 {
-		width++
-		lines /= 10
-	}
-	return width
 }
 
 func trimToWidth(s string, width int) string {
@@ -2497,10 +2503,10 @@ func (s SymbolPosition) String() string {
 }
 
 // ExtractSymbols collects all top-level symbols in the file.
-// It is in-memory and fast, intended for completion.
-func ExtractSymbols(src any) []SymbolPosition {
+// It is in-memory and fast.
+func ExtractSymbols(filename string, src any) []SymbolPosition {
 	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, "buffer.go", src, 0)
+	file, err := parser.ParseFile(fset, filename, src, 0)
 	if err != nil && file == nil {
 		return nil
 	}
@@ -2599,9 +2605,6 @@ func (e *Editor) OpenFile(path string) error {
 			e.active = i
 			e.Buffer = buf
 			e.diags = nil
-			if isGoFile(e.Path) {
-				e.debounceDiagnose()
-			}
 			return nil
 		}
 	}
@@ -2615,9 +2618,6 @@ func (e *Editor) OpenFile(path string) error {
 	e.active = len(e.buffers) - 1
 	e.Buffer = buf
 	e.diags = nil
-	if isGoFile(e.Path) {
-		e.debounceDiagnose()
-	}
 	return nil
 }
 
@@ -2635,9 +2635,6 @@ func (e *Editor) CloseBuffer() {
 	e.Buffer = e.buffers[e.active]
 	e.diags = nil
 	e.message = ""
-	if isGoFile(e.Path) {
-		e.debounceDiagnose()
-	}
 }
 
 func (e *Editor) NextBuffer() {
@@ -2645,9 +2642,6 @@ func (e *Editor) NextBuffer() {
 		e.active = (e.active + 1) % len(e.buffers)
 		e.Buffer = e.buffers[e.active]
 		e.diags = nil
-		if isGoFile(e.Path) {
-			e.debounceDiagnose()
-		}
 	}
 }
 
@@ -2656,9 +2650,6 @@ func (e *Editor) PrevBuffer() {
 		e.active = (e.active - 1 + len(e.buffers)) % len(e.buffers)
 		e.Buffer = e.buffers[e.active]
 		e.diags = nil
-		if isGoFile(e.Path) {
-			e.debounceDiagnose()
-		}
 	}
 }
 
@@ -2843,6 +2834,7 @@ func (e *Editor) jumpTo(target Jump) {
 			log.Print(err)
 			return
 		}
+		e.debounceDiagnose()
 	}
 
 	// 2. Set cursor position
@@ -2944,7 +2936,7 @@ func (p *Palette) symbolItems(e *Editor, query string) []PaletteItem {
 	}
 
 	if p.symbols == nil {
-		p.symbols = FileSymbols(e)
+		p.symbols = ExtractSymbols(e.Path, e.Buffer.NewReader())
 	}
 	var items []PaletteItem
 
@@ -3207,7 +3199,11 @@ func (p *Palette) fileItems(e *Editor, query string) []PaletteItem {
 			Label: filepath.Base(absPath),
 			Action: func(ed *Editor) {
 				ed.recordJump()
-				ed.OpenFile(absPath)
+				if err := ed.OpenFile(absPath); err != nil {
+					log.Print(err)
+					return
+				}
+				ed.debounceDiagnose()
 			},
 		})
 
@@ -3288,8 +3284,7 @@ type Completion struct {
 }
 
 func (c *Completion) Refresh(src any, query string) {
-	// TODO
-	results := ExtractSymbols(src)
+	results := ExtractSymbols("", src)
 	if len(results) == 0 {
 		return
 	}
@@ -3346,7 +3341,7 @@ func (e *Editor) drawCompletion(f *kero.Frame) {
 	}
 
 	var normal kero.Style
-	x := e.gutterW + e.VisualPos(e.Cursor).Col - e.LeftCol
+	x := bufferRect(e).X + e.VisualPos(e.Cursor).Col - e.LeftCol
 	y := e.Cursor.Row - e.TopRow
 	w := maxWidth + 3 // 2 for indicator, 1 for right padding
 	rect := kero.Rect{X: x, Y: y - visibleRows, W: w, H: visibleRows}
@@ -3600,6 +3595,7 @@ func (e *Editor) gotoLocation(l Location) {
 			e.message = err.Error()
 			return
 		}
+		e.debounceDiagnose()
 	}
 	e.Cursor = Position{
 		Row: l.Start.Line - 1,
@@ -3743,6 +3739,8 @@ func (e *Editor) drawLocationList(f *kero.Frame, y, width int) {
 //	Editor Struct 90:6-90:12
 //		Buffer Field 91:3-91:9
 //		Height Field 95:2-95:8
+//
+// deprected: obvious slow, use ExtractSymbols instead
 func FileSymbols(e *Editor) []SymbolPosition {
 	if !isGoFile(e.Path) {
 		return nil
@@ -3836,3 +3834,4 @@ func CheckFile(path string) ([]*scanner.Error, error) {
 	}
 	return errs, nil
 }
+
