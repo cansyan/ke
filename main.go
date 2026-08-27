@@ -2191,10 +2191,7 @@ func (b *Buffer) MoveWordLeft(p Position) Position {
 	}
 
 	line := b.Lines[p.Row]
-	col := p.Col
-	if col > len(line) {
-		col = len(line)
-	}
+	col := min(p.Col, len(line))
 
 	// If at start of line, move to end of previous line
 	if col == 0 {
@@ -2631,7 +2628,7 @@ func (e *Editor) CloseBuffer() {
 		return
 	}
 	// Remove from slice and adjust active index
-	e.buffers = append(e.buffers[:e.active], e.buffers[e.active+1:]...)
+	e.buffers = slices.Delete(e.buffers, e.active, e.active+1)
 	if e.active >= len(e.buffers) {
 		e.active = len(e.buffers) - 1
 	}
@@ -3592,16 +3589,6 @@ func byteColumnToRuneIndex(line string, column int) int {
 		}
 	}
 	return len(runes) - 1
-}
-
-// convert 0-base rune index to 1-base column number (byte count)
-func runeIndexToByteColumn(line string, index int) int {
-	runes := []rune(line)
-	var column int
-	for i := range index {
-		column += utf8.RuneLen(runes[i])
-	}
-	return column
 }
 
 func (e *Editor) gotoLocation(l Location) {
