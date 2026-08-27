@@ -368,7 +368,11 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 			}
 			e.gotoLocation(e.locations.Prev())
 		case "ctrl+s":
-			return e.save()
+			if err := e.save(); err != nil {
+				return err
+			}
+			e.debounceDiagnose()
+			return nil
 		case "ctrl+f":
 			e.startFind()
 			return nil
@@ -1094,7 +1098,11 @@ func (e *Editor) finishSaveAs() error {
 	}
 	e.Path = p
 	e.saveAs = false
-	return e.save()
+	if err := e.save(); err != nil {
+		return err
+	}
+	e.debounceDiagnose()
+	return nil
 }
 
 func (e *Editor) drawSaveAs(f *kero.Frame, y int, width int) {
@@ -2490,8 +2498,7 @@ type SymbolPosition struct {
 	Name     string
 	Receiver string
 	Kind     string // "func", "method", "type", "struct", "var", "const"
-	Line     int    // 1-based
-	Column   int    // 1-based
+	token.Position
 }
 
 // combines receiver and symbol name
@@ -2530,8 +2537,7 @@ func ExtractSymbols(filename string, src any) []SymbolPosition {
 				Name:     d.Name.Name,
 				Receiver: recv,
 				Kind:     kind,
-				Line:     pos.Line,
-				Column:   pos.Column,
+				Position: pos,
 			})
 
 		case *ast.GenDecl:
@@ -2546,10 +2552,9 @@ func ExtractSymbols(filename string, src any) []SymbolPosition {
 						kind = "interface"
 					}
 					results = append(results, SymbolPosition{
-						Name:   s.Name.Name,
-						Kind:   kind,
-						Line:   pos.Line,
-						Column: pos.Column,
+						Name:     s.Name.Name,
+						Kind:     kind,
+						Position: pos,
 					})
 
 				case *ast.ValueSpec:
@@ -2560,10 +2565,9 @@ func ExtractSymbols(filename string, src any) []SymbolPosition {
 					for _, name := range s.Names {
 						pos := fset.Position(name.Pos())
 						results = append(results, SymbolPosition{
-							Name:   name.Name,
-							Kind:   kind,
-							Line:   pos.Line,
-							Column: pos.Column,
+							Name:     name.Name,
+							Kind:     kind,
+							Position: pos,
 						})
 					}
 				}
@@ -3728,6 +3732,7 @@ func (e *Editor) drawLocationList(f *kero.Frame, y, width int) {
 	}
 }
 
+/*
 // For example, run:
 //
 //	gopls symbols main.go
@@ -3791,6 +3796,7 @@ func FileSymbols(e *Editor) []SymbolPosition {
 	}
 	return symbols
 }
+*/
 
 // CheckFile checks file on disk, make accurate diagnoses.
 func CheckFile(path string) ([]*scanner.Error, error) {
@@ -3834,4 +3840,3 @@ func CheckFile(path string) ([]*scanner.Error, error) {
 	}
 	return errs, nil
 }
-
