@@ -135,7 +135,7 @@ type Editor struct {
 	renaming    bool
 	renameInput TextInput
 
-	locations LocationList
+	ref ReferencesPanel
 }
 
 func (e *Editor) Init(ctx *kero.Context) error {
@@ -200,8 +200,8 @@ func (e *Editor) handleMouse(m kero.MouseEvent) error {
 			e.TopRow = max(0, e.TopRow-1)
 			return nil
 		}
-		if e.locations.Active {
-			e.locations.Offset = max(0, e.locations.Offset-1)
+		if e.ref.Active {
+			e.ref.Offset = max(0, e.ref.Offset-1)
 		}
 	case kero.MouseWheelDown:
 		if bufferRect(e).Contains(point) {
@@ -213,9 +213,8 @@ func (e *Editor) handleMouse(m kero.MouseEvent) error {
 			e.TopRow = min(e.TopRow+1, len(e.Lines)-bufferRect(e).H)
 			return nil
 		}
-		if e.locations.Active {
-			loc := e.locations
-			e.locations.Offset = min(loc.Offset+1, len(loc.Items)-loc.VisibleRows())
+		if e.ref.Active {
+			e.ref.Offset = min(e.ref.Offset+1, len(e.ref.Items)-e.ref.VisibleRows())
 		}
 	case kero.MouseLeft:
 		switch m.Action {
@@ -247,13 +246,13 @@ func (e *Editor) handleMouse(m kero.MouseEvent) error {
 				}
 				return nil
 			}
-			if e.locations.Active {
-				index := m.Y - bufferRect(e).H - 1 + e.locations.Offset // minus 1 for header
-				if index < 0 || index >= len(e.locations.Items) {
+			if lRect := bottomPanelRect(e); e.ref.Active && lRect.Contains(point) {
+				index := m.Y - lRect.Y - 1 + e.ref.Offset // minus 1 for header
+				if index < 0 || index >= len(e.ref.Items) {
 					return nil
 				}
-				e.locations.Index = index
-				e.gotoLocation(e.locations.Items[index])
+				e.ref.Index = index
+				e.gotoPosition(e.ref.Items[index].Start)
 			}
 		case kero.MouseRelease:
 			if bufferRect(e).Contains(point) {
@@ -358,15 +357,15 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 			e.gotoDiagnostic()
 			return nil
 		case "ctrl+shift+]", "ctrl+}":
-			if len(e.locations.Items) <= 1 {
+			if len(e.ref.Items) <= 1 {
 				return nil
 			}
-			e.gotoLocation(e.locations.Next())
+			e.gotoPosition(e.ref.Next().Start)
 		case "ctrl+shift+[", "ctrl+{":
-			if len(e.locations.Items) <= 1 {
+			if len(e.ref.Items) <= 1 {
 				return nil
 			}
-			e.gotoLocation(e.locations.Prev())
+			e.gotoPosition(e.ref.Prev().Start)
 		case "ctrl+s":
 			if err := e.save(); err != nil {
 				return err
@@ -644,8 +643,8 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 			e.completion.Active = false
 			return nil
 		}
-		if e.locations.Active {
-			e.locations.Active = false
+		if e.ref.Active {
+			e.ref.Active = false
 			return nil
 		}
 		if e.finding {
@@ -677,8 +676,8 @@ func bufferRect(e *Editor) kero.Rect {
 	if h <= 0 {
 		return kero.Rect{}
 	}
-	if e.locations.Active {
-		h -= min(len(e.locations.Items), e.locations.MaxRows)
+	if e.ref.Active {
+		h -= min(len(e.ref.Items), e.ref.MaxRows)
 	}
 	gutterW := gutterWidth(len(e.Lines))
 	return kero.Rect{X: gutterW, Y: 0, W: e.Width - gutterW, H: h}
@@ -847,8 +846,8 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 			e.drawFind(f, messageY, ctx.Width)
 		case e.renaming:
 			e.drawRename(f, messageY, ctx.Width)
-		case e.locations.Active:
-			e.drawLocationList(f, messageY, ctx.Width)
+		case e.ref.Active:
+			e.drawReferences(f, bottomPanelRect(e))
 		default:
 			if e.message == "" {
 				e.message = "^S save | ^W close | ^Q quit | ^F find | ^P palette"
@@ -3021,18 +3020,18 @@ func (p *Palette) commandItems(_ *Editor, query string) []PaletteItem {
 			}
 			e.startRename()
 		}},
-		{"list location", "", func(e *Editor) { e.locations.Active = !e.locations.Active }},
+		{"list location", "", func(e *Editor) { e.ref.Active = !e.ref.Active }},
 		{"next location", "ctrl+shift+]", func(e *Editor) {
-			if len(e.locations.Items) <= 1 {
+			if len(e.ref.Items) <= 1 {
 				return
 			}
-			e.gotoLocation(e.locations.Next())
+			e.gotoPosition(e.ref.Next().Start)
 		}},
 		{"prev location", "ctrl+shift+[", func(e *Editor) {
-			if len(e.locations.Items) <= 1 {
+			if len(e.ref.Items) <= 1 {
 				return
 			}
-			e.gotoLocation(e.locations.Prev())
+			e.gotoPosition(e.ref.Prev().Start)
 		}},
 	}
 
@@ -3478,10 +3477,10 @@ func GotoDefinition(e *Editor) {
 		log.Print(err)
 		return
 	}
-	e.gotoLocation(l)
+	e.gotoPosition(l.Start)
 }
 
-type LocationList struct {
+type ReferencesPanel struct {
 	Active  bool
 	Index   int
 	Items   []Location
@@ -3490,56 +3489,56 @@ type LocationList struct {
 	Header  string
 }
 
-func NewLocationList(header string, items []Location) LocationList {
-	return LocationList{Active: true, Header: header, Items: items, MaxRows: 10}
+func NewReferencesPanel(header string, items []Location) ReferencesPanel {
+	return ReferencesPanel{Active: true, Header: header, Items: items, MaxRows: 10}
 }
 
-func (ls *LocationList) VisibleRows() int {
-	maxRows := ls.MaxRows
+func (r *ReferencesPanel) VisibleRows() int {
+	maxRows := r.MaxRows
 	if maxRows == 0 {
 		maxRows = 10
 	}
-	return min(len(ls.Items), maxRows)
+	return min(len(r.Items), maxRows)
 }
 
-func (ls *LocationList) Next() Location {
-	total := len(ls.Items)
+func (r *ReferencesPanel) Next() Location {
+	total := len(r.Items)
 	if total == 0 {
 		return Location{}
 	}
 	if total == 1 {
-		return ls.Items[0]
+		return r.Items[0]
 	}
-	ls.Index = (ls.Index + 1) % total
+	r.Index = (r.Index + 1) % total
 
 	// Calculate scrolling offset to keep selected item inside dropdown viewport
-	visibleRows := ls.VisibleRows()
+	visibleRows := r.VisibleRows()
 	offset := 0
-	if ls.Index >= visibleRows {
-		offset = ls.Index - visibleRows + 1
+	if r.Index >= visibleRows {
+		offset = r.Index - visibleRows + 1
 	}
-	ls.Offset = offset
-	return ls.Items[ls.Index]
+	r.Offset = offset
+	return r.Items[r.Index]
 }
 
-func (ls *LocationList) Prev() Location {
-	total := len(ls.Items)
+func (r *ReferencesPanel) Prev() Location {
+	total := len(r.Items)
 	if total == 0 {
 		return Location{}
 	}
 	if total == 1 {
-		return ls.Items[0]
+		return r.Items[0]
 	}
-	ls.Index = (ls.Index - 1 + total) % total
+	r.Index = (r.Index - 1 + total) % total
 
 	// Calculate scrolling offset to keep selected item inside dropdown viewport
-	visibleRows := ls.VisibleRows()
+	visibleRows := r.VisibleRows()
 	offset := 0
-	if ls.Index >= visibleRows {
-		offset = ls.Index - visibleRows + 1
+	if r.Index >= visibleRows {
+		offset = r.Index - visibleRows + 1
 	}
-	ls.Offset = offset
-	return ls.Items[ls.Index]
+	r.Offset = offset
+	return r.Items[r.Index]
 }
 
 // Location represents a specific span of text or a point tied to a specific file.
@@ -3590,10 +3589,11 @@ func byteColumnToRuneIndex(line string, column int) int {
 	return len(runes) - 1
 }
 
-func (e *Editor) gotoLocation(l Location) {
+// goto the token position
+func (e *Editor) gotoPosition(p token.Position) {
 	e.recordJump()
-	if e.Path != l.Start.Filename {
-		err := e.OpenFile(l.Start.Filename)
+	if e.Path != p.Filename {
+		err := e.OpenFile(p.Filename)
 		if err != nil {
 			log.Print(err)
 			e.message = err.Error()
@@ -3602,8 +3602,8 @@ func (e *Editor) gotoLocation(l Location) {
 		e.debounceDiagnose()
 	}
 	e.Cursor = Position{
-		Row: l.Start.Line - 1,
-		Col: byteColumnToRuneIndex(string(e.Lines[l.Start.Line-1]), l.Start.Column),
+		Row: p.Line - 1,
+		Col: byteColumnToRuneIndex(string(e.Lines[p.Line-1]), p.Column),
 	}
 	e.showCursorCenter()
 }
@@ -3659,28 +3659,33 @@ func findReferences(e *Editor) {
 	}
 	start, end := e.Buffer.WordBounds(e.Cursor)
 	header := fmt.Sprintf("%d references for %q", len(locations), e.Buffer.GetRange(start, end))
-	e.locations = NewLocationList(header, locations)
+	e.ref = NewReferencesPanel(header, locations)
 }
 
-// drawLocationList renders the input field and popup overlay menu above row y.
-func (e *Editor) drawLocationList(f *kero.Frame, y, width int) {
-	loc := e.locations
-	if !loc.Active || len(loc.Items) == 0 {
+func bottomPanelRect(e *Editor) kero.Rect {
+	headerRow := 1
+	visibleRows := e.ref.VisibleRows()
+	rect := kero.Rect{X: 0, W: e.Width, H: visibleRows + headerRow}
+	rect.Y = e.Height - 1 - rect.H
+	return rect
+}
+
+// drawReferences renders a bottom overlay panel for LSP References.
+func (e *Editor) drawReferences(f *kero.Frame, rect kero.Rect) {
+	if !e.ref.Active || len(e.ref.Items) == 0 {
 		return
 	}
 
 	style := kero.NewStyle().Reverse()
 
 	// Calculate visible window bounds
-	total := len(loc.Items)
-	visibleRows := loc.VisibleRows()
+	total := len(e.ref.Items)
+	visibleRows := e.ref.VisibleRows()
 
 	// 3. Fill background for dropdown overlay rendered directly above row y
-	headerRow := 1
-	rect := kero.Rect{X: 0, Y: y - visibleRows, W: width, H: visibleRows + headerRow}
 	f.Fill(rect, ' ', style)
 	// 4. Render header
-	f.Write(rect.X+1, rect.Y, loc.Header, style)
+	f.Write(rect.X+1, rect.Y, e.ref.Header, style)
 
 	buffers := e.buffers
 	getBuffer := func(path string) (*Buffer, error) {
@@ -3699,17 +3704,17 @@ func (e *Editor) drawLocationList(f *kero.Frame, y, width int) {
 
 	// 5. Render item rows
 	for i := range visibleRows {
-		idx := i + loc.Offset
+		idx := i + e.ref.Offset
 		if idx >= total {
 			break
 		}
 
-		item := loc.Items[idx]
-		lineY := rect.Y + headerRow + i
+		item := e.ref.Items[idx]
+		lineY := rect.Y + i + 1 // 1 is the header row
 
 		indicator := " "
 		itemStyle := style
-		if idx == loc.Index {
+		if idx == e.ref.Index {
 			indicator = ">"
 			itemStyle = itemStyle.Bold()
 		}
@@ -3725,78 +3730,12 @@ func (e *Editor) drawLocationList(f *kero.Frame, y, width int) {
 			item.Start.Column, line)
 		runes := []rune(text)
 
-		if len(runes) > width {
-			text = string(runes[:width])
+		if len(runes) > rect.W {
+			text = string(runes[:rect.W])
 		}
 		f.Write(rect.X+1, lineY, text, itemStyle)
 	}
 }
-
-/*
-// For example, run:
-//
-//	gopls symbols main.go
-//
-// ouput:
-//
-//	parsePathArg Function 34:6-34:18
-//	main Function 59:6-59:10
-//	Editor Struct 90:6-90:12
-//		Buffer Field 91:3-91:9
-//		Height Field 95:2-95:8
-//
-// deprected: obvious slow, use ExtractSymbols instead
-func FileSymbols(e *Editor) []SymbolPosition {
-	if !isGoFile(e.Path) {
-		return nil
-	}
-	// flush buffer to disk before running gopls
-	if e.Buffer.Dirty {
-		if err := e.Buffer.Save(); err != nil {
-			log.Print(err)
-			e.message = err.Error()
-			return nil
-		}
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	now := time.Now()
-	cmd := exec.CommandContext(ctx, "gopls", "symbols", fmt.Sprintf("%s", e.Path))
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		log.Print(err)
-		e.message = err.Error()
-		return nil
-	}
-	log.Printf("run %q in %.1fs", cmd, time.Since(now).Seconds())
-	rawLines := strings.Split(string(out), "\n")
-	if len(rawLines) == 0 {
-		return nil
-	}
-	symbols := make([]SymbolPosition, 0, len(rawLines))
-	for _, line := range rawLines {
-		parts := strings.Fields(line)
-		if len(parts) < 3 {
-			continue
-		}
-		sym := SymbolPosition{
-			Name: parts[0],
-			Kind: parts[1],
-		}
-		rawPos := strings.Split(parts[2], "-")
-		if len(rawPos) != 2 {
-			continue
-		}
-		if parts := strings.Split(rawPos[0], ":"); len(parts) == 2 {
-			sym.Line, _ = strconv.Atoi(parts[0])
-			sym.Column, _ = strconv.Atoi(parts[1])
-		}
-		symbols = append(symbols, sym)
-	}
-	return symbols
-}
-*/
 
 // CheckFile checks file on disk, make accurate diagnoses.
 func CheckFile(path string) ([]*scanner.Error, error) {
