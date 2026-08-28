@@ -252,7 +252,7 @@ func (e *Editor) handleMouse(m kero.MouseEvent) error {
 					return nil
 				}
 				e.ref.Index = index
-				e.gotoPosition(e.ref.Items[index].Start)
+				e.gotoLocation(e.ref.Items[index])
 			}
 		case kero.MouseRelease:
 			if bufferRect(e).Contains(point) {
@@ -360,12 +360,12 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 			if len(e.ref.Items) <= 1 {
 				return nil
 			}
-			e.gotoPosition(e.ref.Next().Start)
+			e.gotoLocation(e.ref.Next())
 		case "ctrl+shift+[", "ctrl+{":
 			if len(e.ref.Items) <= 1 {
 				return nil
 			}
-			e.gotoPosition(e.ref.Prev().Start)
+			e.gotoLocation(e.ref.Prev())
 		case "ctrl+s":
 			if err := e.save(); err != nil {
 				return err
@@ -804,8 +804,8 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 				names.WriteString("[")
 			}
 			name := "untitled"
-			if b.Path != "" {
-				name = filepath.Base(b.Path)
+			if b.Filename != "" {
+				name = filepath.Base(b.Filename)
 			}
 			names.WriteString(name)
 			if b.Dirty {
@@ -1046,7 +1046,7 @@ func (e *Editor) save() error {
 	if e.Buffer == nil {
 		return nil
 	}
-	if e.Path == "" {
+	if e.Filename == "" {
 		e.startSaveAs()
 		return nil
 	}
@@ -1060,13 +1060,13 @@ func (e *Editor) save() error {
 		return nil
 	}
 
-	e.message = fmt.Sprintf("saved %s", filepath.Base(e.Path))
+	e.message = fmt.Sprintf("saved %s", filepath.Base(e.Filename))
 	return nil
 }
 
 func (e *Editor) startSaveAs() {
 	e.saveAs = true
-	e.saveInput.SetText(e.Path)
+	e.saveInput.SetText(e.Filename)
 	e.message = "enter a filename"
 }
 
@@ -1095,7 +1095,7 @@ func (e *Editor) finishSaveAs() error {
 	if err != nil {
 		return err
 	}
-	e.Path = p
+	e.Filename = p
 	e.saveAs = false
 	if err := e.save(); err != nil {
 		return err
@@ -1355,7 +1355,7 @@ func (e *Editor) moveDown() {
 func (e *Editor) markDirty() {
 	e.Dirty = true
 	e.message = ""
-	if isGoFile(e.Path) {
+	if isGoFile(e.Filename) {
 		e.debounceDiagnose()
 	}
 }
@@ -1368,7 +1368,7 @@ type diagResult struct {
 // debounceDiagnose makes instant diagnose for dirty buffer,
 // and accurate diagnose for clean file.
 func (e *Editor) debounceDiagnose() {
-	if e.Buffer == nil || !isGoFile(e.Buffer.Path) {
+	if e.Buffer == nil || !isGoFile(e.Buffer.Filename) {
 		return
 	}
 
@@ -1380,7 +1380,7 @@ func (e *Editor) debounceDiagnose() {
 	if e.diagChan == nil {
 		e.diagChan = make(chan diagResult, 4)
 	}
-	filename := e.Path
+	filename := e.Filename
 	src := e.Buffer.NewReader()
 	e.diagTimer = time.AfterFunc(300*time.Millisecond, func() {
 		var errs []*scanner.Error
@@ -1691,17 +1691,24 @@ func (t TextInput) Draw(f *kero.Frame, r kero.Rect, s kero.Style) {
 	}
 }
 
-// Position represents coordinate within a file
+/* TODO
+In terminal UI (TUI) rendering, double-width characters
+(like CJK characters or emojis) occupy 2 terminal columns despite being 1 rune.
+Separating Byte Offset (storage), Rune Offset (character count),
+and Visual Display Column (screen cell width) prevents layout corruption.
+*/
+
+// Position represents a zero-indexed coordinate inside a buffer.
 type Position struct {
-	Row int // line index, starting at 0
-	Col int // rune index within the line, starting at 0
+	Row int // line offset, starting at 0
+	Col int // rune offset within the line, starting at 0
 }
 
 type Buffer struct {
-	Path   string   // absolute path
-	Lines  [][]rune // Using [][]rune handles multi-byte UTF-8 correctly
-	Cursor Position
-	Dirty  bool
+	Filename string
+	Lines    [][]rune // Using [][]rune handles multi-byte UTF-8 correctly
+	Cursor   Position
+	Dirty    bool
 
 	// viewport
 	TopRow  int // vertical scroll offsets, starts from 0
@@ -2377,7 +2384,7 @@ func (b *Buffer) PosFromVisual(p Position) Position {
 // It returns true if the buffer was modified, and an error if formatting fails.
 func (b *Buffer) Format() (bool, error) {
 	// Only format Go files
-	if filepath.Ext(b.Path) != ".go" {
+	if filepath.Ext(b.Filename) != ".go" {
 		return false, nil
 	}
 
@@ -2604,7 +2611,7 @@ func (e *Editor) OpenFile(path string) error {
 
 	// switch to existing buffer
 	for i, buf := range e.buffers {
-		if buf.Path == path {
+		if buf.Filename == path {
 			e.active = i
 			e.Buffer = buf
 			e.diags = nil
@@ -2661,8 +2668,8 @@ func (e *Editor) PrevBuffer() {
 func BufferFromFile(path string) (*Buffer, error) {
 	if path == "" {
 		return &Buffer{
-			Path:  "",
-			Lines: [][]rune{[]rune("")},
+			Filename: "",
+			Lines:    [][]rune{[]rune("")},
 		}, nil
 	}
 
@@ -2675,8 +2682,8 @@ func BufferFromFile(path string) (*Buffer, error) {
 	if os.IsNotExist(err) {
 		// New/unsaved file: initialize with one empty line
 		return &Buffer{
-			Path:  absPath,
-			Lines: [][]rune{[]rune("")},
+			Filename: absPath,
+			Lines:    [][]rune{[]rune("")},
 		}, nil
 	} else if err != nil {
 		return nil, err
@@ -2694,8 +2701,8 @@ func BufferFromFile(path string) (*Buffer, error) {
 	}
 
 	return &Buffer{
-		Path:  absPath,
-		Lines: lines,
+		Filename: absPath,
+		Lines:    lines,
 	}, nil
 }
 
@@ -2726,7 +2733,7 @@ func readLines(r io.Reader) ([][]rune, error) {
 }
 
 func (b *Buffer) Save() error {
-	file, err := os.OpenFile(b.Path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
+	file, err := os.OpenFile(b.Filename, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
 		return err
 	}
@@ -2752,15 +2759,9 @@ func (b *Buffer) Save() error {
 	return nil
 }
 
-// Jump represents a recorded location in a buffer.
-type Jump struct {
-	Path string   // File path (used to match across buffer switches/reopens)
-	Pos  Position // Cursor position (Row, Col)
-}
-
 // JumpList manages navigation history for long jumps (Go To Def, Find Symbol, etc.).
 type JumpList struct {
-	items []Jump
+	items []Location
 	index int // Points to current position in history
 }
 
@@ -2772,7 +2773,7 @@ func (j *JumpList) Push(path string, pos Position) {
 	if len(j.items) > 0 && j.index >= 0 && j.index < len(j.items) {
 		curr := j.items[j.index]
 		// Avoid pushing duplicate positions in the same file
-		if curr.Path == path && curr.Pos == pos {
+		if curr.Filename == path && curr.Pos == pos {
 			return
 		}
 	}
@@ -2782,7 +2783,7 @@ func (j *JumpList) Push(path string, pos Position) {
 		j.items = j.items[:j.index+1]
 	}
 
-	j.items = append(j.items, Jump{Path: path, Pos: pos})
+	j.items = append(j.items, Location{Filename: path, Pos: pos})
 	if len(j.items) > maxJumps {
 		j.items = j.items[1:]
 	}
@@ -2790,9 +2791,9 @@ func (j *JumpList) Push(path string, pos Position) {
 }
 
 // Back steps back in history and returns the target jump position.
-func (j *JumpList) Back(currentPath string, currentPos Position) (Jump, bool) {
+func (j *JumpList) Back(currentPath string, currentPos Position) (Location, bool) {
 	if len(j.items) == 0 {
-		return Jump{}, false
+		return Location{}, false
 	}
 
 	// If we are at the head of the jump list, record current position first
@@ -2811,9 +2812,9 @@ func (j *JumpList) Back(currentPath string, currentPos Position) (Jump, bool) {
 }
 
 // Forward steps forward in history and returns the target jump position.
-func (j *JumpList) Forward() (Jump, bool) {
+func (j *JumpList) Forward() (Location, bool) {
 	if len(j.items) == 0 || j.index >= len(j.items)-1 {
-		return Jump{}, false
+		return Location{}, false
 	}
 
 	j.index++
@@ -2825,14 +2826,14 @@ func (e *Editor) recordJump() {
 	if e.Buffer == nil {
 		return
 	}
-	e.jumps.Push(e.Path, e.Cursor)
+	e.jumps.Push(e.Filename, e.Cursor)
 }
 
 // jumpTo restores a recorded location, switching buffers if necessary.
-func (e *Editor) jumpTo(target Jump) {
+func (e *Editor) jumpTo(target Location) {
 	// 1. Switch buffer if the target is in a different file
-	if target.Path != "" && target.Path != e.Path {
-		err := e.OpenFile(target.Path)
+	if target.Filename != "" && target.Filename != e.Filename {
+		err := e.OpenFile(target.Filename)
 		if err != nil {
 			log.Print(err)
 			return
@@ -2851,7 +2852,7 @@ func (e *Editor) JumpBack() {
 	if e.Buffer == nil {
 		return
 	}
-	if target, ok := e.jumps.Back(e.Path, e.Cursor); ok {
+	if target, ok := e.jumps.Back(e.Filename, e.Cursor); ok {
 		e.jumpTo(target)
 	}
 }
@@ -2939,7 +2940,7 @@ func (p *Palette) symbolItems(e *Editor, query string) []PaletteItem {
 	}
 
 	if p.symbols == nil {
-		p.symbols = ExtractSymbols(e.Path, e.Buffer.NewReader())
+		p.symbols = ExtractSymbols(e.Filename, e.Buffer.NewReader())
 	}
 	var items []PaletteItem
 
@@ -2998,7 +2999,7 @@ func (p *Palette) commandItems(_ *Editor, query string) []PaletteItem {
 			e.PrevBuffer()
 		}},
 		{"LSP: check", "", func(e *Editor) {
-			diags, err := CheckFile(e.Path)
+			diags, err := CheckFile(e.Filename)
 			if err != nil {
 				e.message = err.Error()
 				return
@@ -3015,7 +3016,7 @@ func (p *Palette) commandItems(_ *Editor, query string) []PaletteItem {
 			e.palette.Open(e, "@")
 		}},
 		{"LSP: rename symbol", "", func(e *Editor) {
-			if !isGoFile(e.Path) {
+			if !isGoFile(e.Filename) {
 				return
 			}
 			e.startRename()
@@ -3025,13 +3026,13 @@ func (p *Palette) commandItems(_ *Editor, query string) []PaletteItem {
 			if len(e.ref.Items) <= 1 {
 				return
 			}
-			e.gotoPosition(e.ref.Next().Start)
+			e.gotoLocation(e.ref.Next())
 		}},
 		{"prev location", "ctrl+shift+[", func(e *Editor) {
 			if len(e.ref.Items) <= 1 {
 				return
 			}
-			e.gotoPosition(e.ref.Prev().Start)
+			e.gotoLocation(e.ref.Prev())
 		}},
 	}
 
@@ -3141,17 +3142,17 @@ func (p *Palette) fileItems(e *Editor, query string) []PaletteItem {
 	// 1. Include open buffers first for quick switching
 	openPaths := make(map[string]bool)
 	for i, buf := range e.buffers {
-		if buf.Path == "" {
+		if buf.Filename == "" {
 			continue
 		}
-		openPaths[buf.Path] = true
+		openPaths[buf.Filename] = true
 
-		if query != "" && !strings.Contains(strings.ToLower(buf.Path), lowerQuery) {
+		if query != "" && !strings.Contains(strings.ToLower(buf.Filename), lowerQuery) {
 			continue
 		}
 
 		bufIdx := i
-		bufPath := buf.Path
+		bufPath := buf.Filename
 		items = append(items, PaletteItem{
 			Label:  filepath.Base(bufPath),
 			Detail: "active",
@@ -3393,7 +3394,7 @@ func (e *Editor) updateRename(ev kero.KeyEvent) {
 		*/
 		now := time.Now()
 		cmd := exec.CommandContext(ctx, "gopls", "rename", "-w", "-l", fmt.Sprintf("%s:%d:%d",
-			e.Path, e.Cursor.Row+1, e.Cursor.Col+1), newName)
+			e.Filename, e.Cursor.Row+1, e.Cursor.Col+1), newName)
 		out, err := cmd.CombinedOutput()
 		if err != nil {
 			log.Print(err)
@@ -3407,7 +3408,7 @@ func (e *Editor) updateRename(ev kero.KeyEvent) {
 		for i := range editedFiles {
 			for j := range e.buffers {
 				buf := e.buffers[j]
-				if buf.Path != editedFiles[i] {
+				if buf.Filename != editedFiles[i] {
 					continue
 				}
 				newBuf, err := BufferFromFile(editedFiles[i])
@@ -3444,7 +3445,7 @@ func (e *Editor) drawRename(f *kero.Frame, y int, width int) {
 }
 
 func GotoDefinition(e *Editor) {
-	if !isGoFile(e.Path) {
+	if !isGoFile(e.Filename) {
 		return
 	}
 	// flush buffer to disk before running gopls
@@ -3464,7 +3465,7 @@ func GotoDefinition(e *Editor) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "gopls", "definition", fmt.Sprintf("%s:%d:%d",
-		e.Path, e.Cursor.Row+1, e.Cursor.Col+1))
+		e.Filename, e.Cursor.Row+1, e.Cursor.Col+1))
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		log.Print(err)
@@ -3477,7 +3478,7 @@ func GotoDefinition(e *Editor) {
 		log.Print(err)
 		return
 	}
-	e.gotoPosition(l.Start)
+	e.gotoLocation(l)
 }
 
 type ReferencesPanel struct {
@@ -3541,10 +3542,10 @@ func (r *ReferencesPanel) Prev() Location {
 	return r.Items[r.Index]
 }
 
-// Location represents a specific span of text or a point tied to a specific file.
+// Location represents coordinate within a specified file.
 type Location struct {
-	Start token.Position
-	End   token.Position
+	Filename string
+	Pos      Position
 }
 
 func ParseLocation(s string) (Location, error) {
@@ -3552,7 +3553,7 @@ func ParseLocation(s string) (Location, error) {
 	if len(parts) < 3 {
 		return Location{}, errors.New("unknown position: " + s)
 	}
-	path := parts[0]
+	filename := parts[0]
 	lineNo, err := strconv.Atoi(parts[1])
 	if err != nil {
 		return Location{}, err
@@ -3569,9 +3570,13 @@ func ParseLocation(s string) (Location, error) {
 	if err != nil {
 		return Location{}, err
 	}
+	_ = endCol // todo
 	loc := Location{
-		Start: token.Position{Filename: path, Line: lineNo, Column: startCol},
-		End:   token.Position{Filename: path, Line: lineNo, Column: endCol},
+		Filename: filename,
+		Pos: Position{
+			Row: lineNo - 1,
+			Col: startCol - 1, // TODO: convert the Bytes Offset column to rune offset
+		},
 	}
 	return loc, nil
 }
@@ -3589,11 +3594,10 @@ func byteColumnToRuneIndex(line string, column int) int {
 	return len(runes) - 1
 }
 
-// goto the token position
-func (e *Editor) gotoPosition(p token.Position) {
+func (e *Editor) gotoLocation(l Location) {
 	e.recordJump()
-	if e.Path != p.Filename {
-		err := e.OpenFile(p.Filename)
+	if e.Filename != l.Filename {
+		err := e.OpenFile(l.Filename)
 		if err != nil {
 			log.Print(err)
 			e.message = err.Error()
@@ -3601,10 +3605,7 @@ func (e *Editor) gotoPosition(p token.Position) {
 		}
 		e.debounceDiagnose()
 	}
-	e.Cursor = Position{
-		Row: p.Line - 1,
-		Col: byteColumnToRuneIndex(string(e.Lines[p.Line-1]), p.Column),
-	}
+	e.Cursor = l.Pos
 	e.showCursorCenter()
 }
 
@@ -3621,7 +3622,7 @@ func (e *Editor) gotoPosition(p token.Position) {
 // where the line and column start at 1, and columns are measured in bytes of the UTF-8 encoding.
 // More details see https://go.dev/gopls/command-line
 func findReferences(e *Editor) {
-	if !isGoFile(e.Path) {
+	if !isGoFile(e.Filename) {
 		return
 	}
 	// flush buffer to disk before running gopls
@@ -3637,7 +3638,7 @@ func findReferences(e *Editor) {
 	defer cancel()
 	now := time.Now()
 	cmd := exec.CommandContext(ctx, "gopls", "references", fmt.Sprintf("%s:%d:%d",
-		e.Path, e.Cursor.Row+1, e.Cursor.Col+1))
+		e.Filename, e.Cursor.Row+1, e.Cursor.Col+1))
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		log.Print(err)
@@ -3690,7 +3691,7 @@ func (e *Editor) drawReferences(f *kero.Frame, rect kero.Rect) {
 	buffers := e.buffers
 	getBuffer := func(path string) (*Buffer, error) {
 		for _, b := range buffers {
-			if b.Path == path {
+			if b.Filename == path {
 				return b, nil
 			}
 		}
@@ -3719,15 +3720,15 @@ func (e *Editor) drawReferences(f *kero.Frame, rect kero.Rect) {
 			itemStyle = itemStyle.Bold()
 		}
 
-		buf, err := getBuffer(item.Start.Filename)
+		buf, err := getBuffer(item.Filename)
 		if err != nil {
 			log.Print(err)
 			continue
 		}
 
-		line := string(buf.Lines[item.Start.Line-1])
-		text := fmt.Sprintf("%s %s:%d:%d: %s", indicator, filepath.Base(item.Start.Filename), item.Start.Line,
-			item.Start.Column, line)
+		line := string(buf.Lines[item.Pos.Row])
+		text := fmt.Sprintf("%s %s:%d:%d: %s", indicator, filepath.Base(item.Filename), item.Pos.Row+1,
+			item.Pos.Col+1, line)
 		runes := []rune(text)
 
 		if len(runes) > rect.W {
@@ -3773,7 +3774,7 @@ func CheckFile(path string) ([]*scanner.Error, error) {
 			continue
 		}
 		errs = append(errs, &scanner.Error{
-			Pos: loc.Start,
+			Pos: token.Position{Line: loc.Pos.Row + 1, Column: loc.Pos.Col + 1},
 			Msg: after,
 		})
 	}
