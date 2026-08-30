@@ -1,24 +1,25 @@
 package main
 
 import (
+	"bytes"
 	"testing"
 
 	"github.com/cansyan/kero"
 )
 
 func TestDisplayColumn(t *testing.T) {
-	b := BufferFromString("a\tbc")
-	if got := b.VisualPos(Position{Col: 2}); got.Col != 4 {
-		t.Fatalf("VisualPos(Position{Row: 0, Col: 2}) = %+v, want col 4", got)
+	b := NewBuffer("", []byte("a\tbc"))
+	if got := b.ByteToVisualCol(Position{Col: 2}, 4); got != 4 {
+		t.Fatalf("ByteToVisualCol(Position{Row: 0, Col: 2}) = %+v, want col 4", got)
 	}
-	if got := b.VisualPos(Position{Col: 3}); got.Col != 5 {
-		t.Fatalf("VisualPos(Position{Row: 0, Col: 3}) = %+v, want col 5", got)
+	if got := b.ByteToVisualCol(Position{Col: 3}, 4); got != 5 {
+		t.Fatalf("ByteToVisualCol(Position{Row: 0, Col: 3}) = %+v, want col 5", got)
 	}
-	if got := b.PosFromVisual(Position{Col: 4}); got.Col != 2 {
-		t.Fatalf("PosFromVisual(Position{Col: 4}) = %+v, want col 2", got)
+	if got := b.VisualToByteCol(0, 4, 4); got != 2 {
+		t.Fatalf("VisualToByteCol(Position{Col: 4}) = %+v, want col 2", got)
 	}
-	if got := b.PosFromVisual(Position{Col: 5}); got.Col != 3 {
-		t.Fatalf("PosFromVisual(Position{Col: 5}) = %+v, want col 3", got)
+	if got := b.VisualToByteCol(0, 5, 4); got != 3 {
+		t.Fatalf("VisualToByteCol(Position{Col: 5}) = %+v, want col 3", got)
 	}
 }
 
@@ -36,72 +37,70 @@ func TestCheckGoSemantics(t *testing.T) {
 }
 
 func TestEnsureCursorVisible_WithTabs(t *testing.T) {
-	buf := BufferFromString("\thello world")
-	buf.Cursor = Position{Row: 0, Col: 0}
+	buf := NewBuffer("", []byte("\thello world"))
 	// Mock width = 10 (marker + line number + space leaves textW = 7)
-	ed := &Editor{Buffer: buf, Width: 10, Height: 10}
+	v := &View{Buf: buf, Width: 10, Height: 10, Cursor: Position{Row: 0, Col: 0}}
 
-	ed.showCursorCenter()
-	if ed.LeftCol != 0 {
-		t.Fatalf("expected colOffset = 0, got %d", ed.LeftCol)
+	v.showCursorCenter()
+	if v.ScrollCol != 0 {
+		t.Fatalf("expected colOffset = 0, got %d", v.ScrollCol)
 	}
 
 	// Move cursor to 'w' in "world" (rune index 7: '\t', h, e, l, l, o, ' ') -> display column 4 + 6 = 10
-	ed.Cursor.Col = 7
-	ed.showCursorCenter()
-	// textW = 10 - 1 - 2 = 7. cursorDisplay = 10.
-	// 10 >= colOffset + 7 => colOffset = 10 - 7 + 1 = 4.
-	if ed.LeftCol != 4 {
-		t.Fatalf("expected colOffset = 4, got %d", ed.LeftCol)
+	v.Cursor.Col = 7
+	v.showCursorCenter()
+	if v.ScrollCol != 5 {
+		t.Fatalf("expected colOffset = 4, got %d", v.ScrollCol)
 	}
 
 	// Move cursor back to index 0 ('\t', display column 0)
-	ed.Cursor.Col = 0
-	ed.showCursorCenter()
-	if ed.LeftCol != 0 {
-		t.Fatalf("expected colOffset = 0 when returning to start, got %d", ed.LeftCol)
+	v.Cursor.Col = 0
+	v.showCursorCenter()
+	if v.ScrollCol != 0 {
+		t.Fatalf("expected colOffset = 0 when returning to start, got %d", v.ScrollCol)
 	}
 }
 
 func TestMoveUpMoveDown_WithTabs(t *testing.T) {
-	buf := BufferFromString("\thello\nabcdefg")
-	buf.Cursor = Position{Row: 0, Col: 1} // on 'h' (display col 4)
-	ed := &Editor{
-		Buffer: buf,
+	buf := NewBuffer("", []byte("\thello\nabcdefg"))
+	v := &View{
+		Buf:    buf,
+		Cursor: Position{Row: 0, Col: 1}, // on 'h' (display col 4)
 	}
 
-	ed.moveDown()
-	if ed.Cursor.Row != 1 {
-		t.Fatalf("expected row 1, got %d", ed.Cursor.Row)
+	v.moveDown()
+	if v.Cursor.Row != 1 {
+		t.Fatalf("expected row 1, got %d", v.Cursor.Row)
 	}
 	// display col 4 on "abcdefg" corresponds to rune index 4 ('e')
-	if ed.Cursor.Col != 4 {
-		t.Fatalf("expected col 4, got %d", ed.Cursor.Col)
+	if v.Cursor.Col != 4 {
+		t.Fatalf("expected col 4, got %d", v.Cursor.Col)
 	}
 
-	ed.moveUp()
-	if ed.Cursor.Row != 0 {
-		t.Fatalf("expected row 0, got %d", ed.Cursor.Row)
+	v.moveUp()
+	if v.Cursor.Row != 0 {
+		t.Fatalf("expected row 0, got %d", v.Cursor.Row)
 	}
 	// display col 4 on "\thello" corresponds to rune index 1 ('h')
-	if ed.Cursor.Col != 1 {
-		t.Fatalf("expected col 1, got %d", ed.Cursor.Col)
+	if v.Cursor.Col != 1 {
+		t.Fatalf("expected col 1, got %d", v.Cursor.Col)
 	}
 }
 
 func TestTab_MultiLineSelection(t *testing.T) {
-	buf := BufferFromString("first line\nsecond line\nthird line")
-	buf.Selecting = true
-	buf.SelAnchor = Position{Row: 0, Col: 2}
-	buf.Cursor = Position{Row: 1, Col: 6}
-	ed := &Editor{
-		Buffer: buf,
+	buf := NewBuffer("", []byte("first line\nsecond line\nthird line"))
+	v := &View{
+		Buf:       buf,
+		Selecting: true,
+		SelAnchor: Position{Row: 0, Col: 2},
+		Cursor:    Position{Row: 1, Col: 6},
 	}
+	e := &Editor{views: []*View{v}}
 
 	ctx := &kero.Context{Width: 80, Height: 24}
 	ev := kero.KeyEvent{Key: kero.KeyTab}
 
-	err := ed.Update(ctx, ev)
+	err := e.Update(ctx, ev)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -112,27 +111,28 @@ func TestTab_MultiLineSelection(t *testing.T) {
 		"third line",
 	}
 
-	for i := range len(ed.Buffer.Lines) {
-		if line := string(ed.Buffer.Line(i)); line != expectedLines[i] {
+	for i := range len(v.Buf.Lines) {
+		if line := string(v.Buf.Lines[i]); line != expectedLines[i] {
 			t.Errorf("line %d = %q, want %q", i, line, expectedLines[i])
 		}
 	}
 
-	if ed.SelAnchor.Col != 3 {
-		t.Errorf("seletion start col = %d, want 3", ed.SelAnchor.Col)
+	if v.SelAnchor.Col != 3 {
+		t.Errorf("seletion start col = %d, want 3", v.SelAnchor.Col)
 	}
-	if ed.Cursor.Col != 7 {
-		t.Errorf("selection end col = %d, want 7", ed.Cursor.Col)
+	if v.Cursor.Col != 7 {
+		t.Errorf("selection end col = %d, want 7", v.Cursor.Col)
 	}
 }
 
 func TestTab_SingleLineSelection(t *testing.T) {
-	buf := BufferFromString("hello world")
-	buf.Selecting = true
-	buf.SelAnchor = Position{Row: 0, Col: 0}
-	buf.Cursor = Position{Row: 0, Col: 5}
+	buf := NewBuffer("", []byte("hello world"))
+	v := &View{Buf: buf}
+	v.Selecting = true
+	v.SelAnchor = Position{Row: 0, Col: 0}
+	v.Cursor = Position{Row: 0, Col: 5}
 	ed := &Editor{
-		Buffer: buf,
+		views: []*View{v},
 	}
 
 	ctx := &kero.Context{Width: 80, Height: 24}
@@ -144,21 +144,22 @@ func TestTab_SingleLineSelection(t *testing.T) {
 	}
 
 	// Single line selection should be deleted and replaced with a tab character
-	if string(ed.Buffer.Line(0)) != "\t world" {
-		t.Errorf("lines[0] = %q, want %q", string(ed.Buffer.Line(0)), "\t world")
+	if string(v.Buf.Lines[0]) != "\t world" {
+		t.Errorf("lines[0] = %q, want %q", string(v.Buf.Lines[0]), "\t world")
 	}
-	if ed.Selecting {
+	if v.Selecting {
 		t.Errorf("expected selecting to be false")
 	}
 }
 
 func TestShiftTab_UnindentSelection(t *testing.T) {
-	buf := BufferFromString("\tfirst line\n    second line\nthird line")
-	buf.Cursor = Position{Row: 1, Col: 7}
-	buf.Selecting = true
-	buf.SelAnchor = Position{Row: 0, Col: 3}
+	buf := NewBuffer("", []byte("\tfirst line\n    second line\nthird line"))
+	v := &View{Buf: buf}
+	v.Cursor = Position{Row: 1, Col: 7}
+	v.Selecting = true
+	v.SelAnchor = Position{Row: 0, Col: 3}
 	ed := &Editor{
-		Buffer: buf,
+		views: []*View{v},
 	}
 
 	ctx := &kero.Context{Width: 80, Height: 24}
@@ -175,25 +176,26 @@ func TestShiftTab_UnindentSelection(t *testing.T) {
 		"third line",
 	}
 
-	for i := range len(ed.Buffer.Lines) {
-		if line := string(ed.Buffer.Line(i)); line != expectedLines[i] {
+	for i := range len(v.Buf.Lines) {
+		if line := string(v.Buf.Lines[i]); line != expectedLines[i] {
 			t.Errorf("line %d = %q, want %q", i, line, expectedLines[i])
 		}
 	}
 
-	if ed.SelAnchor.Col != 2 {
-		t.Errorf("selStartCol = %d, want 2", ed.SelAnchor.Col)
+	if v.SelAnchor.Col != 2 {
+		t.Errorf("selStartCol = %d, want 2", v.SelAnchor.Col)
 	}
-	if ed.Cursor.Col != 3 {
-		t.Errorf("col = %d, want 3", ed.Cursor.Col)
+	if v.Cursor.Col != 3 {
+		t.Errorf("col = %d, want 3", v.Cursor.Col)
 	}
 }
 
 func TestShiftTab_UnindentLineWithoutSelection(t *testing.T) {
-	buf := BufferFromString("\thello world")
-	buf.Cursor = Position{Row: 0, Col: 6}
+	buf := NewBuffer("", []byte("\thello world"))
+	v := &View{Buf: buf}
+	v.Cursor = Position{Row: 0, Col: 6}
 	ed := &Editor{
-		Buffer: buf,
+		views: []*View{v},
 	}
 
 	ctx := &kero.Context{Width: 80, Height: 24}
@@ -204,67 +206,68 @@ func TestShiftTab_UnindentLineWithoutSelection(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if string(ed.Buffer.Line(0)) != "hello world" {
-		t.Errorf("lines[0] = %q, want %q", ed.Buffer.Line(0), "hello world")
+	if string(v.Buf.Lines[0]) != "hello world" {
+		t.Errorf("lines[0] = %q, want %q", v.Buf.Lines[0], "hello world")
 	}
-	if ed.Cursor.Col != 5 {
-		t.Errorf("col = %d, want 5", ed.Cursor.Col)
+	if v.Cursor.Col != 5 {
+		t.Errorf("col = %d, want 5", v.Cursor.Col)
 	}
 }
 
 func TestStartSelectLine(t *testing.T) {
-	buf := BufferFromString("first line\nsecond line\nthird line")
-	buf.Cursor = Position{Row: 0, Col: 3}
+	buf := NewBuffer("", []byte("first line\nsecond line\nthird line"))
+	v := &View{Buf: buf}
+	v.Cursor = Position{Row: 0, Col: 3}
 	ed := &Editor{
-		Buffer: buf,
+		views: []*View{v},
 	}
 
 	// 1st Ctrl+L: selects line 0 down to line 1 col 0
 	ed.selectLine()
-	if !ed.Selecting {
+	if !v.Selecting {
 		t.Errorf("expected selecting to be true")
 	}
-	if ed.SelAnchor.Row != 0 || ed.SelAnchor.Col != 0 {
-		t.Errorf("selStart = (%d, %d), want (0, 0)", ed.SelAnchor.Row, ed.SelAnchor.Col)
+	if v.SelAnchor.Row != 0 || v.SelAnchor.Col != 0 {
+		t.Errorf("selStart = (%d, %d), want (0, 0)", v.SelAnchor.Row, v.SelAnchor.Col)
 	}
-	if ed.Cursor.Row != 1 || ed.Cursor.Col != 0 {
-		t.Errorf("cursor = (%d, %d), want (1, 0)", ed.Cursor.Row, ed.Cursor.Col)
+	if v.Cursor.Row != 1 || v.Cursor.Col != 0 {
+		t.Errorf("cursor = (%d, %d), want (1, 0)", v.Cursor.Row, v.Cursor.Col)
 	}
 
 	// 2nd Ctrl+L: extends selection to line 2 col 0
 	ed.selectLine()
-	if ed.Cursor.Row != 2 || ed.Cursor.Col != 0 {
-		t.Errorf("cursor = (%d, %d), want (2, 0)", ed.Cursor.Row, ed.Cursor.Col)
+	if v.Cursor.Row != 2 || v.Cursor.Col != 0 {
+		t.Errorf("cursor = (%d, %d), want (2, 0)", v.Cursor.Row, v.Cursor.Col)
 	}
 
 	// 3rd Ctrl+L: extends selection to line 2 end
 	ed.selectLine()
-	if ed.Cursor.Row != 2 || ed.Cursor.Col != len("third line") {
-		t.Errorf("cursor = (%d, %d), want (2, %d)", ed.Cursor.Row, ed.Cursor.Col, len("third line"))
+	if v.Cursor.Row != 2 || v.Cursor.Col != len("third line") {
+		t.Errorf("cursor = (%d, %d), want (2, %d)", v.Cursor.Row, v.Cursor.Col, len("third line"))
 	}
 }
 
 func TestWordUnderCursor(t *testing.T) {
-	buf := BufferFromString("func (e *Editor) finishCommand() error {")
-	buf.Cursor = Position{Row: 0, Col: 20} // on 'f' in finishCommand
-	ed := &Editor{
-		Buffer: buf,
-	}
-	start, end := ed.Buffer.WordBounds(ed.Cursor)
+	buf := NewBuffer("", []byte("func (e *Editor) finishCommand() error {"))
+	v := &View{Buf: buf}
+	v.Cursor = Position{Row: 0, Col: 20} // on 'f' in finishCommand
+
+	start, end := v.Buf.WordBounds(v.Cursor)
 	if start == end {
-		t.Fatalf("wordAt(%+v, %+v) returned empty range", ed.Cursor.Row, ed.Cursor.Col)
+		t.Fatalf("wordAt(%+v, %+v) returned empty range", v.Cursor.Row, v.Cursor.Col)
 	}
-	word := ed.Buffer.GetRange(start, end)
+	word := v.Buf.GetRange(start, end)
 	if word != "finishCommand" {
-		t.Fatalf("wordAt(%+v, %+v) = %q, want %q", ed.Cursor.Row, ed.Cursor.Col, word, "finishCommand")
+		t.Fatalf("wordAt(%+v, %+v) = %q, want %q", v.Cursor.Row, v.Cursor.Col, word, "finishCommand")
 	}
 }
 
 func TestReplaceCurrentAndSkip(t *testing.T) {
-	buf := BufferFromString("one two one three one")
-	buf.Cursor = Position{Row: 0, Col: 0}
+	buf := NewBuffer("", []byte("one two one three one"))
+	v := &View{Buf: buf}
+	v.Cursor = Position{Row: 0, Col: 0}
 	ed := &Editor{
-		Buffer: buf,
+		views: []*View{v},
 	}
 
 	ed.startFind()
@@ -274,7 +277,7 @@ func TestReplaceCurrentAndSkip(t *testing.T) {
 	ed.replaceInput.SetText("1")
 	ed.updateFind(kero.KeyEvent{Key: kero.KeyEnter})
 
-	if got := ed.Buffer.String(); got != "1 two one three one" {
+	if got := string(v.Buf.Lines[0]); got != "1 two one three one" {
 		t.Fatalf("after replace current = %q, want %q", got, "1 two one three one")
 	}
 	if !ed.findMatch || ed.findMatchStart.Col != 6 {
@@ -292,7 +295,9 @@ func TestReplaceCurrentAndSkip(t *testing.T) {
 
 func TestReplaceAll(t *testing.T) {
 	ed := &Editor{
-		Buffer: BufferFromString("Cat\ncatapult\nDOG"),
+		views: []*View{
+			{Buf: NewBuffer("", []byte("Cat\ncatapult\nDOG"))},
+		},
 	}
 	ed.startFind()
 	ed.findInput.SetText("cat")
@@ -301,7 +306,7 @@ func TestReplaceAll(t *testing.T) {
 	ctrlEnter := kero.KeyEvent{Key: kero.KeyEnter, Mod: kero.ModCtrl}
 	ed.updateFind(ctrlEnter)
 
-	if got := ed.Buffer.String(); got != "fox\nfoxapult\nDOG" {
+	if got := string(bytes.Join(ed.Buf().Lines, []byte{'\n'})); got != "fox\nfoxapult\nDOG" {
 		t.Fatalf("after replace all = %q, want %q", got, "fox\nfoxapult\nDOG")
 	}
 	if ed.message != "replaced 2 matches" {

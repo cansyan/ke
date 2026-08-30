@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"go/ast"
-	"go/format"
 	"go/importer"
 	"go/parser"
 	"go/scanner"
@@ -27,6 +26,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/cansyan/kero"
+	"github.com/mattn/go-runewidth"
 )
 
 // parsePathArg parses an argument of the form "path", "path:row", or
@@ -70,8 +70,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	e.Buffer.Cursor = e.Buffer.ClampPos(Position{Row: row, Col: col})
-	e.debounceDiagnose()
+	e.view().Cursor = e.Buf().ClampPos(Position{Row: row, Col: col})
 
 	f, err := os.OpenFile("/tmp/ke.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
@@ -87,13 +86,44 @@ func main() {
 	}
 }
 
+// Position represents a zero-indexed coordinate inside Buffer.
+//
+// In terminal UI rendering, double-width characters
+// (like CJK characters or emojis) occupy 2 terminal columns despite being 1 rune.
+// Separating Byte Offset (storage), Rune Offset (character count),
+// and Visual Display Column (screen cell width) prevents layout corruption.
+type Position struct {
+	Row int // line index (0-based)
+	Col int // byte offset within line (0-based)
+}
+
+// View holds UI-specific state for a single window/viewport.
+// Responsible strictly for displaying Buffer lines and handling cursor movement inside text
+type View struct {
+	Buf    *Buffer
+	Cursor Position
+
+	// Viewport
+	ScrollRow int // Topmost visible line index (0-based)
+	ScrollCol int // Leftmost visible visual column (0-based)
+	Width     int // Viewport width in terminal cells
+	Height    int // Viewport height in terminal rows
+
+	Selecting bool
+	SelAnchor Position // selection at [e.view().SelAnchor, e.pos)
+}
+
+// SetSize updates the viewport dimensions and re-clamps scrolling.
+func (v *View) SetSize(width, height int) {
+	v.Width = width
+	v.Height = height
+	v.showCursor()
+}
+
 // Editor implements kero.App interface
 type Editor struct {
-	*Buffer // short path to the buffers[active]
-	buffers []*Buffer
-	active  int // index of currently active buffer
-	Width   int
-	Height  int
+	views  []*View
+	active int // index of active view
 
 	message string
 
@@ -138,9 +168,27 @@ type Editor struct {
 	ref ReferencesPanel
 }
 
+// View returns the currently focused View.
+func (e *Editor) view() *View {
+	if len(e.views) == 0 || e.active < 0 || e.active >= len(e.views) {
+		return nil
+	}
+	return e.views[e.active]
+}
+
+// Buf is a convenient shortcut to the active View's Buffer.
+func (e *Editor) Buf() *Buffer {
+	v := e.view()
+	if v == nil {
+		return nil
+	}
+	return v.Buf
+}
+
 func (e *Editor) Init(ctx *kero.Context) error {
-	e.Width, e.Height = ctx.Width, ctx.Height
-	e.showCursor()
+	// e.view().SetSize(ctx.Width, ctx.Height)
+	// e.view().showCursor()
+	e.debounceDiagnose()
 	return nil
 }
 
@@ -157,18 +205,26 @@ func (e *Editor) LastEvent() string {
 func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 	// refresh diagnostic as soon as possible
 	e.applyDiagnostic()
+	v := e.view()
+	if v.Width == 0 || v.Height == 0 {
+		_, textRect, _, _ := LayoutWindow(ctx.Width, ctx.Height, len(e.Buf().Lines))
+		v.SetSize(textRect.W, textRect.H)
+	}
 
 	switch ev := ev.(type) {
 	case kero.TickEvent:
 		return nil
 	case kero.ResizeEvent:
-		e.Width, e.Height = ev.Width, ev.Height
+		_, textRect, _, _ := LayoutWindow(ev.Width, ev.Height, len(e.Buf().Lines))
+		for _, v := range e.views {
+			v.SetSize(textRect.W, textRect.H)
+		}
 	case kero.PasteStartEvent:
 		e.pasting = true
 	case kero.PasteEndEvent:
 		e.pasting = false
 	case kero.MouseEvent:
-		e.handleMouse(ev)
+		e.handleMouse(ctx, ev)
 	case kero.KeyEvent:
 		e.handleKey(ctx, ev)
 	}
@@ -176,41 +232,45 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 	return nil
 }
 
-func (e *Editor) cursorFromMouse(m kero.MouseEvent) Position {
-	row := e.TopRow + m.Y
-	if row >= len(e.Lines) {
-		// out of viewport, return current cursor
-		return e.Cursor
+// convert mouse (x, y) to Positon of Buffer
+func (e *Editor) mouseToPosition(m kero.MouseEvent, textRect kero.Rect) Position {
+	row := m.Y - textRect.Y + e.view().ScrollRow
+	if row >= len(e.Buf().Lines) {
+		// out of viewport
+		return e.view().Cursor
 	}
 
-	displayCol := m.X - bufferRect(e).X + e.LeftCol
-	return e.PosFromVisual(Position{Row: row, Col: displayCol})
+	visualCol := m.X - textRect.X + e.view().ScrollCol
+	col := e.Buf().VisualToByteCol(row, visualCol, 4)
+	return Position{Row: row, Col: col}
 }
 
-func (e *Editor) handleMouse(m kero.MouseEvent) error {
+func (e *Editor) handleMouse(ctx *kero.Context, m kero.MouseEvent) error {
+	_, textRect, _, _ := LayoutWindow(ctx.Width, ctx.Height, len(e.Buf().Lines))
+	paletteRect := LayoutPalatte(ctx.Width, ctx.Height, e.palette.VisibleRows()+1)
 	point := kero.Point{X: m.X, Y: m.Y}
 	switch m.Button {
 	case kero.MouseWheelUp:
-		if bufferRect(e).Contains(point) {
+		if textRect.Contains(point) {
 			p := e.palette
-			if p.Active && paletteRect(e).Contains(point) {
+			if p.Active && paletteRect.Contains(point) {
 				e.palette.Offset = max(0, p.Offset-1)
 				return nil
 			}
-			e.TopRow = max(0, e.TopRow-1)
+			e.view().ScrollRow = max(0, e.view().ScrollRow-1)
 			return nil
 		}
 		if e.ref.Active {
 			e.ref.Offset = max(0, e.ref.Offset-1)
 		}
 	case kero.MouseWheelDown:
-		if bufferRect(e).Contains(point) {
+		if textRect.Contains(point) {
 			p := e.palette
-			if p.Active && paletteRect(e).Contains(kero.Point{X: m.X, Y: m.Y}) {
+			if p.Active && paletteRect.Contains(kero.Point{X: m.X, Y: m.Y}) {
 				e.palette.Offset = min(p.Offset+1, len(p.Items)-p.VisibleRows())
 				return nil
 			}
-			e.TopRow = min(e.TopRow+1, len(e.Lines)-bufferRect(e).H)
+			e.view().ScrollRow = min(e.view().ScrollRow+1, len(e.Buf().Lines)-textRect.H)
 			return nil
 		}
 		if e.ref.Active {
@@ -220,9 +280,8 @@ func (e *Editor) handleMouse(m kero.MouseEvent) error {
 		switch m.Action {
 		case kero.MousePress:
 			if e.palette.Active {
-				pr := paletteRect(e)
-				if pr.Contains(kero.Point{X: m.X, Y: m.Y}) {
-					index := m.Y - pr.Y - 1 + e.palette.Offset
+				if paletteRect.Contains(kero.Point{X: m.X, Y: m.Y}) {
+					index := m.Y - paletteRect.Y - 1 + e.palette.Offset
 					if index < 0 || index >= len(e.palette.Items) {
 						return nil
 					}
@@ -235,8 +294,8 @@ func (e *Editor) handleMouse(m kero.MouseEvent) error {
 				e.palette.Close()
 			}
 
-			if bufferRect(e).Contains(point) {
-				e.Cursor = e.cursorFromMouse(m)
+			if textRect.Contains(point) {
+				e.view().Cursor = e.mouseToPosition(m, textRect)
 				if e.hasSelect() {
 					e.clearSelect()
 				}
@@ -246,8 +305,8 @@ func (e *Editor) handleMouse(m kero.MouseEvent) error {
 				}
 				return nil
 			}
-			if lRect := bottomPanelRect(e); e.ref.Active && lRect.Contains(point) {
-				index := m.Y - lRect.Y - 1 + e.ref.Offset // minus 1 for header
+			if rect := LayoutBottomPanel(ctx.Width, ctx.Height); e.ref.Active && rect.Contains(point) {
+				index := m.Y - rect.Y - 1 + e.ref.Offset // minus 1 for header
 				if index < 0 || index >= len(e.ref.Items) {
 					return nil
 				}
@@ -255,7 +314,7 @@ func (e *Editor) handleMouse(m kero.MouseEvent) error {
 				e.gotoLocation(e.ref.Items[index])
 			}
 		case kero.MouseRelease:
-			if bufferRect(e).Contains(point) {
+			if textRect.Contains(point) {
 				// ctrl+mouse_left_release goto definition
 				if m.Mod == kero.ModCtrl {
 					GotoDefinition(e)
@@ -266,12 +325,12 @@ func (e *Editor) handleMouse(m kero.MouseEvent) error {
 			if last, ok := e.lastEvent.(kero.MouseEvent); ok &&
 				last.Button == kero.MouseLeft && last.Action == kero.MousePress {
 				// first drag sets selection anchor
-				e.Selecting = true
-				e.SelAnchor = e.cursorFromMouse(last)
+				e.view().Selecting = true
+				e.view().SelAnchor = e.mouseToPosition(last, textRect)
 			}
 			// later drag expands selection
-			e.Cursor = e.cursorFromMouse(m)
-			e.showCursor()
+			e.view().Cursor = e.mouseToPosition(m, textRect)
+			e.view().showCursor()
 		}
 	}
 	return nil
@@ -281,7 +340,7 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 	// can quit at anytime, first priority
 	if key.String() == "ctrl+q" {
 		quitAgain := e.LastEvent() == "ctrl+q"
-		if e.Dirty && !quitAgain {
+		if e.Buf().Dirty && !quitAgain {
 			e.message = "warn: unsaved changes, press ctrl+s to save or ctrl+q again to quit"
 			return nil
 		}
@@ -289,7 +348,7 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 		return nil
 	}
 
-	defer e.showCursor()
+	defer e.view().showCursor()
 	if e.saveAs {
 		return e.updateSaveAs(key)
 	}
@@ -310,34 +369,36 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 		e.completion.Active = completing
 	}()
 
+	v := e.view()
+	buf := e.Buf()
 	switch key.Key {
 	case kero.KeyRune:
 		switch key.String() {
 		case "ctrl+n":
-			start, end := e.WordBounds(e.PrevPos(e.Cursor))
-			word := e.GetRange(start, end)
+			start, end := buf.WordBounds(buf.PrevRunePos(v.Cursor))
+			word := buf.GetRange(start, end)
 			c := &e.completion
-			c.Refresh(e.Buffer.NewReader(), word)
+			c.Refresh(buf.NewReader(), word)
 			if len(c.Items) == 1 {
 				// only 1 candidates, apply it early
-				cursor := e.DeleteRange(start, end)
-				e.Cursor = e.Insert(cursor, c.Items[c.Index].Name)
+				cursor := buf.Delete(start, end)
+				v.Cursor = buf.Insert(cursor, c.Items[c.Index].Name)
 				e.markDirty()
 				return nil
 			}
 			completing = len(c.Items) > 0
 		case "ctrl+-":
 			e.JumpBack()
-			e.showCursorCenter()
+			e.view().showCursorCenter()
 		case "ctrl+shift+-", "ctrl+_":
 			e.JumpForward()
-			e.showCursorCenter()
+			e.view().showCursorCenter()
 		case "ctrl+w":
-			if e.Dirty && !(e.LastEvent() == "ctrl+w") {
+			if buf.Dirty && !(e.LastEvent() == "ctrl+w") {
 				e.message = "warn: unsaved changes, press ctrl+s to save or ctrl+w again to close"
 				return nil
 			}
-			if len(e.buffers) <= 1 {
+			if len(e.views) <= 1 {
 				ctx.Quit()
 				return nil
 			}
@@ -389,10 +450,10 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 				// duplicate selection not implemented yet
 				return nil
 			}
-			if start, end := e.Buffer.WordBounds(e.Cursor); start != end {
-				e.Selecting = true
-				e.SelAnchor = start
-				e.Cursor = end
+			if start, end := buf.WordBounds(v.Cursor); start != end {
+				v.Selecting = true
+				v.SelAnchor = start
+				v.Cursor = end
 			}
 			return nil
 		case "ctrl+l":
@@ -404,18 +465,18 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 				e.deleteSelect()
 				return nil
 			}
-			e.Cursor = e.Buffer.DeleteRange(e.Cursor, e.Buffer.LineEnd(e.Cursor))
+			v.Cursor = buf.Delete(v.Cursor, buf.LineEnd(v.Cursor))
 			e.markDirty()
 			return nil
 		case "ctrl+a":
-			p := e.Buffer.LineStartNonSpace(e.Cursor)
-			if e.Cursor == p {
-				e.Cursor.Col = 0
+			p := buf.LineStartNonSpace(v.Cursor)
+			if v.Cursor == p {
+				v.Cursor.Col = 0
 				return nil
 			}
-			e.Cursor = p
+			v.Cursor = p
 		case "ctrl+e":
-			e.Cursor = e.Buffer.LineEnd(e.Cursor)
+			v.Cursor = buf.LineEnd(v.Cursor)
 		}
 
 		if key.Mod != 0 {
@@ -424,19 +485,19 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 		if e.hasSelect() {
 			e.deleteSelect()
 		}
-		e.Cursor = e.Buffer.Insert(e.Cursor, string([]rune{key.Rune}))
+		v.Cursor = buf.Insert(v.Cursor, string([]rune{key.Rune}))
 		e.markDirty()
 		if e.completion.Active {
-			start, end := e.WordBounds(e.PrevPos(e.Cursor))
-			word := e.GetRange(start, end)
-			e.completion.Refresh(e.Buffer.NewReader(), word)
+			start, end := buf.WordBounds(buf.PrevRunePos(v.Cursor))
+			word := buf.GetRange(start, end)
+			e.completion.Refresh(buf.NewReader(), word)
 			completing = len(e.completion.Items) > 0
 		}
 	case kero.KeyEnter:
 		if e.completion.Active {
-			start, end := e.WordBounds(e.PrevPos(e.Cursor))
-			cursor := e.DeleteRange(start, end)
-			e.Cursor = e.Insert(cursor, e.completion.Items[e.completion.Index].Name)
+			start, end := buf.WordBounds(buf.PrevRunePos(v.Cursor))
+			cursor := buf.Delete(start, end)
+			v.Cursor = buf.Insert(cursor, e.completion.Items[e.completion.Index].Name)
 			e.markDirty()
 			return nil
 		}
@@ -446,22 +507,23 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 		}
 
 		if e.pasting {
-			e.Cursor = e.Buffer.Insert(e.Cursor, "\n")
+			v.Cursor = buf.Insert(v.Cursor, "\n")
 			return nil
 		}
 
 		// compute indentation
-		autoIndent := func(line []rune, col int) string {
+		getIndent := func(line []byte, col int) string {
 			if len(line) == 0 || col == 0 {
 				return ""
 			}
 			// get indentation before the column
 			var n int
-			for _, b := range line[:col] {
-				if !unicode.IsSpace(b) {
+			for n <= len(line) {
+				r, size := utf8.DecodeRune(line[:col])
+				if !unicode.IsSpace(r) {
 					break
 				}
-				n++
+				n += size
 			}
 			indent := string(line[:n])
 			// indent on block start
@@ -474,31 +536,31 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 		switch key.String() {
 		case "ctrl+enter":
 			// insert newline below
-			line := e.Buffer.Line(e.Cursor.Row)
-			indent := autoIndent(line, len(line))
-			p := Position{Row: e.Cursor.Row, Col: len(line)}
-			e.Cursor = e.Buffer.Insert(p, "\n"+indent)
+			line := buf.Lines[v.Cursor.Row]
+			indent := getIndent(line, len(line))
+			p := Position{Row: v.Cursor.Row, Col: len(line)}
+			v.Cursor = buf.Insert(p, "\n"+indent)
 		case "shift+enter":
 			// insert newline above
 			var prevIndent string
-			if e.Cursor.Row > 0 {
-				prevLine := e.Buffer.Line(e.Cursor.Row - 1)
-				prevIndent = autoIndent(prevLine, len(prevLine))
+			if v.Cursor.Row > 0 {
+				prevLine := buf.Lines[v.Cursor.Row-1]
+				prevIndent = getIndent(prevLine, len(prevLine))
 			}
-			e.Buffer.Insert(Position{Row: e.Cursor.Row, Col: 0}, "\n")
-			e.Cursor = e.Buffer.Insert(Position{Row: e.Cursor.Row, Col: 0}, prevIndent)
+			buf.Insert(Position{Row: v.Cursor.Row, Col: 0}, "\n")
+			v.Cursor = buf.Insert(Position{Row: v.Cursor.Row, Col: 0}, prevIndent)
 		default:
 			// insert newline under cursor
-			line := e.Buffer.Line(e.Cursor.Row)
-			indent := autoIndent(line, e.Cursor.Col)
-			e.Cursor = e.Buffer.Insert(e.Cursor, "\n"+string(indent))
+			line := buf.Lines[v.Cursor.Row]
+			indent := getIndent(line, v.Cursor.Col)
+			v.Cursor = buf.Insert(v.Cursor, "\n"+string(indent))
 		}
 		e.markDirty()
 	case kero.KeyTab:
 		if e.completion.Active {
-			start, end := e.WordBounds(e.PrevPos(e.Cursor))
-			cursor := e.DeleteRange(start, end)
-			e.Cursor = e.Insert(cursor, e.completion.Items[e.completion.Index].Name)
+			start, end := buf.WordBounds(buf.PrevRunePos(v.Cursor))
+			cursor := buf.Delete(start, end)
+			v.Cursor = buf.Insert(cursor, e.completion.Items[e.completion.Index].Name)
 			e.markDirty()
 			break
 		}
@@ -508,14 +570,14 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 			break
 		}
 		if e.hasSelect() {
-			start, end := orderPos(e.SelAnchor, e.Cursor)
+			start, end := orderPos(v.SelAnchor, v.Cursor)
 			if start.Row != end.Row {
 				e.indentSelect()
 				break
 			}
 			e.deleteSelect()
 		}
-		e.Cursor = e.Insert(e.Cursor, "\t")
+		v.Cursor = buf.Insert(v.Cursor, "\t")
 		e.markDirty()
 	case kero.KeyBackspace:
 		if e.hasSelect() {
@@ -525,119 +587,119 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 		switch key.String() {
 		case "ctrl+backspace", "cmd+backspace":
 			// delete to line start
-			e.Cursor = e.Buffer.DeleteRange(Position{Row: e.Cursor.Row, Col: 0}, e.Cursor)
+			v.Cursor = buf.Delete(Position{Row: v.Cursor.Row, Col: 0}, v.Cursor)
 		case "alt+backspace":
 			// delete word backwards
-			prev := e.Buffer.MoveWordLeft(e.Cursor)
-			e.Cursor = e.Buffer.DeleteRange(prev, e.Cursor)
+			prev := buf.MoveWordLeft(v.Cursor)
+			v.Cursor = buf.Delete(prev, v.Cursor)
 		case "cmd+shift+backspace":
 			// delete whole line
-			e.Cursor = e.Buffer.DeleteRange(Position{Row: e.Cursor.Row}, Position{Row: e.Cursor.Row + 1})
+			v.Cursor = buf.Delete(Position{Row: v.Cursor.Row}, Position{Row: v.Cursor.Row + 1})
 		default:
-			e.Cursor = e.Buffer.DeleteRange(e.Buffer.PrevPos(e.Cursor), e.Cursor)
+			v.Cursor = buf.Delete(buf.PrevRunePos(v.Cursor), v.Cursor)
 		}
 		e.markDirty()
 	case kero.KeyDelete:
-		e.Cursor = e.Buffer.DeleteRange(e.Cursor, e.Buffer.NextPos(e.Cursor))
+		v.Cursor = buf.Delete(v.Cursor, buf.NextRunePos(v.Cursor))
 		e.markDirty()
 	case kero.KeyLeft:
 		switch key.String() {
 		case "alt+left":
-			e.Cursor = e.Buffer.MoveWordLeft(e.Cursor)
+			v.Cursor = buf.MoveWordLeft(v.Cursor)
 		case "cmd+left":
-			p := e.Buffer.LineStartNonSpace(e.Cursor)
-			if e.Cursor == p {
-				e.Cursor.Col = 0
+			p := buf.LineStartNonSpace(v.Cursor)
+			if v.Cursor == p {
+				v.Cursor.Col = 0
 			} else {
-				e.Cursor = p
+				v.Cursor = p
 			}
 		case "shift+left":
 			// start selection
-			if !e.Selecting {
-				e.Selecting = true
-				e.SelAnchor = e.Cursor
+			if !v.Selecting {
+				v.Selecting = true
+				v.SelAnchor = v.Cursor
 			}
-			e.moveLeft()
+			v.moveLeft()
 		default:
-			e.moveLeft()
+			v.moveLeft()
 		}
 	case kero.KeyRight:
 		switch key.String() {
 		case "alt+right":
-			e.Cursor = e.Buffer.MoveWordRight(e.Cursor)
+			v.Cursor = buf.MoveWordRight(v.Cursor)
 		case "cmd+right":
-			e.Cursor = e.Buffer.LineEnd(e.Cursor)
+			v.Cursor = buf.LineEnd(v.Cursor)
 		case "shift+right":
 			// start selection
-			if !e.Selecting {
-				e.Selecting = true
-				e.SelAnchor = e.Cursor
+			if !v.Selecting {
+				v.Selecting = true
+				v.SelAnchor = v.Cursor
 			}
-			e.moveRight()
+			v.moveRight()
 		default:
-			e.moveRight()
+			v.moveRight()
 		}
 	case kero.KeyUp:
 		switch key.String() {
 		case "cmd+up":
 			e.recordJump()
 			// file start
-			e.Cursor.Row = 0
-			e.Cursor.Col = 0
+			v.Cursor.Row = 0
+			v.Cursor.Col = 0
 		case "shift+up":
 			// start selection
-			if !e.Selecting {
-				e.Selecting = true
-				e.SelAnchor = e.Cursor
+			if !v.Selecting {
+				v.Selecting = true
+				v.SelAnchor = v.Cursor
 			}
-			e.moveUp()
+			v.moveUp()
 		default:
 			if e.completion.Active {
 				e.completion.Prev()
 				completing = true
 				return nil
 			}
-			e.moveUp()
+			v.moveUp()
 		}
 	case kero.KeyDown:
 		switch key.String() {
 		case "cmd+down":
 			e.recordJump()
 			// file end
-			e.Cursor.Row = len(e.Buffer.Lines) - 1
-			e.Cursor = e.Buffer.LineEnd(e.Cursor)
+			v.Cursor.Row = len(buf.Lines) - 1
+			v.Cursor = buf.LineEnd(v.Cursor)
 		case "shift+down":
 			// start selection
-			if !e.Selecting {
-				e.Selecting = true
-				e.SelAnchor = e.Cursor
+			if !v.Selecting {
+				v.Selecting = true
+				v.SelAnchor = v.Cursor
 			}
-			e.moveDown()
+			v.moveDown()
 		default:
 			if e.completion.Active {
 				e.completion.Next()
 				completing = true
 				return nil
 			}
-			e.moveDown()
+			v.moveDown()
 		}
 	case kero.KeyHome:
-		p := e.Buffer.LineStartNonSpace(e.Cursor)
-		if e.Cursor == p {
-			e.Cursor.Col = 0
+		p := buf.LineStartNonSpace(v.Cursor)
+		if v.Cursor == p {
+			v.Cursor.Col = 0
 			return nil
 		}
-		e.Cursor = p
+		v.Cursor = p
 	case kero.KeyEnd:
-		e.Cursor = e.Buffer.LineEnd(e.Cursor)
+		v.Cursor = buf.LineEnd(v.Cursor)
 	case kero.KeyPgUp:
 		e.recordJump()
-		e.Cursor.Row -= bufferRect(e).H
-		e.Cursor = e.Buffer.ClampPos(e.Cursor)
+		v.Cursor.Row -= v.Height
+		v.Cursor = buf.ClampPos(v.Cursor)
 	case kero.KeyPgDown:
 		e.recordJump()
-		e.Cursor.Row += bufferRect(e).H
-		e.Cursor = e.Buffer.ClampPos(e.Cursor)
+		v.Cursor.Row += v.Height
+		v.Cursor = buf.ClampPos(v.Cursor)
 	case kero.KeyEsc:
 		if e.completion.Active {
 			e.completion.Active = false
@@ -656,198 +718,220 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 	return nil
 }
 
-// return the width of line number
-func lineNumberW(lines int) int {
+func gutterWidth(lines int) int {
 	width := 1
 	for lines >= 10 {
 		width++
 		lines /= 10
 	}
-	return width
+	return width + 2 // marker, line number, and separator
 }
 
-func gutterWidth(lines int) int {
-	return lineNumberW(lines) + 2 // marker, line number, and separator
+// LayoutWindow splits a total available screen Rect into component Rects.
+func LayoutWindow(totalWidth, totalHeight, lineCount int) (gutterRect, textRect, msgRect, statusRect kero.Rect) {
+	remaining := kero.Rect{W: totalWidth, H: totalHeight}
+
+	remaining, statusRect = kero.SplitHorizontal(remaining, remaining.H-1)
+	remaining, msgRect = kero.SplitHorizontal(remaining, remaining.H-1)
+
+	gutterWidth := gutterWidth(lineCount)
+	gutterRect, textRect = kero.SplitVertical(remaining, gutterWidth)
+
+	return gutterRect, textRect, msgRect, statusRect
 }
 
-// helper function to calculate the rectangle of buffer
-func bufferRect(e *Editor) kero.Rect {
-	h := e.Height - 2
-	if h <= 0 {
-		return kero.Rect{}
-	}
-	if e.ref.Active {
-		h -= min(len(e.ref.Items), e.ref.MaxRows)
-	}
-	gutterW := gutterWidth(len(e.Lines))
-	return kero.Rect{X: gutterW, Y: 0, W: e.Width - gutterW, H: h}
-}
-
-func paletteRect(e *Editor) kero.Rect {
-	rect := kero.Rect{X: (e.Width - 60) / 2, Y: 2, W: 60, H: e.palette.VisibleRows() + 1}
+func LayoutPalatte(totalWidth, totalHeight, paletteHeight int) kero.Rect {
+	rect := kero.Rect{X: (totalWidth - 60) / 2, Y: 2, W: 60, H: paletteHeight}
 	if rect.X <= 0 {
-		rect.X = e.Width / 4
-		rect.W = e.Width / 2
+		rect.X = totalWidth / 4
+		rect.W = totalWidth / 2
 	}
+	return rect
+}
+
+// calculate the rectangle for the bottom overlay panel
+func LayoutBottomPanel(totalWidth, totalHeight int) kero.Rect {
+	header := 1
+	visibleRows := 10
+	rect := kero.Rect{X: 0, W: totalWidth, H: visibleRows + header}
+	statusBar := 1
+	rect.Y = totalHeight - statusBar - rect.H
 	return rect
 }
 
 func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 	statusStyle := kero.NewStyle().Reverse()
-	lineNoStyle := kero.NewStyle().Foreground(kero.ColorBlue).Dim()
+	gutterStyle := kero.NewStyle().Foreground(kero.ColorBlue).Dim()
+	gutterActiveStyle := kero.NewStyle().Foreground(kero.ColorBlue)
 	textStyle := kero.NewStyle()
 	cursorStyle := textStyle.Reverse().Foreground(kero.ColorRed)
 	selectStyle := textStyle.Reverse()
 	messageStyle := kero.NewStyle()
 
-	bRect := bufferRect(e)
-	lineNoW := lineNumberW(len(e.Lines))
-	for y := range bRect.H {
-		lineIndex := e.TopRow + y
-		if lineIndex >= len(e.Lines) {
-			f.Write(0, y, "~", lineNoStyle)
+	v := e.view()
+	fSize := f.Size()
+	gutterRect, textRect, msgRect, statusRect := LayoutWindow(fSize.Width, fSize.Height, len(v.Buf.Lines))
+
+	// 1. Draw Gutter Area
+	for i := 0; i < gutterRect.H; i++ {
+		lineIdx := v.ScrollRow + i
+		y := gutterRect.Y + i
+
+		if lineIdx >= len(v.Buf.Lines) {
+			f.Write(gutterRect.X, y, "~", gutterStyle)
 			continue
 		}
 
-		lnStyle := lineNoStyle
-		if lineIndex == e.Cursor.Row {
-			lnStyle = kero.NewStyle().Foreground(kero.ColorBlue)
+		gutterText := fmt.Sprintf(" %*d ", gutterRect.W-2, lineIdx+1)
+		if lineIdx == v.Cursor.Row {
+			f.Write(gutterRect.X, y, gutterText, gutterActiveStyle)
+		} else {
+			f.Write(gutterRect.X, y, gutterText, gutterStyle)
 		}
-		f.Write(1, y, fmt.Sprintf("%*d ", lineNoW, lineIndex+1), lnStyle)
 
-		srcLine := e.Buffer.Line(lineIndex)
-		fullPadded := padTab(srcLine, 4)
+		if v := e.diagnosticForLine(lineIdx); v != nil {
+			red := kero.NewStyle().Foreground(kero.ColorRed)
+			f.Set(gutterRect.X, y, 'x', red)
+		}
+	}
 
+	// 2. Draw Text Viewport Area
+	for i := 0; i < textRect.H; i++ {
+		lineIdx := v.ScrollRow + i
+		if lineIdx >= len(v.Buf.Lines) {
+			break
+		}
+
+		y := textRect.Y + i
+		line := v.Buf.Lines[lineIdx]
+		fullPadded := padTab(string(line), 4)
 		// visual part of the padded line
 		var visPadded string
-		if e.LeftCol < len(fullPadded) {
-			visPadded = fullPadded[e.LeftCol:]
+		if v.ScrollCol < len(fullPadded) {
+			visPadded = fullPadded[v.ScrollCol:]
 		}
-		if len(visPadded) > bRect.W {
-			visPadded = visPadded[:bRect.W]
+		if len(visPadded) > textRect.W {
+			visPadded = visPadded[:textRect.W]
 		}
 
-		// draw the line
-		f.Write(bRect.X, y, visPadded, textStyle)
+		f.Write(textRect.X, y, visPadded, textStyle)
 
-		if v := e.diagnosticForLine(lineIndex); v != nil {
+		// show disanostic if appear
+		if v := e.diagnosticForLine(lineIdx); v != nil {
 			red := kero.NewStyle().Foreground(kero.ColorRed)
-			f.Write(0, y, "x", red)
-			dx := max(bRect.X+len(visPadded), ctx.Width-len(v.Msg))
+			dx := max(textRect.X+len(visPadded), fSize.Width-len(v.Msg))
 			f.Write(dx, y, v.Msg, red)
 		}
 
 		// highlight selection if any
-		if e.Selecting {
-			start, end := orderPos(e.SelAnchor, e.Cursor)
-			if lineIndex >= start.Row && lineIndex <= end.Row {
+		if v.Selecting {
+			start, end := orderPos(v.SelAnchor, v.Cursor)
+			if lineIdx >= start.Row && lineIdx <= end.Row {
 				var selStartCol, selEndCol int
 				if start.Row == end.Row {
 					selStartCol = start.Col
 					selEndCol = end.Col
-				} else if lineIndex == start.Row {
+				} else if lineIdx == start.Row {
 					selStartCol = start.Col
-					selEndCol = len(srcLine)
-				} else if lineIndex == end.Row {
+					selEndCol = len(line)
+				} else if lineIdx == end.Row {
 					selStartCol = 0
 					selEndCol = end.Col
 				} else {
 					selStartCol = 0
-					selEndCol = len(srcLine)
+					selEndCol = len(line)
 				}
 
-				visStart := e.VisualPos(Position{Row: lineIndex, Col: selStartCol})
-				visEnd := e.VisualPos(Position{Row: lineIndex, Col: selEndCol})
+				visStartCol := v.Buf.ByteToVisualCol(Position{Row: lineIdx, Col: selStartCol}, 4)
+				visEndCol := v.Buf.ByteToVisualCol(Position{Row: lineIdx, Col: selEndCol}, 4)
 
-				startDisplay := max(0, min(visStart.Col-e.LeftCol, len(visPadded)))
-				endDisplay := max(0, min(visEnd.Col-e.LeftCol, len(visPadded)))
+				startDisplay := max(0, min(visStartCol-v.ScrollCol, len(visPadded)))
+				endDisplay := max(0, min(visEndCol-v.ScrollCol, len(visPadded)))
 
 				for x := startDisplay; x < endDisplay; x++ {
 					ch := rune(visPadded[x])
-					f.Set(bRect.X+x, y, ch, selectStyle)
+					f.Set(textRect.X+x, y, ch, selectStyle)
 				}
 			}
 		}
 
 		// highlight finding match
-		if e.finding && e.findMatch && lineIndex == e.findMatchStart.Row && lineIndex == e.findMatchEnd.Row {
-			visStart := e.VisualPos(Position{Row: lineIndex, Col: e.findMatchStart.Col})
-			visEnd := e.VisualPos(Position{Row: lineIndex, Col: e.findMatchEnd.Col})
+		if e.finding && e.findMatch && lineIdx == e.findMatchStart.Row && lineIdx == e.findMatchEnd.Row {
+			visStartCol := e.Buf().ByteToVisualCol(Position{Row: lineIdx, Col: e.findMatchStart.Col}, 4)
+			visEndCol := e.Buf().ByteToVisualCol(Position{Row: lineIdx, Col: e.findMatchEnd.Col}, 4)
 
-			startDisplay := max(0, min(visStart.Col-e.LeftCol, len(visPadded)))
-			endDisplay := max(0, min(visEnd.Col-e.LeftCol, len(visPadded)))
+			startDisplay := max(0, min(visStartCol-e.view().ScrollCol, len(visPadded)))
+			endDisplay := max(0, min(visEndCol-e.view().ScrollCol, len(visPadded)))
 
 			for x := startDisplay; x < endDisplay; x++ {
 				ch := rune(visPadded[x])
-				f.Set(bRect.X+x, y, ch, selectStyle)
+				f.Set(textRect.X+x, y, ch, selectStyle)
 			}
 		}
 	}
 
-	cursorVisPos := e.VisualPos(e.Cursor)
-	cursorX := bRect.X + cursorVisPos.Col - e.LeftCol
-	cursorY := 0 + e.Cursor.Row - e.TopRow
-	if bRect.Contains(kero.Point{X: cursorX, Y: cursorY}) {
-		fullLinePadded := padTab(e.Line(e.Cursor.Row), 4)
+	cursorVisCol := v.Buf.ByteToVisualCol(v.Cursor, 4)
+	cursorX := textRect.X + cursorVisCol - v.ScrollCol
+	cursorY := 0 + v.Cursor.Row - v.ScrollRow
+	if textRect.Contains(kero.Point{X: cursorX, Y: cursorY}) {
+		fullLinePadded := padTab(string(v.Buf.Lines[v.Cursor.Row]), 4)
 		ch := ' '
-		if cursorVisPos.Col < len(fullLinePadded) {
-			ch = rune(fullLinePadded[cursorVisPos.Col])
+		if cursorVisCol < len(fullLinePadded) {
+			ch = rune(fullLinePadded[cursorVisCol])
 		}
 		f.Set(cursorX, cursorY, ch, cursorStyle)
 	}
 
-	statusY := ctx.Height - 1
-	if statusY >= 0 {
+	// statusY := ctx.Height - 1
+	if statusRect.H > 0 {
 		var names strings.Builder
-		for i, b := range e.buffers {
-			if i == e.active && len(e.buffers) > 1 {
+		for i, b := range e.views {
+			if i == e.active && len(e.views) > 1 {
 				names.WriteString("[")
 			}
 			name := "untitled"
-			if b.Filename != "" {
-				name = filepath.Base(b.Filename)
+			if b.Buf.Path != "" {
+				name = filepath.Base(b.Buf.Path)
 			}
 			names.WriteString(name)
-			if b.Dirty {
+			if b.Buf.Dirty {
 				names.WriteString("*")
 			}
-			if i == e.active && len(e.buffers) > 1 {
+			if i == e.active && len(e.views) > 1 {
 				names.WriteString("]")
 			}
 			names.WriteString(" ")
 		}
-		status := fmt.Sprintf(" %s| Line %d, Col %d", names.String(), e.Cursor.Row+1, cursorVisPos.Col+1)
-		if e.Selecting {
+		status := fmt.Sprintf(" %s| Line %d, Col %d", names.String(), v.Cursor.Row+1, cursorVisCol+1)
+		if v.Selecting {
 			status = status + " | Selecting"
 		}
-		f.Fill(kero.Rect{X: 0, Y: statusY, W: ctx.Width, H: 1}, ' ', statusStyle)
-		f.Write(0, statusY, trimToWidth(status, ctx.Width), statusStyle)
+		f.Fill(statusRect, ' ', statusStyle)
+		f.Write(statusRect.X, statusRect.Y, trimToWidth(status, ctx.Width), statusStyle)
+		if s := e.LastEvent(); s != "" {
+			f.Write(fSize.Width-runewidth.StringWidth(s), statusRect.Y, s, statusStyle)
+		}
 		if len(e.diags) > 0 {
 			warn := fmt.Sprintf("%d diagnostic", len(e.diags))
-			statusWidth := len([]rune(status))
-			f.Write(statusWidth+1, statusY, "| ", statusStyle)
-			eventWidth := len(e.LastEvent())
-			remainWidth := ctx.Width - statusWidth - eventWidth
+			statusWidth := runewidth.StringWidth(status)
+			eventWidth := runewidth.StringWidth(e.LastEvent())
+			remainWidth := fSize.Width - statusWidth - eventWidth
 			if remainWidth > 0 {
-				f.Write(statusWidth+3, statusY, trimToWidth(warn, remainWidth), statusStyle.Background(kero.ColorRed))
+				f.Write(statusRect.X+statusWidth+1, statusRect.Y, trimToWidth("| "+warn, remainWidth), statusStyle.Background(kero.ColorRed))
 			}
-		}
-		if s := e.LastEvent(); s != "" {
-			f.Write(ctx.Width-len(s), statusY, s, statusStyle)
 		}
 	}
 
-	messageY := ctx.Height - 2
-	if messageY >= 0 {
+	if msgRect.H > 0 {
 		switch {
 		case e.saveAs:
-			e.drawSaveAs(f, messageY, ctx.Width)
+			e.drawSaveAs(f, msgRect)
 		case e.finding:
-			e.drawFind(f, messageY, ctx.Width)
+			e.drawFind(f, msgRect)
 		case e.renaming:
-			e.drawRename(f, messageY, ctx.Width)
+			e.drawRename(f, msgRect)
 		case e.ref.Active:
-			e.drawReferences(f, bottomPanelRect(e))
+			e.drawReferences(f, LayoutBottomPanel(fSize.Width, fSize.Height))
 		default:
 			if e.message == "" {
 				e.message = "^S save | ^W close | ^Q quit | ^F find | ^P palette"
@@ -855,7 +939,7 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 			if strings.HasPrefix(e.message, "error:") || strings.HasPrefix(e.message, "warn:") {
 				messageStyle = messageStyle.Foreground(kero.ColorRed)
 			}
-			f.Write(0, messageY, trimToWidth(" "+e.message, ctx.Width), messageStyle)
+			f.Write(msgRect.X, msgRect.Y, trimToWidth(" "+e.message, ctx.Width), messageStyle)
 		}
 	}
 
@@ -864,20 +948,20 @@ func (e *Editor) View(ctx *kero.Context, f *kero.Frame) {
 	}
 
 	if e.palette.Active {
-		e.drawPalette(f, paletteRect(e))
+		e.drawPalette(f, LayoutPalatte(fSize.Width, fSize.Height, e.palette.VisibleRows()+1))
 	}
 }
 
 func (e *Editor) selectLine() {
-	if !e.Selecting {
-		e.Selecting = true
-		e.SelAnchor = Position{Row: e.Cursor.Row, Col: 0}
+	if !e.view().Selecting {
+		e.view().Selecting = true
+		e.view().SelAnchor = Position{Row: e.view().Cursor.Row, Col: 0}
 	}
-	if e.Cursor.Row < len(e.Buffer.Lines)-1 {
-		e.Cursor.Row++
-		e.Cursor.Col = 0
+	if e.view().Cursor.Row < len(e.Buf().Lines)-1 {
+		e.view().Cursor.Row++
+		e.view().Cursor.Col = 0
 	} else {
-		e.Cursor = e.Buffer.LineEnd(e.Cursor)
+		e.view().Cursor = e.Buf().LineEnd(e.view().Cursor)
 	}
 }
 
@@ -886,21 +970,21 @@ func isWordChar(r rune) bool {
 }
 
 func (e *Editor) hasSelect() bool {
-	return e.Selecting && e.SelAnchor != e.Cursor
+	return e.view().Selecting && e.view().SelAnchor != e.view().Cursor
 }
 
 func (e *Editor) clearSelect() {
-	e.Selecting = false
+	e.view().Selecting = false
 }
 
 func (e *Editor) copy() {
 	if e.hasSelect() {
-		e.clipboard = e.Buffer.GetRange(e.SelAnchor, e.Cursor)
+		e.clipboard = e.Buf().GetRange(e.view().SelAnchor, e.view().Cursor)
 		e.clipIsLine = false
 		return
 	}
 	// copy entire current line, remember it's a line copy
-	e.clipboard = string(e.Buffer.Line(e.Cursor.Row))
+	e.clipboard = string(e.Buf().Lines[e.view().Cursor.Row])
 	e.clipIsLine = true
 }
 
@@ -909,7 +993,7 @@ func (e *Editor) indentSelect() {
 		return
 	}
 
-	start, end := orderPos(e.SelAnchor, e.Cursor)
+	start, end := orderPos(e.view().SelAnchor, e.view().Cursor)
 	if start.Row == end.Row {
 		return
 	}
@@ -918,64 +1002,65 @@ func (e *Editor) indentSelect() {
 		lastRow = end.Row - 1
 	}
 	for r := start.Row; r <= lastRow; r++ {
-		e.Buffer.Insert(Position{Row: r, Col: 0}, "\t")
+		e.Buf().Insert(Position{Row: r, Col: 0}, "\t")
 	}
-	if start.Row <= e.SelAnchor.Row && e.SelAnchor.Row <= lastRow {
-		e.SelAnchor.Col++
+	if start.Row <= e.view().SelAnchor.Row && e.view().SelAnchor.Row <= lastRow {
+		e.view().SelAnchor.Col++
 	}
-	if start.Row <= e.Cursor.Row && e.Cursor.Row <= lastRow {
-		e.Cursor.Col++
+	if start.Row <= e.view().Cursor.Row && e.view().Cursor.Row <= lastRow {
+		e.view().Cursor.Col++
 	}
 	e.markDirty()
 }
 
-func unindentLine(s string) (string, int) {
-	if strings.HasPrefix(s, "\t") {
-		return s[1:], 1
+// unindent the line, return the removed bytes number
+func unindent(line string) (string, int) {
+	if strings.HasPrefix(line, "\t") {
+		return line[1:], 1
 	}
 	spaces := 0
-	for spaces < 4 && spaces < len(s) && s[spaces] == ' ' {
+	for spaces < 4 && spaces < len(line) && line[spaces] == ' ' {
 		spaces++
 	}
 	if spaces > 0 {
-		return s[spaces:], spaces
+		return line[spaces:], spaces
 	}
-	return s, 0
+	return line, 0
 }
 
 func (e *Editor) unindentSelectOrLine() {
 	if !e.hasSelect() {
-		newLine, removed := unindentLine(string(e.Buffer.Line(e.Cursor.Row)))
+		newLine, removed := unindent(string(e.Buf().Lines[e.view().Cursor.Row]))
 		if removed > 0 {
-			e.Buffer.SetLine(e.Cursor.Row, []rune(newLine))
-			e.Cursor.Col = max(0, e.Cursor.Col-removed)
+			e.Buf().Lines[e.view().Cursor.Row] = []byte(newLine)
+			e.view().Cursor.Col = max(0, e.view().Cursor.Col-removed)
 			e.markDirty()
 		}
 		return
 	}
 
-	start, end := orderPos(e.SelAnchor, e.Cursor)
+	start, end := orderPos(e.view().SelAnchor, e.view().Cursor)
 	lastRow := end.Row
 	if end.Col == 0 && end.Row > start.Row {
 		lastRow = end.Row - 1
 	}
 	var startRemoved, endRemoved int
 	for r := start.Row; r <= lastRow; r++ {
-		newLine, removed := unindentLine(string(e.Buffer.Line(r)))
-		if r == e.SelAnchor.Row {
+		newLine, removed := unindent(string(e.Buf().Lines[r]))
+		if r == e.view().SelAnchor.Row {
 			startRemoved = removed
 		}
-		if r == e.Cursor.Row {
+		if r == e.view().Cursor.Row {
 			endRemoved = removed
 		}
-		e.Buffer.SetLine(r, []rune(newLine))
+		e.Buf().Lines[r] = []byte(newLine)
 	}
 
-	if e.SelAnchor.Row <= lastRow {
-		e.SelAnchor.Col = max(0, e.SelAnchor.Col-startRemoved)
+	if e.view().SelAnchor.Row <= lastRow {
+		e.view().SelAnchor.Col = max(0, e.view().SelAnchor.Col-startRemoved)
 	}
-	if e.Cursor.Row <= lastRow {
-		e.Cursor.Col = max(0, e.Cursor.Col-endRemoved)
+	if e.view().Cursor.Row <= lastRow {
+		e.view().Cursor.Col = max(0, e.view().Cursor.Col-endRemoved)
 	}
 	e.markDirty()
 }
@@ -984,8 +1069,8 @@ func (e *Editor) deleteSelect() {
 	if !e.hasSelect() {
 		return
 	}
-	e.Cursor = e.Buffer.DeleteRange(e.SelAnchor, e.Cursor)
-	e.Selecting = false
+	e.view().Cursor = e.Buf().Delete(e.view().SelAnchor, e.view().Cursor)
+	e.view().Selecting = false
 	e.markDirty()
 }
 
@@ -997,10 +1082,10 @@ func (e *Editor) cut() {
 		return
 	}
 	// cut current line
-	p1 := Position{Row: e.Cursor.Row}
-	e.clipboard = e.Buffer.GetRange(p1, e.Buffer.LineEnd(e.Cursor))
+	p1 := Position{Row: e.view().Cursor.Row}
+	e.clipboard = e.Buf().GetRange(p1, e.Buf().LineEnd(e.view().Cursor))
 	e.clipIsLine = true
-	e.Cursor = e.Buffer.DeleteRange(p1, Position{Row: e.Cursor.Row + 1})
+	e.view().Cursor = e.Buf().Delete(p1, Position{Row: e.view().Cursor.Row + 1})
 	e.markDirty()
 }
 
@@ -1016,17 +1101,17 @@ func (e *Editor) paste() {
 	// whole-line copy: paste a fresh copy of that line ABOVE the current line,
 	// pushing the current line downward.
 	if e.clipIsLine && e.clipboard != "" {
-		e.Buffer.Insert(Position{Row: e.Cursor.Row, Col: 0}, e.clipboard+"\n")
-		e.Cursor.Row++
+		e.Buf().Insert(Position{Row: e.view().Cursor.Row, Col: 0}, e.clipboard+"\n")
+		e.view().Cursor.Row++
 		e.markDirty()
 		return
 	}
 
-	e.Cursor = e.Buffer.Insert(e.Cursor, e.clipboard)
+	e.view().Cursor = e.Buf().Insert(e.view().Cursor, e.clipboard)
 	e.markDirty()
 }
 
-func padTab(s []rune, tabSize int) string {
+func padTab(s string, tabSize int) string {
 	var result strings.Builder
 	col := 0
 	for _, r := range s {
@@ -1043,30 +1128,30 @@ func padTab(s []rune, tabSize int) string {
 }
 
 func (e *Editor) save() error {
-	if e.Buffer == nil {
+	if e.Buf() == nil {
 		return nil
 	}
-	if e.Filename == "" {
+	if e.Buf().Path == "" {
 		e.startSaveAs()
 		return nil
 	}
 
-	if _, err := e.Buffer.Format(); err != nil {
+	if _, err := e.Buf().Format(); err != nil {
 		log.Print(err)
 	}
 
-	if err := e.Buffer.Save(); err != nil {
+	if err := e.Buf().SaveFile(); err != nil {
 		e.message = "error: " + err.Error()
 		return nil
 	}
 
-	e.message = fmt.Sprintf("saved %s", filepath.Base(e.Filename))
+	e.message = fmt.Sprintf("saved %s", filepath.Base(e.Buf().Path))
 	return nil
 }
 
 func (e *Editor) startSaveAs() {
 	e.saveAs = true
-	e.saveInput.SetText(e.Filename)
+	e.saveInput.SetText(e.Buf().Path)
 	e.message = "enter a filename"
 }
 
@@ -1095,7 +1180,7 @@ func (e *Editor) finishSaveAs() error {
 	if err != nil {
 		return err
 	}
-	e.Filename = p
+	e.Buf().Path = p
 	e.saveAs = false
 	if err := e.save(); err != nil {
 		return err
@@ -1104,7 +1189,7 @@ func (e *Editor) finishSaveAs() error {
 	return nil
 }
 
-func (e *Editor) drawSaveAs(f *kero.Frame, y int, width int) {
+func (e *Editor) drawSaveAs(f *kero.Frame, rect kero.Rect) {
 	normal := kero.NewStyle().Foreground(kero.ColorYellow)
 	errorStyle := kero.NewStyle().Foreground(kero.ColorRed)
 	style := normal
@@ -1113,12 +1198,12 @@ func (e *Editor) drawSaveAs(f *kero.Frame, y int, width int) {
 	}
 
 	prompt := " Save as: "
-	f.Write(0, y, trimToWidth(prompt, width), style)
+	f.Write(rect.X, rect.Y, trimToWidth(prompt, rect.W), style)
 	inputX := len([]rune(prompt))
-	if inputX >= width {
+	if inputX >= rect.W {
 		return
 	}
-	e.saveInput.Draw(f, kero.Rect{X: inputX, Y: y, W: width - inputX, H: 1}, style)
+	e.saveInput.Draw(f, kero.Rect{X: inputX, Y: rect.Y, W: rect.W - inputX, H: 1}, style)
 }
 
 // startFind starts a Find prompt, and pre-fill with selection or last query, if any.
@@ -1127,7 +1212,7 @@ func (e *Editor) startFind() {
 	e.findBlur = false
 	e.replacing = false
 	if e.hasSelect() {
-		e.findInput.SetTextAndSelectAll(e.Buffer.GetRange(e.SelAnchor, e.Cursor))
+		e.findInput.SetTextAndSelectAll(e.Buf().GetRange(e.view().SelAnchor, e.view().Cursor))
 		return
 	}
 	if e.findInput.String() != "" {
@@ -1188,19 +1273,19 @@ func (e *Editor) updateFind(ev kero.KeyEvent) error {
 
 		if ev.Mod&kero.ModShift != 0 {
 			if ignoreCase {
-				if start, end, ok := e.Buffer.FindPrevIgnoreCase(query, e.Cursor); ok {
+				if start, end, ok := e.Buf().FindPrevIgnoreCase(query, e.view().Cursor); ok {
 					e.findMatch = true
 					e.findMatchStart = start
 					e.findMatchEnd = end
-					e.Cursor = start
+					e.view().Cursor = start
 					e.clearSelect()
 				}
 			} else {
-				if start, end, ok := e.Buffer.FindPrev(query, e.Cursor); ok {
+				if start, end, ok := e.Buf().FindPrev(query, e.view().Cursor); ok {
 					e.findMatch = true
 					e.findMatchStart = start
 					e.findMatchEnd = end
-					e.Cursor = start
+					e.view().Cursor = start
 					e.clearSelect()
 				}
 			}
@@ -1208,21 +1293,21 @@ func (e *Editor) updateFind(ev kero.KeyEvent) error {
 		}
 
 		if ignoreCase {
-			start, end, ok := e.Buffer.FindNextIgnoreCase(query, e.Cursor)
+			start, end, ok := e.Buf().FindNextIgnoreCase(query, e.view().Cursor)
 			if ok {
 				e.findMatch = true
 				e.findMatchStart = start
 				e.findMatchEnd = end
-				e.Cursor = end
+				e.view().Cursor = end
 				e.clearSelect()
 			}
 		} else {
-			start, end, ok := e.Buffer.FindNext(query, e.Cursor)
+			start, end, ok := e.Buf().FindNext(query, e.view().Cursor)
 			if ok {
 				e.findMatch = true
 				e.findMatchStart = start
 				e.findMatchEnd = end
-				e.Cursor = end
+				e.view().Cursor = end
 				e.clearSelect()
 			}
 		}
@@ -1236,23 +1321,23 @@ func (e *Editor) updateFind(ev kero.KeyEvent) error {
 	return nil
 }
 
-func (e *Editor) drawFind(f *kero.Frame, y int, width int) {
+func (e *Editor) drawFind(f *kero.Frame, rect kero.Rect) {
 	normal := kero.NewStyle()
 	prompt := " Find: "
-	f.Write(0, y, trimToWidth(prompt, width), normal)
+	f.Write(rect.X, rect.Y, trimToWidth(prompt, rect.W), normal)
 	inputX := len([]rune(prompt))
-	if inputX >= width {
+	if inputX >= rect.W {
 		return
 	}
 	if !e.replacing {
-		e.findInput.Draw(f, kero.Rect{X: inputX, Y: y, W: width - inputX, H: 1}, normal)
+		e.findInput.Draw(f, kero.Rect{X: inputX, Y: rect.Y, W: rect.W - inputX, H: 1}, normal)
 		return
 	}
-	e.findInput.Draw(f, kero.Rect{X: inputX, Y: y, W: width - inputX, H: 1}, normal)
+	e.findInput.Draw(f, kero.Rect{X: inputX, Y: rect.Y, W: rect.W - inputX, H: 1}, normal)
 	replaceX := inputX + len([]rune(e.findInput.String())) + 4
-	if replaceX < width {
-		f.Write(replaceX-4, y, " -> ", normal.Foreground(kero.ColorYellow))
-		e.replaceInput.Draw(f, kero.Rect{X: replaceX, Y: y, W: width - replaceX, H: 1}, normal)
+	if replaceX < rect.W {
+		f.Write(replaceX-4, rect.Y, " -> ", normal.Foreground(kero.ColorYellow))
+		e.replaceInput.Draw(f, kero.Rect{X: replaceX, Y: rect.Y, W: rect.W - replaceX, H: 1}, normal)
 	}
 }
 
@@ -1261,7 +1346,7 @@ func (e *Editor) skipFindMatch() {
 	if query == "" {
 		return
 	}
-	from := e.Cursor
+	from := e.view().Cursor
 	if e.findMatch {
 		from = e.findMatchEnd
 	}
@@ -1269,9 +1354,9 @@ func (e *Editor) skipFindMatch() {
 	var start, end Position
 	var ok bool
 	if ignoreCase {
-		start, end, ok = e.Buffer.FindNextIgnoreCase(query, from)
+		start, end, ok = e.Buf().FindNextIgnoreCase(query, from)
 	} else {
-		start, end, ok = e.Buffer.FindNext(query, from)
+		start, end, ok = e.Buf().FindNext(query, from)
 	}
 	if !ok {
 		e.findMatch = false
@@ -1280,7 +1365,7 @@ func (e *Editor) skipFindMatch() {
 	e.findMatch = true
 	e.findMatchStart = start
 	e.findMatchEnd = end
-	e.Cursor = end
+	e.view().Cursor = end
 	e.clearSelect()
 }
 
@@ -1296,13 +1381,13 @@ func (e *Editor) replaceCurrent() error {
 		return nil
 	}
 
-	replacedEnd := e.ReplaceRange(e.findMatchStart, e.findMatchEnd, e.replaceInput.String())
+	replacedEnd := e.Buf().ReplaceRange(e.findMatchStart, e.findMatchEnd, e.replaceInput.String())
 	e.markDirty()
-	e.Cursor = replacedEnd
+	e.view().Cursor = replacedEnd
 	e.findMatch = false
-	if e.replaceInput.String() == query && replacedEnd.Col < e.LineEnd(replacedEnd).Col {
+	if e.replaceInput.String() == query && replacedEnd.Col < e.Buf().LineEnd(replacedEnd).Col {
 		replacedEnd.Col++
-		e.Cursor = replacedEnd
+		e.view().Cursor = replacedEnd
 	}
 	e.skipFindMatch()
 	return nil
@@ -1316,9 +1401,9 @@ func (e *Editor) replaceAll() error {
 	ignoreCase := findQueryIgnoreCase(query)
 	var count int
 	if ignoreCase {
-		count = e.Buffer.ReplaceAllIgnoreCase(query, e.replaceInput.String())
+		count = e.Buf().ReplaceAllIgnoreCase(query, e.replaceInput.String())
 	} else {
-		count = e.Buffer.ReplaceAll(query, e.replaceInput.String())
+		count = e.Buf().ReplaceAll(query, e.replaceInput.String())
 	}
 	if count > 0 {
 		e.markDirty()
@@ -1328,34 +1413,36 @@ func (e *Editor) replaceAll() error {
 	return nil
 }
 
-func (e *Editor) moveLeft() {
-	e.Cursor = e.Buffer.PrevPos(e.Cursor)
+func (v *View) moveLeft() {
+	v.Cursor = v.Buf.PrevRunePos(v.Cursor)
 }
 
-func (e *Editor) moveRight() {
-	e.Cursor = e.Buffer.NextPos(e.Cursor)
+func (v *View) moveRight() {
+	v.Cursor = v.Buf.NextRunePos(v.Cursor)
 }
 
-func (e *Editor) moveUp() {
-	if e.Cursor.Row == 0 {
+func (v *View) moveUp() {
+	if v.Cursor.Row == 0 {
 		return
 	}
-	vp := e.VisualPos(e.Cursor)
-	e.Cursor = e.PosFromVisual(Position{Row: vp.Row - 1, Col: vp.Col})
+	vCol := v.Buf.ByteToVisualCol(v.Cursor, 4)
+	col := v.Buf.VisualToByteCol(v.Cursor.Row-1, vCol, 4)
+	v.Cursor = Position{Row: v.Cursor.Row - 1, Col: col}
 }
 
-func (e *Editor) moveDown() {
-	if e.Cursor.Row == len(e.Buffer.Lines)-1 {
+func (v *View) moveDown() {
+	if v.Cursor.Row >= len(v.Buf.Lines)-1 {
 		return
 	}
-	vp := e.VisualPos(e.Cursor)
-	e.Cursor = e.PosFromVisual(Position{Row: vp.Row + 1, Col: vp.Col})
+	vCol := v.Buf.ByteToVisualCol(v.Cursor, 4)
+	col := v.Buf.VisualToByteCol(v.Cursor.Row+1, vCol, 4)
+	v.Cursor = Position{Row: v.Cursor.Row + 1, Col: col}
 }
 
 func (e *Editor) markDirty() {
-	e.Dirty = true
+	e.Buf().Dirty = true
 	e.message = ""
-	if isGoFile(e.Filename) {
+	if isGoFile(e.Buf().Path) {
 		e.debounceDiagnose()
 	}
 }
@@ -1368,7 +1455,7 @@ type diagResult struct {
 // debounceDiagnose makes instant diagnose for dirty buffer,
 // and accurate diagnose for clean file.
 func (e *Editor) debounceDiagnose() {
-	if e.Buffer == nil || !isGoFile(e.Buffer.Filename) {
+	if e.Buf() == nil || !isGoFile(e.Buf().Path) {
 		return
 	}
 
@@ -1380,11 +1467,11 @@ func (e *Editor) debounceDiagnose() {
 	if e.diagChan == nil {
 		e.diagChan = make(chan diagResult, 4)
 	}
-	filename := e.Filename
-	src := e.Buffer.NewReader()
+	filename := e.Buf().Path
+	src := e.Buf().NewReader()
 	e.diagTimer = time.AfterFunc(300*time.Millisecond, func() {
 		var errs []*scanner.Error
-		if e.Buffer.Dirty {
+		if e.Buf().Dirty {
 			// suitable for instant editing
 			errs = CheckSemantics(filename, src)
 		} else {
@@ -1438,13 +1525,14 @@ func (e *Editor) gotoDiagnostic() {
 		return
 	}
 
+	v := e.view()
 	// find next diagnostic
 	var err *scanner.Error
 	for _, d := range e.diags {
 		dRow := d.Pos.Line - 1
-		dCol := byteColumnToRuneIndex(string(e.Lines[dRow]), d.Pos.Column)
-		if dRow > e.Cursor.Row ||
-			(dRow == e.Cursor.Row && dCol > e.Cursor.Col) {
+		dCol := byteColumnToRuneIndex(string(v.Buf.Lines[dRow]), d.Pos.Column)
+		if dRow > v.Cursor.Row ||
+			(dRow == v.Cursor.Row && dCol > v.Cursor.Col) {
 			err = d
 			break
 		}
@@ -1454,74 +1542,71 @@ func (e *Editor) gotoDiagnostic() {
 	}
 
 	dRow := err.Pos.Line - 1
-	dCol := byteColumnToRuneIndex(string(e.Lines[dRow]), err.Pos.Column)
-	e.Cursor = e.Buffer.ClampPos(Position{Row: dRow, Col: dCol})
-	e.showCursorCenter()
+	dCol := byteColumnToRuneIndex(string(v.Buf.Lines[dRow]), err.Pos.Column)
+	v.Cursor = v.Buf.ClampPos(Position{Row: dRow, Col: dCol})
+	v.showCursorCenter()
 }
 
 func isGoFile(path string) bool {
 	return strings.EqualFold(filepath.Ext(path), ".go")
 }
 
-// scroll vertically to ensure cursor visible
-func (e *Editor) scrollV(margin int) {
-	// 1. Vertical Scrolling (Row)
-	maxTopRow := e.Cursor.Row - (bufferRect(e).H - margin)
-	if e.TopRow < maxTopRow {
-		e.TopRow = maxTopRow
-	}
-
-	// Ensure cursor is below the top margin
-	minTopRow := e.Cursor.Row - margin
-	if e.TopRow > minTopRow {
-		e.TopRow = minTopRow
-	}
-
-	// Clamp to top boundary
-	if e.TopRow < 0 {
-		e.TopRow = 0
-	}
-}
-
-// scroll horizontally to ensure cursor visible
-func (e *Editor) scrollH() {
-	textW := e.Width - lineNumberW(len(e.Lines)) - 2
-	textW = max(1, textW)
-
-	visCursor := e.VisualPos(e.Cursor)
-
-	if visCursor.Col < e.LeftCol {
-		e.LeftCol = visCursor.Col
-	} else if visCursor.Col >= e.LeftCol+textW {
-		e.LeftCol = visCursor.Col - textW + 1
-	}
-
-	if e.LeftCol < 0 {
-		e.LeftCol = 0
-	}
-}
-
-// showCursor adjusts TopRow and LeftCol to ensure the cursor is within
+// showCursor adjusts vertical and horizontal scrolling to ensure the cursor is within
 // the visible viewport.
-// It does nothing if called after showCursorCenter()
-func (e *Editor) showCursor() {
-	e.scrollV(1)
-	e.scrollH()
-}
-
-// showCursorCenter ensures the cursor is within viewport.
-// If cursor's row is visible, it shows naturally, without vertical scroll;
-// Otherwise, it scroll the viewport to center the cursor.
-func (e *Editor) showCursorCenter() {
-	bufH := bufferRect(e).H
-	if bufH <= 0 {
+func (v *View) showCursor() {
+	if v.Height <= 0 {
 		return
 	}
 
-	if e.Cursor.Row < e.TopRow || e.Cursor.Row >= e.TopRow+bufH-1 {
-		e.scrollV(bufH / 2)
+	// 1. Cursor is above the viewport -> scroll UP
+	if v.Cursor.Row < v.ScrollRow {
+		v.ScrollRow = v.Cursor.Row
 	}
-	e.scrollH()
+
+	// 2. Cursor is below the viewport -> scroll DOWN
+	// Bottom-most visible row index is (ScrollRow + Height - 1)
+	if v.Cursor.Row >= v.ScrollRow+v.Height {
+		v.ScrollRow = v.Cursor.Row - v.Height + 1
+	}
+
+	// Clamp to top boundary
+	if v.ScrollRow < 0 {
+		v.ScrollRow = 0
+	}
+
+	if v.Width <= 0 {
+		return
+	}
+
+	vCol := v.Buf.ByteToVisualCol(v.Cursor, 4)
+
+	// 1. Cursor is to the left of the viewport -> scroll LEFT
+	if vCol < v.ScrollCol {
+		v.ScrollCol = vCol
+	}
+
+	// 2. Cursor is to the right of the viewport -> scroll RIGHT
+	// Right-most visible visual column index is (ScrollCol + Width - 1)
+	if vCol >= v.ScrollCol+v.Width {
+		v.ScrollCol = vCol - v.Width + 1
+	}
+
+	// Clamp to left boundary
+	if v.ScrollCol < 0 {
+		v.ScrollCol = 0
+	}
+}
+
+// showCursorCenter centers the cursor in the viewport both vertically and horizontally.
+func (v *View) showCursorCenter() {
+	tabWidth := 4
+
+	// Center vertically
+	v.ScrollRow = max(v.Cursor.Row-(v.Height/2), 0)
+
+	// Center horizontally
+	vCol := v.Buf.ByteToVisualCol(v.Cursor, tabWidth)
+	v.ScrollCol = max(vCol-(v.Width/2), 0)
 }
 
 func trimToWidth(s string, width int) string {
@@ -1533,901 +1618,6 @@ func trimToWidth(s string, width int) string {
 		return s
 	}
 	return string(runes[:width])
-}
-
-// TextInput is a small editable single-line text widget.
-type TextInput struct {
-	runes       []rune
-	Cursor      int // Rune index
-	Placeholder string
-	SelectAll   bool
-}
-
-// SetText populates the input and sets cursor to the end.
-func (t *TextInput) SetText(s string) {
-	t.runes = []rune(s)
-	t.Cursor = len(t.runes)
-}
-
-func (t *TextInput) SetTextAndSelectAll(s string) {
-	t.runes = []rune(s)
-	t.Cursor = len(t.runes)
-	t.SelectAll = true
-}
-
-func (t *TextInput) Reset() {
-	t.runes = t.runes[:0] // Reuse underlying array memory
-	t.Cursor = 0
-	t.Placeholder = ""
-	t.SelectAll = false
-}
-
-func (t *TextInput) String() string {
-	return string(t.runes)
-}
-
-// Len returns the current rune count.
-func (t *TextInput) Len() int {
-	return len(t.runes)
-}
-
-func (t *TextInput) Update(ev kero.Event) {
-	e, ok := ev.(kero.KeyEvent)
-	if !ok {
-		return
-	}
-
-	// Handle SelectAll replacement on first keystroke
-	if t.SelectAll {
-		if e.Key == kero.KeyRune || e.Key == kero.KeyBackspace {
-			t.SelectAll = false
-			t.runes = t.runes[:0]
-			t.Cursor = 0
-			if e.Key == kero.KeyBackspace {
-				return
-			}
-		} else {
-			// Arrow keys or Esc just clear selection state
-			t.SelectAll = false
-		}
-	}
-
-	switch e.Key {
-	case kero.KeyRune:
-		if e.Mod&kero.ModCtrl != 0 {
-			return
-		}
-		t.runes = slices.Insert(t.runes, t.Cursor, e.Rune)
-		t.Cursor++
-
-	case kero.KeyBackspace:
-		if t.Cursor > 0 {
-			t.runes = slices.Delete(t.runes, t.Cursor-1, t.Cursor)
-			t.Cursor--
-		}
-
-	case kero.KeyDelete:
-		if t.Cursor < len(t.runes) {
-			t.runes = slices.Delete(t.runes, t.Cursor, t.Cursor+1)
-		}
-
-	case kero.KeyLeft:
-		if t.Cursor > 0 {
-			t.Cursor--
-		}
-
-	case kero.KeyRight:
-		if t.Cursor < len(t.runes) {
-			t.Cursor++
-		}
-
-	case kero.KeyHome:
-		t.Cursor = 0
-
-	case kero.KeyEnd:
-		t.Cursor = len(t.runes)
-	}
-}
-
-// toggleReverse flips the reverse attribute bit.
-func toggleReverse(s kero.Style) kero.Style {
-	s.Attr = s.Attr ^ kero.AttrReverse
-	return s
-}
-
-// Draw renders the text input and its cursor.
-func (t TextInput) Draw(f *kero.Frame, r kero.Rect, s kero.Style) {
-	cursorStyle := toggleReverse(s)
-
-	if t.SelectAll && len(t.runes) > 0 {
-		for i, ch := range t.runes {
-			x := r.X + i
-			if x < r.Right() {
-				f.Set(x, r.Y, ch, s.Reverse())
-			}
-		}
-		return
-	}
-
-	if t.Cursor < 0 {
-		t.Cursor = 0
-	}
-	if t.Cursor > len(t.runes) {
-		t.Cursor = len(t.runes)
-	}
-
-	// Render placeholder when value is empty
-	if len(t.runes) == 0 && t.Placeholder != "" {
-		for i, ch := range []rune(t.Placeholder) {
-			if i == 0 {
-				f.Set(r.X+i, r.Y, ch, cursorStyle)
-			} else {
-				f.Set(r.X+i, r.Y, ch, s.Dim())
-			}
-		}
-		return
-	}
-
-	// Render characters
-	for i, ch := range t.runes {
-		x := r.X + i
-		if x >= r.Right() {
-			break
-		}
-
-		if i == t.Cursor {
-			f.Set(x, r.Y, ch, cursorStyle)
-		} else {
-			f.Set(x, r.Y, ch, s)
-		}
-	}
-
-	// Render trailing cursor when at end of line
-	if t.Cursor == len(t.runes) {
-		x := r.X + t.Cursor
-		if x < r.Right() {
-			f.Set(x, r.Y, ' ', cursorStyle)
-		}
-	}
-}
-
-/* TODO
-In terminal UI (TUI) rendering, double-width characters
-(like CJK characters or emojis) occupy 2 terminal columns despite being 1 rune.
-Separating Byte Offset (storage), Rune Offset (character count),
-and Visual Display Column (screen cell width) prevents layout corruption.
-*/
-
-// Position represents a zero-indexed coordinate inside a buffer.
-type Position struct {
-	Row int // line offset, starting at 0
-	Col int // rune offset within the line, starting at 0
-}
-
-type Buffer struct {
-	Filename string
-	Lines    [][]rune // Using [][]rune handles multi-byte UTF-8 correctly
-	Cursor   Position
-	Dirty    bool
-
-	// viewport
-	TopRow  int // vertical scroll offsets, starts from 0
-	LeftCol int // horizontal scroll offsets, starts from display column offset (0-based)
-
-	Selecting bool
-	SelAnchor Position // selection at [e.selAnchor, e.pos)
-}
-
-func BufferFromString(content string) *Buffer {
-	rawLines := strings.Split(content, "\n")
-	lines := make([][]rune, len(rawLines))
-	for i, l := range rawLines {
-		lines[i] = []rune(l)
-	}
-	return &Buffer{Lines: lines}
-}
-
-// Line returns a copy of the line at the specified row.
-// Returns nil if the row index is out of bounds.
-func (b *Buffer) Line(row int) []rune {
-	if row < 0 || row >= len(b.Lines) {
-		return nil
-	}
-	src := b.Lines[row]
-	if src == nil {
-		return nil
-	}
-
-	dst := make([]rune, len(src))
-	copy(dst, src)
-	return dst
-}
-
-func (b *Buffer) SetLine(row int, line []rune) {
-	if row < 0 || row >= len(b.Lines) {
-		return
-	}
-
-	// Copy input slice to prevent external modification
-	dst := make([]rune, len(line))
-	copy(dst, line)
-	b.Lines[row] = dst
-}
-
-// String returns the full buffer text as a string, joined by newlines.
-func (b *Buffer) String() string {
-	linesCount := len(b.Lines)
-	if linesCount == 0 {
-		return ""
-	}
-
-	// 1. Calculate approximate total byte capacity to minimize allocations
-	var totalBytes int
-	for _, line := range b.Lines {
-		for _, r := range line {
-			totalBytes += utf8.RuneLen(r)
-		}
-	}
-	// Add space for newline characters ('\n')
-	totalBytes += (linesCount - 1)
-
-	// 2. Pre-allocate strings.Builder buffer
-	var sb strings.Builder
-	sb.Grow(totalBytes)
-
-	// 3. Write lines joined by newlines
-	for i, line := range b.Lines {
-		if i > 0 {
-			sb.WriteByte('\n')
-		}
-		for _, r := range line {
-			sb.WriteRune(r)
-		}
-	}
-
-	return sb.String()
-}
-
-// Insert inserts text at the given position and returns the new cursor position.
-func (b *Buffer) Insert(p Position, text string) Position {
-	if p.Row < 0 || p.Row >= len(b.Lines) {
-		return p
-	}
-
-	line := b.Lines[p.Row]
-	if p.Col < 0 {
-		p.Col = 0
-	}
-	if p.Col > len(line) {
-		p.Col = len(line)
-	}
-
-	prefix := string(line[:p.Col])
-	suffix := string(line[p.Col:])
-	newLines := strings.Split(prefix+text+suffix, "\n")
-
-	// Single-line insertion fast path
-	if len(newLines) == 1 {
-		b.Lines[p.Row] = []rune(newLines[0])
-		return Position{
-			Row: p.Row,
-			Col: p.Col + len([]rune(text)),
-		}
-	}
-
-	updated := make([][]rune, 0, len(b.Lines)+len(newLines)-1)
-	updated = append(updated, b.Lines[:p.Row]...)
-	for i := range newLines {
-		updated = append(updated, []rune(newLines[i]))
-	}
-	updated = append(updated, b.Lines[p.Row+1:]...)
-
-	b.Lines = updated
-
-	return Position{
-		Row: p.Row + len(newLines) - 1,
-		Col: len([]rune(newLines[len(newLines)-1])) - len([]rune(suffix)),
-	}
-}
-
-func (b *Buffer) ReplaceRange(start, end Position, newText string) Position {
-	// Boundary safety checks
-	if start.Row < 0 || start.Row >= len(b.Lines) {
-		return start
-	}
-	if end.Row >= len(b.Lines) {
-		end.Row = len(b.Lines) - 1
-		end.Col = len(b.Lines[end.Row])
-	}
-
-	// 1. Extract prefix before startCol and suffix after endCol
-	prefix := string(b.Lines[start.Row])[:start.Col]
-	suffix := string(b.Lines[end.Row])[end.Col:]
-
-	// 2. Split replacement text into lines
-	newLines := strings.Split(prefix+newText+suffix, "\n")
-
-	// 3. inline replace, return early
-	if start.Row == end.Row && len(newLines) == 1 {
-		b.Lines[start.Row] = []rune(newLines[0])
-		return Position{Row: start.Row, Col: start.Col + len([]rune(newText))}
-	}
-
-	// 4. Splice newLines into b.Lines slice, replacing range [startLine : endLine+1]
-	updated := make([][]rune, 0, len(b.Lines)-(end.Row-start.Row+1)+len(newLines))
-	updated = append(updated, b.Lines[:start.Row]...)
-	for i := range newLines {
-		updated = append(updated, []rune(newLines[i]))
-	}
-	updated = append(updated, b.Lines[end.Row+1:]...)
-
-	b.Lines = updated
-	return Position{
-		Row: start.Row + len(newLines) - 1,
-		Col: len([]rune(newLines[len(newLines)-1])) - len([]rune(suffix)),
-	}
-}
-
-// orderPos guarantees start <= end (top-to-bottom, left-to-right)
-func orderPos(p1, p2 Position) (start, end Position) {
-	if p1.Row < p2.Row || (p1.Row == p2.Row && p1.Col <= p2.Col) {
-		return p1, p2
-	}
-	return p2, p1
-}
-
-// ClampPos ensures p falls within valid buffer bounds.
-func (b *Buffer) ClampPos(p Position) Position {
-	if len(b.Lines) == 0 {
-		return Position{Row: 0, Col: 0}
-	}
-
-	// Clamp Row
-	row := p.Row
-	if row < 0 {
-		row = 0
-	} else if row >= len(b.Lines) {
-		row = len(b.Lines) - 1
-	}
-
-	// Clamp Col within the valid row
-	lineLen := len(b.Lines[row])
-	col := p.Col
-	if col < 0 {
-		col = 0
-	} else if col > lineLen {
-		col = lineLen
-	}
-
-	return Position{Row: row, Col: col}
-}
-
-// GetRange extracts the text between two positions (inclusive start, exclusive end).
-func (b *Buffer) GetRange(p1, p2 Position) string {
-	start, end := orderPos(b.ClampPos(p1), b.ClampPos(p2))
-
-	if start == end {
-		return ""
-	}
-
-	// Single-line range fast path
-	if start.Row == end.Row {
-		return string(b.Lines[start.Row][start.Col:end.Col])
-	}
-
-	// Multi-line range path
-	var sb strings.Builder
-
-	// First line fragment
-	sb.WriteString(string(b.Lines[start.Row][start.Col:]))
-	sb.WriteRune('\n')
-
-	// Intermediate full lines
-	for l := start.Row + 1; l < end.Row; l++ {
-		sb.WriteString(string(b.Lines[l]))
-		sb.WriteRune('\n')
-	}
-
-	// Final line fragment
-	sb.WriteString(string(b.Lines[end.Row][:end.Col]))
-
-	return sb.String()
-}
-
-// DeleteRange removes text between two positions [p1, p2) and returns the new cursor position.
-func (b *Buffer) DeleteRange(p1, p2 Position) Position {
-	start, end := orderPos(b.ClampPos(p1), b.ClampPos(p2))
-	if start == end {
-		return start
-	}
-
-	// Single-line deletion fast path
-	if start.Row == end.Row {
-		line := b.Lines[start.Row]
-		newLine := make([]rune, 0, len(line)-(end.Col-start.Col))
-		newLine = append(newLine, line[:start.Col]...)
-		newLine = append(newLine, line[end.Col:]...)
-
-		b.Lines[start.Row] = newLine
-		return start
-	}
-
-	// Multi-line deletion path
-	startLinePrefix := b.Lines[start.Row][:start.Col]
-	endLineSuffix := b.Lines[end.Row][end.Col:]
-
-	// Stitch start prefix and end suffix into one merged line
-	mergedLine := make([]rune, 0, len(startLinePrefix)+len(endLineSuffix))
-	mergedLine = append(mergedLine, startLinePrefix...)
-	mergedLine = append(mergedLine, endLineSuffix...)
-
-	// Rebuild line slice removing deleted lines
-	newLines := make([][]rune, 0, len(b.Lines)-(end.Row-start.Row))
-	newLines = append(newLines, b.Lines[:start.Row]...)
-	newLines = append(newLines, mergedLine)
-	newLines = append(newLines, b.Lines[end.Row+1:]...)
-
-	b.Lines = newLines
-
-	return start
-}
-
-// WordBounds finds the start and end of the word surrounding pos on its line.
-func (b *Buffer) WordBounds(p Position) (start, end Position) {
-	if p.Row < 0 || p.Row >= len(b.Lines) {
-		return
-	}
-
-	line := b.Lines[p.Row]
-	if len(line) == 0 {
-		return
-	}
-
-	col := p.Col
-	if col >= len(line) {
-		col = len(line) - 1
-	}
-
-	// Determine matching mode based on target character under cursor
-	targetIsWord := isWordChar(line[col])
-
-	// Scan left for start
-	startCol := col
-	for startCol > 0 && isWordChar(line[startCol-1]) == targetIsWord {
-		startCol--
-	}
-
-	// Scan right for end
-	endCol := col
-	for endCol < len(line) && isWordChar(line[endCol]) == targetIsWord {
-		endCol++
-	}
-
-	start = Position{Row: p.Row, Col: startCol}
-	end = Position{Row: p.Row, Col: endCol}
-	return start, end
-}
-
-// FindNext searches forward starting after "from" for an exact query.
-// Returns the position matching query, and true if found.
-func (b *Buffer) FindNext(query string, from Position) (start, end Position, ok bool) {
-	return b.findNext(query, from, false)
-}
-
-// FindNextIgnoreCase searches forward starting after "from" for query text,
-// ignoring case.
-func (b *Buffer) FindNextIgnoreCase(query string, from Position) (start, end Position, ok bool) {
-	return b.findNext(query, from, true)
-}
-
-func (b *Buffer) findNext(query string, from Position, ignoreCase bool) (start, end Position, ok bool) {
-	if query == "" || len(b.Lines) == 0 {
-		return Position{}, Position{}, false
-	}
-
-	queryRunes := []rune(query)
-	if len(queryRunes) == 0 {
-		return Position{}, Position{}, false
-	}
-
-	row := from.Row
-	col := from.Col
-	for rowsSearched := 0; rowsSearched <= len(b.Lines); rowsSearched++ {
-		line := b.Lines[row]
-		for i := col; i <= len(line)-len(queryRunes); i++ {
-			match := true
-			for j := range queryRunes {
-				if !runeMatches(line[i+j], queryRunes[j], ignoreCase) {
-					match = false
-					break
-				}
-			}
-			if match {
-				start = Position{Row: row, Col: i}
-				end = Position{Row: row, Col: i + len(queryRunes)}
-				return start, end, true
-			}
-		}
-
-		if row+1 < len(b.Lines) {
-			row++
-		} else {
-			row = 0
-		}
-		col = 0
-	}
-
-	return Position{}, Position{}, false
-}
-
-// FindPrev searches backward starting before fromPos for an exact query.
-// Returns the start and end positions matching query, and true if found.
-func (b *Buffer) FindPrev(query string, from Position) (start, end Position, ok bool) {
-	return b.findPrev(query, from, false)
-}
-
-// FindPrevIgnoreCase searches backward starting before fromPos for query text,
-// ignoring case.
-func (b *Buffer) FindPrevIgnoreCase(query string, from Position) (start, end Position, ok bool) {
-	return b.findPrev(query, from, true)
-}
-
-func (b *Buffer) findPrev(query string, from Position, ignoreCase bool) (start, end Position, ok bool) {
-	if query == "" || len(b.Lines) == 0 {
-		return Position{}, Position{}, false
-	}
-
-	queryRunes := []rune(query)
-	if len(queryRunes) == 0 {
-		return Position{}, Position{}, false
-	}
-	qLen := len(queryRunes)
-
-	row := from.Row
-	for rowsSearched := 0; rowsSearched <= len(b.Lines); rowsSearched++ {
-		line := b.Lines[row]
-		// Determine the rightmost starting column index for search on this row
-		maxCol := len(line) - qLen
-		if row == from.Row {
-			maxCol = from.Col - qLen
-		}
-
-		// Search backward within current line
-		if maxCol >= 0 {
-			for c := maxCol; c >= 0; c-- {
-				matched := true
-				for i := range queryRunes {
-					if !runeMatches(line[c+i], queryRunes[i], ignoreCase) {
-						matched = false
-						break
-					}
-				}
-				if matched {
-					start = Position{Row: row, Col: c}
-					end = Position{Row: row, Col: c + qLen}
-					return start, end, true
-				}
-			}
-		}
-
-		if row > 0 {
-			row--
-		} else {
-			row = len(b.Lines) - 1
-		}
-	}
-
-	return Position{}, Position{}, false
-}
-
-// ReplaceAll replaces every exact occurrence of query in the buffer.
-func (b *Buffer) ReplaceAll(query, replacement string) (count int) {
-	return b.replaceAll(query, replacement, false)
-}
-
-// ReplaceAllIgnoreCase replaces every case-insensitive occurrence of query.
-func (b *Buffer) ReplaceAllIgnoreCase(query, replacement string) (count int) {
-	return b.replaceAll(query, replacement, true)
-}
-
-func (b *Buffer) replaceAll(query, replacement string, ignoreCase bool) (count int) {
-	queryRunes := []rune(query)
-	if len(queryRunes) == 0 {
-		return 0
-	}
-
-	for row, line := range b.Lines {
-		result := make([]rune, 0, len(line))
-		for col := 0; col < len(line); {
-			if col+len(queryRunes) <= len(line) {
-				matched := true
-				for i, queryRune := range queryRunes {
-					if !runeMatches(line[col+i], queryRune, ignoreCase) {
-						matched = false
-						break
-					}
-				}
-				if matched {
-					result = append(result, []rune(replacement)...)
-					count++
-					col += len(queryRunes)
-					continue
-				}
-			}
-			result = append(result, line[col])
-			col++
-		}
-		if count > 0 {
-			b.Lines[row] = result
-		}
-	}
-	return count
-}
-
-func runeMatches(left, right rune, ignoreCase bool) bool {
-	if ignoreCase {
-		return unicode.ToLower(left) == unicode.ToLower(right)
-	}
-	return left == right
-}
-
-// MoveWordRight moves the cursor to the end of the current word,
-// or across whitespace/punctuation to the end of the next word.
-func (b *Buffer) MoveWordRight(p Position) Position {
-	if p.Row >= len(b.Lines) {
-		return p
-	}
-
-	line := b.Lines[p.Row]
-
-	// If at or past line end, wrap to the start of the next line
-	if p.Col >= len(line) {
-		if p.Row+1 < len(b.Lines) {
-			return Position{Row: p.Row + 1, Col: 0}
-		}
-		return p // End of document
-	}
-
-	col := p.Col
-
-	// Skip leading non-word characters (whitespace, punctuation)
-	for col < len(line) && !isWordChar(line[col]) {
-		col++
-	}
-
-	// Consume the word characters until the end of word
-	for col < len(line) && isWordChar(line[col]) {
-		col++
-	}
-
-	return Position{Row: p.Row, Col: col}
-}
-
-// MoveWordLeft moves the cursor to the start of the current word,
-// or across whitespace/punctuation to the start of the previous word.
-func (b *Buffer) MoveWordLeft(p Position) Position {
-	if p.Row < 0 || p.Row >= len(b.Lines) {
-		return p
-	}
-
-	line := b.Lines[p.Row]
-	col := min(p.Col, len(line))
-
-	// If at start of line, move to end of previous line
-	if col == 0 {
-		if p.Row == 0 {
-			return Position{Row: 0, Col: 0}
-		}
-		prevLine := b.Lines[p.Row-1]
-		return Position{Row: p.Row - 1, Col: len(prevLine)}
-	}
-
-	i := col
-	// skip non-word characters (whitespace/punctuation)
-	for i > 0 && !isWordChar(line[i-1]) {
-		i--
-	}
-	// skip word characters to the start of the word
-	for i > 0 && isWordChar(line[i-1]) {
-		i--
-	}
-	return Position{Row: p.Row, Col: i}
-}
-
-// NextPos returns the Position after stepping one rune right, wrapping lines if needed.
-func (b *Buffer) NextPos(p Position) Position {
-	lineLen := len(b.Line(p.Row))
-	if p.Col < lineLen {
-		return Position{Row: p.Row, Col: p.Col + 1}
-	}
-	if p.Row < len(b.Lines)-1 {
-		return Position{Row: p.Row + 1, Col: 0}
-	}
-	return p
-}
-
-// PrevPos returns the Position after stepping one rune left, wrapping lines if needed.
-func (b *Buffer) PrevPos(p Position) Position {
-	if p.Col > 0 {
-		return Position{Row: p.Row, Col: p.Col - 1}
-	}
-	if p.Row > 0 {
-		prevRow := p.Row - 1
-		return Position{Row: prevRow, Col: len(b.Line(prevRow))}
-	}
-	return p
-}
-
-func (b *Buffer) LineStartNonSpace(p Position) Position {
-	if p.Row < 0 || p.Row >= len(b.Lines) {
-		return p
-	}
-	for i, char := range b.Lines[p.Row] {
-		if !unicode.IsSpace(char) {
-			return Position{Row: p.Row, Col: i}
-		}
-	}
-	return Position{Row: p.Row, Col: 0}
-}
-
-func (b *Buffer) LineEnd(p Position) Position {
-	if p.Row < 0 || p.Row >= len(b.Lines) {
-		return p
-	}
-	return Position{Row: p.Row, Col: len(b.Lines[p.Row])}
-}
-
-// BufReader implements io.Reader over Buffer lines.
-type BufReader struct {
-	buf       *Buffer
-	lineIdx   int
-	colIdx    int
-	encoded   [utf8.UTFMax]byte
-	encLen    int
-	encOffset int
-}
-
-func (b *Buffer) NewReader() *BufReader {
-	return &BufReader{buf: b}
-}
-
-func (r *BufReader) Read(p []byte) (n int, err error) {
-	if r.lineIdx >= len(r.buf.Lines) {
-		return 0, io.EOF
-	}
-
-	for n < len(p) {
-		// Flush remaining encoded bytes from current rune
-		if r.encOffset < r.encLen {
-			p[n] = r.encoded[r.encOffset]
-			n++
-			r.encOffset++
-			continue
-		}
-
-		line := r.buf.Lines[r.lineIdx]
-
-		// At end of line, output newline character
-		if r.colIdx >= len(line) {
-			p[n] = '\n'
-			n++
-			r.lineIdx++
-			r.colIdx = 0
-			r.encLen = 0
-			r.encOffset = 0
-			if r.lineIdx >= len(r.buf.Lines) {
-				break
-			}
-			continue
-		}
-
-		// Encode next rune
-		runeVal := line[r.colIdx]
-		r.colIdx++
-		r.encLen = utf8.EncodeRune(r.encoded[:], runeVal)
-		r.encOffset = 0
-	}
-
-	return n, nil
-}
-
-// VisualPos converts a buffer position to a visual display position, accounting tab stop.
-func (b *Buffer) VisualPos(p Position) Position {
-	if p.Row < 0 || p.Row >= len(b.Lines) {
-		return p
-	}
-
-	line := b.Lines[p.Row]
-	if p.Col < 0 {
-		p.Col = 0
-	} else if p.Col > len(line) {
-		p.Col = len(line)
-	}
-
-	col := 0
-	for i := range p.Col {
-		if line[i] == '\t' {
-			col += 4 - (col % 4)
-			continue
-		}
-		col++
-	}
-	return Position{Row: p.Row, Col: col}
-}
-
-// PosFromVisual converts a visual display Position back to a buffer Position.
-func (b *Buffer) PosFromVisual(p Position) Position {
-	if p.Row < 0 || p.Row >= len(b.Lines) {
-		return p
-	}
-
-	if p.Col <= 0 {
-		return Position{Row: p.Row, Col: 0}
-	}
-
-	col := 0
-	line := b.Lines[p.Row]
-	for i, r := range line {
-		advance := 1
-		if r == '\t' {
-			advance = 4 - (col % 4)
-		}
-		if col+advance > p.Col {
-			return Position{Row: p.Row, Col: i}
-		}
-		col += advance
-	}
-	return Position{Row: p.Row, Col: len(line)}
-}
-
-// Format runs go/format on the buffer's content if it is a Go source file.
-// It returns true if the buffer was modified, and an error if formatting fails.
-func (b *Buffer) Format() (bool, error) {
-	// Only format Go files
-	if filepath.Ext(b.Filename) != ".go" {
-		return false, nil
-	}
-
-	// 1. Join [][]rune lines into a single byte slice for go/format
-	var buf bytes.Buffer
-	for i, line := range b.Lines {
-		buf.WriteString(string(line))
-		if i < len(b.Lines)-1 {
-			buf.WriteByte('\n')
-		}
-	}
-
-	// 2. Format the source code using go/format
-	formatted, err := format.Source(buf.Bytes())
-	if err != nil {
-		return false, err // Returns syntax/parser errors from the Go compiler
-	}
-
-	// 3. Convert formatted bytes back to [][]rune
-	formattedStr := string(formatted)
-	// Handle trailing newline splitting gracefully
-	rawLines := strings.Split(strings.TrimSuffix(formattedStr, "\n"), "\n")
-
-	newLines := make([][]rune, len(rawLines))
-	for i, l := range rawLines {
-		newLines[i] = []rune(l)
-	}
-
-	// 4. Update lines and preserve cursor sanity
-	b.Lines = newLines
-	b.Dirty = true
-
-	// Clamp cursor to valid row/col bounds after formatting changes line lengths
-	if b.Cursor.Row >= len(b.Lines) {
-		b.Cursor.Row = max(0, len(b.Lines)-1)
-	}
-	if len(b.Lines) > 0 {
-		b.Cursor.Col = min(b.Cursor.Col, len(b.Lines[b.Cursor.Row]))
-	} else {
-		b.Cursor.Col = 0
-	}
-
-	return true, nil
 }
 
 // CheckSemantics checks syntax and type error.
@@ -2610,10 +1800,9 @@ func (e *Editor) OpenFile(path string) error {
 	}
 
 	// switch to existing buffer
-	for i, buf := range e.buffers {
-		if buf.Filename == path {
+	for i, v := range e.views {
+		if v.Buf.Path == path {
 			e.active = i
-			e.Buffer = buf
 			e.diags = nil
 			return nil
 		}
@@ -2624,101 +1813,54 @@ func (e *Editor) OpenFile(path string) error {
 		return err
 	}
 
-	e.buffers = append(e.buffers, buf)
-	e.active = len(e.buffers) - 1
-	e.Buffer = buf
+	e.views = append(e.views, &View{Buf: buf})
+	e.active = len(e.views) - 1
 	e.diags = nil
 	return nil
 }
 
 // CloseBuffer closes the active buffer.
 func (e *Editor) CloseBuffer() {
-	if len(e.buffers) <= 1 {
+	if len(e.views) <= 1 {
 		// Either exit or leave an empty scratch buffer
 		return
 	}
 	// Remove from slice and adjust active index
-	e.buffers = slices.Delete(e.buffers, e.active, e.active+1)
-	if e.active >= len(e.buffers) {
-		e.active = len(e.buffers) - 1
+	e.views = slices.Delete(e.views, e.active, e.active+1)
+	if e.active >= len(e.views) {
+		e.active = len(e.views) - 1
 	}
-	e.Buffer = e.buffers[e.active]
 	e.diags = nil
 	e.message = ""
 }
 
 func (e *Editor) NextBuffer() {
-	if len(e.buffers) > 1 {
-		e.active = (e.active + 1) % len(e.buffers)
-		e.Buffer = e.buffers[e.active]
+	if len(e.views) > 1 {
+		e.active = (e.active + 1) % len(e.views)
 		e.diags = nil
 	}
 }
 
 func (e *Editor) PrevBuffer() {
-	if len(e.buffers) > 1 {
-		e.active = (e.active - 1 + len(e.buffers)) % len(e.buffers)
-		e.Buffer = e.buffers[e.active]
+	if len(e.views) > 1 {
+		e.active = (e.active - 1 + len(e.views)) % len(e.views)
 		e.diags = nil
 	}
 }
 
-// BufferFromFile opens a file and prepares a Buffer struct.
-// If the file does not exist, it creates a new empty buffer associated with that path.
-func BufferFromFile(path string) (*Buffer, error) {
-	if path == "" {
-		return &Buffer{
-			Filename: "",
-			Lines:    [][]rune{[]rune("")},
-		}, nil
-	}
-
-	absPath, err := filepath.Abs(path)
-	if err != nil {
-		return nil, err
-	}
-
-	file, err := os.Open(absPath)
-	if os.IsNotExist(err) {
-		// New/unsaved file: initialize with one empty line
-		return &Buffer{
-			Filename: absPath,
-			Lines:    [][]rune{[]rune("")},
-		}, nil
-	} else if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-
-	lines, err := readLines(file)
-	if err != nil {
-		return nil, err
-	}
-
-	// Guarantee at least one line exists in memory
-	if len(lines) == 0 {
-		lines = [][]rune{}
-	}
-
-	return &Buffer{
-		Filename: absPath,
-		Lines:    lines,
-	}, nil
-}
-
-func readLines(r io.Reader) ([][]rune, error) {
-	var lines [][]rune
+func readLines(r io.Reader) ([][]byte, error) {
+	var lines [][]byte
 	reader := bufio.NewReader(r)
 
 	for {
-		line, err := reader.ReadString('\n')
+		line, err := reader.ReadBytes('\n')
 
 		// Strip '\n' and carriage return '\r' (Windows normalization)
-		line = strings.TrimSuffix(line, "\n")
-		line = strings.TrimSuffix(line, "\r")
+		line = bytes.TrimSuffix(line, []byte{'\n'})
+		line = bytes.TrimSuffix(line, []byte{'\r'})
 
-		if line != "" || err == nil {
-			lines = append(lines, []rune(line))
+		if line != nil || err == nil {
+			lines = append(lines, line)
 		}
 
 		if err != nil {
@@ -2730,33 +1872,6 @@ func readLines(r io.Reader) ([][]rune, error) {
 	}
 
 	return lines, nil
-}
-
-func (b *Buffer) Save() error {
-	file, err := os.OpenFile(b.Filename, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	writer := bufio.NewWriter(file)
-	for i, line := range b.Lines {
-		if _, err := writer.WriteString(string(line)); err != nil {
-			return err
-		}
-		if i < len(b.Lines)-1 {
-			if _, err := writer.WriteString("\n"); err != nil {
-				return err
-			}
-		}
-	}
-
-	if err := writer.Flush(); err != nil {
-		return err
-	}
-
-	b.Dirty = false
-	return nil
 }
 
 // JumpList manages navigation history for long jumps (Go To Def, Find Symbol, etc.).
@@ -2823,16 +1938,16 @@ func (j *JumpList) Forward() (Location, bool) {
 
 // recordJump saves the current editor position into the jump history.
 func (e *Editor) recordJump() {
-	if e.Buffer == nil {
+	if e.Buf() == nil {
 		return
 	}
-	e.jumps.Push(e.Filename, e.Cursor)
+	e.jumps.Push(e.Buf().Path, e.view().Cursor)
 }
 
 // jumpTo restores a recorded location, switching buffers if necessary.
 func (e *Editor) jumpTo(target Location) {
 	// 1. Switch buffer if the target is in a different file
-	if target.Filename != "" && target.Filename != e.Filename {
+	if target.Filename != "" && target.Filename != e.Buf().Path {
 		err := e.OpenFile(target.Filename)
 		if err != nil {
 			log.Print(err)
@@ -2842,24 +1957,24 @@ func (e *Editor) jumpTo(target Location) {
 	}
 
 	// 2. Set cursor position
-	if target.Pos.Row >= 0 && target.Pos.Row < len(e.Lines) {
-		e.Cursor = e.ClampPos(target.Pos)
+	if target.Pos.Row >= 0 && target.Pos.Row < len(e.Buf().Lines) {
+		e.view().Cursor = e.Buf().ClampPos(target.Pos)
 	}
 }
 
 // JumpBack moves to the previous position in jump history.
 func (e *Editor) JumpBack() {
-	if e.Buffer == nil {
+	if e.Buf() == nil {
 		return
 	}
-	if target, ok := e.jumps.Back(e.Filename, e.Cursor); ok {
+	if target, ok := e.jumps.Back(e.Buf().Path, e.view().Cursor); ok {
 		e.jumpTo(target)
 	}
 }
 
 // JumpForward moves to the next position in jump history.
 func (e *Editor) JumpForward() {
-	if e.Buffer == nil {
+	if e.Buf() == nil {
 		return
 	}
 	if target, ok := e.jumps.Forward(); ok {
@@ -2929,7 +2044,7 @@ func (p *Palette) Refresh(e *Editor) {
 
 // Symbol Provider (@)
 func (p *Palette) symbolItems(e *Editor, query string) []PaletteItem {
-	if e.Buffer == nil {
+	if e.Buf() == nil {
 		return nil
 	}
 
@@ -2940,7 +2055,7 @@ func (p *Palette) symbolItems(e *Editor, query string) []PaletteItem {
 	}
 
 	if p.symbols == nil {
-		p.symbols = ExtractSymbols(e.Filename, e.Buffer.NewReader())
+		p.symbols = ExtractSymbols(e.Buf().Path, e.Buf().NewReader())
 	}
 	var items []PaletteItem
 
@@ -2965,11 +2080,11 @@ func (p *Palette) symbolItems(e *Editor, query string) []PaletteItem {
 			// Kind: sym.Kind,
 			Action: func(ed *Editor) {
 				ed.recordJump()
-				ed.Cursor = Position{
+				ed.view().Cursor = Position{
 					Row: sym.Line - 1,
-					Col: byteColumnToRuneIndex(string(e.Lines[sym.Line-1]), sym.Column),
+					Col: byteColumnToRuneIndex(string(e.Buf().Lines[sym.Line-1]), sym.Column),
 				}
-				e.showCursorCenter()
+				e.view().showCursorCenter()
 			},
 		})
 	}
@@ -2986,11 +2101,11 @@ func (p *Palette) commandItems(_ *Editor, query string) []PaletteItem {
 		// use readable name for cmd, easy to search
 		{"jump back", "ctrl+-", func(e *Editor) {
 			e.JumpBack()
-			e.showCursorCenter()
+			e.view().showCursorCenter()
 		}},
 		{"jump forward", "ctrl+shift+-", func(e *Editor) {
 			e.JumpForward()
-			e.showCursorCenter()
+			e.view().showCursorCenter()
 		}},
 		{"next buffer", "", func(e *Editor) {
 			e.NextBuffer()
@@ -2999,7 +2114,7 @@ func (p *Palette) commandItems(_ *Editor, query string) []PaletteItem {
 			e.PrevBuffer()
 		}},
 		{"LSP: check", "", func(e *Editor) {
-			diags, err := CheckFile(e.Filename)
+			diags, err := CheckFile(e.Buf().Path)
 			if err != nil {
 				e.message = err.Error()
 				return
@@ -3007,7 +2122,7 @@ func (p *Palette) commandItems(_ *Editor, query string) []PaletteItem {
 			e.diags = diags
 		}},
 		{"LSP: find references", "", findReferences},
-		{"LSP: format file", "", func(e *Editor) { e.Buffer.Format() }},
+		{"LSP: format file", "", func(e *Editor) { e.Buf().Format() }},
 		{"LSP: goto definition", "ctrl+g", GotoDefinition},
 		{"LSP: goto diagnostic", "ctrl+]", func(e *Editor) {
 			e.gotoDiagnostic()
@@ -3016,7 +2131,7 @@ func (p *Palette) commandItems(_ *Editor, query string) []PaletteItem {
 			e.palette.Open(e, "@")
 		}},
 		{"LSP: rename symbol", "", func(e *Editor) {
-			if !isGoFile(e.Filename) {
+			if !isGoFile(e.Buf().Path) {
 				return
 			}
 			e.startRename()
@@ -3065,12 +2180,12 @@ func (p *Palette) commandItems(_ *Editor, query string) []PaletteItem {
 
 // Goto Line Provider (:)
 func (p *Palette) lineItems(e *Editor, query string) []PaletteItem {
-	if query == "" || e.Buffer == nil {
+	if query == "" || e.Buf() == nil {
 		return nil
 	}
 
 	lineNum, err := strconv.Atoi(query)
-	if err != nil || lineNum <= 0 || lineNum > len(e.Lines) {
+	if err != nil || lineNum <= 0 || lineNum > len(e.Buf().Lines) {
 		return nil
 	}
 
@@ -3080,8 +2195,8 @@ func (p *Palette) lineItems(e *Editor, query string) []PaletteItem {
 			Label: fmt.Sprintf("Go to line %d", lineNum),
 			Action: func(ed *Editor) {
 				ed.recordJump()
-				ed.Cursor = Position{Row: targetRow, Col: 0}
-				ed.showCursorCenter()
+				ed.view().Cursor = Position{Row: targetRow, Col: 0}
+				ed.view().showCursorCenter()
 			},
 		},
 	}
@@ -3141,25 +2256,24 @@ func (p *Palette) fileItems(e *Editor, query string) []PaletteItem {
 
 	// 1. Include open buffers first for quick switching
 	openPaths := make(map[string]bool)
-	for i, buf := range e.buffers {
-		if buf.Filename == "" {
+	for i, v := range e.views {
+		if v.Buf.Path == "" {
 			continue
 		}
-		openPaths[buf.Filename] = true
+		openPaths[v.Buf.Path] = true
 
-		if query != "" && !strings.Contains(strings.ToLower(buf.Filename), lowerQuery) {
+		if query != "" && !strings.Contains(strings.ToLower(v.Buf.Path), lowerQuery) {
 			continue
 		}
 
 		bufIdx := i
-		bufPath := buf.Filename
+		bufPath := v.Buf.Path
 		items = append(items, PaletteItem{
 			Label:  filepath.Base(bufPath),
 			Detail: "active",
 			Action: func(ed *Editor) {
 				ed.recordJump()
 				ed.active = bufIdx
-				ed.Buffer = ed.buffers[bufIdx]
 				e.diags = nil
 			},
 		})
@@ -3329,6 +2443,8 @@ func (e *Editor) drawCompletion(f *kero.Frame) {
 		return
 	}
 
+	_, textRect, _, _ := LayoutWindow(f.Size().Width, f.Size().Height, len(e.Buf().Lines))
+
 	c := e.completion
 	visibleRows := min(len(c.Items), 10)
 	var maxWidth int
@@ -3345,8 +2461,8 @@ func (e *Editor) drawCompletion(f *kero.Frame) {
 	}
 
 	var normal kero.Style
-	x := bufferRect(e).X + e.VisualPos(e.Cursor).Col - e.LeftCol
-	y := e.Cursor.Row - e.TopRow
+	x := textRect.X + e.Buf().ByteToVisualCol(e.view().Cursor, 4) - e.view().ScrollCol
+	y := e.view().Cursor.Row - e.view().ScrollRow
 	w := maxWidth + 3 // 2 for indicator, 1 for right padding
 	rect := kero.Rect{X: x, Y: y - visibleRows, W: w, H: visibleRows}
 	f.Fill(rect, ' ', normal.Reverse())
@@ -3362,8 +2478,8 @@ func (e *Editor) drawCompletion(f *kero.Frame) {
 
 func (e *Editor) startRename() {
 	e.renaming = true
-	start, end := e.Buffer.WordBounds(e.Cursor)
-	symbol := e.Buffer.GetRange(start, end)
+	start, end := e.Buf().WordBounds(e.view().Cursor)
+	symbol := e.Buf().GetRange(start, end)
 	e.renameInput.SetTextAndSelectAll(symbol)
 }
 
@@ -3374,8 +2490,8 @@ func (e *Editor) updateRename(ev kero.KeyEvent) {
 	case kero.KeyEnter:
 		newName := e.renameInput.String()
 		// try save
-		if e.Buffer.Dirty {
-			if err := e.Buffer.Save(); err != nil {
+		if e.Buf().Dirty {
+			if err := e.Buf().SaveFile(); err != nil {
 				log.Print(err)
 				e.message = err.Error()
 				return
@@ -3394,7 +2510,7 @@ func (e *Editor) updateRename(ev kero.KeyEvent) {
 		*/
 		now := time.Now()
 		cmd := exec.CommandContext(ctx, "gopls", "rename", "-w", "-l", fmt.Sprintf("%s:%d:%d",
-			e.Filename, e.Cursor.Row+1, e.Cursor.Col+1), newName)
+			e.Buf().Path, e.view().Cursor.Row+1, e.view().Cursor.Col+1), newName)
 		out, err := cmd.CombinedOutput()
 		if err != nil {
 			log.Print(err)
@@ -3406,9 +2522,9 @@ func (e *Editor) updateRename(ev kero.KeyEvent) {
 		// reload buffer
 		editedFiles := strings.Split(string(out), "\n")
 		for i := range editedFiles {
-			for j := range e.buffers {
-				buf := e.buffers[j]
-				if buf.Filename != editedFiles[i] {
+			for j := range e.views {
+				v := e.views[j]
+				if v.Buf.Path != editedFiles[i] {
 					continue
 				}
 				newBuf, err := BufferFromFile(editedFiles[i])
@@ -3416,13 +2532,11 @@ func (e *Editor) updateRename(ev kero.KeyEvent) {
 					log.Print(err)
 					continue
 				}
-				newBuf.Cursor = newBuf.ClampPos(buf.Cursor)
-				newBuf.TopRow = buf.TopRow
-				newBuf.LeftCol = buf.LeftCol
-				e.buffers[j] = newBuf
-				if j == e.active {
-					e.Buffer = newBuf
-				}
+				newView := &View{Buf: newBuf}
+				newView.Cursor = newBuf.ClampPos(v.Cursor)
+				newView.ScrollRow = v.ScrollRow
+				newView.ScrollCol = v.ScrollCol
+				e.views[j] = newView
 				break
 			}
 		}
@@ -3433,24 +2547,24 @@ func (e *Editor) updateRename(ev kero.KeyEvent) {
 	}
 }
 
-func (e *Editor) drawRename(f *kero.Frame, y int, width int) {
+func (e *Editor) drawRename(f *kero.Frame, rect kero.Rect) {
 	normal := kero.NewStyle()
 	prompt := " Rename: "
-	f.Write(0, y, trimToWidth(prompt, width), normal)
+	f.Write(rect.X, rect.Y, trimToWidth(prompt, rect.W), normal)
 	inputX := len([]rune(prompt))
-	if inputX >= width {
+	if inputX >= rect.W {
 		return
 	}
-	e.renameInput.Draw(f, kero.Rect{X: inputX, Y: y, W: width - inputX, H: 1}, normal)
+	e.renameInput.Draw(f, kero.Rect{X: inputX, Y: rect.Y, W: rect.W - inputX, H: rect.H}, normal)
 }
 
 func GotoDefinition(e *Editor) {
-	if !isGoFile(e.Filename) {
+	if !isGoFile(e.Buf().Path) {
 		return
 	}
 	// flush buffer to disk before running gopls
-	if e.Buffer.Dirty {
-		if err := e.Buffer.Save(); err != nil {
+	if e.Buf().Dirty {
+		if err := e.Buf().SaveFile(); err != nil {
 			log.Print(err)
 			e.message = err.Error()
 			return
@@ -3465,7 +2579,7 @@ func GotoDefinition(e *Editor) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "gopls", "definition", fmt.Sprintf("%s:%d:%d",
-		e.Filename, e.Cursor.Row+1, e.Cursor.Col+1))
+		e.Buf().Path, e.view().Cursor.Row+1, e.view().Cursor.Col+1))
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		log.Print(err)
@@ -3596,7 +2710,7 @@ func byteColumnToRuneIndex(line string, column int) int {
 
 func (e *Editor) gotoLocation(l Location) {
 	e.recordJump()
-	if e.Filename != l.Filename {
+	if e.Buf().Path != l.Filename {
 		err := e.OpenFile(l.Filename)
 		if err != nil {
 			log.Print(err)
@@ -3605,8 +2719,8 @@ func (e *Editor) gotoLocation(l Location) {
 		}
 		e.debounceDiagnose()
 	}
-	e.Cursor = l.Pos
-	e.showCursorCenter()
+	e.view().Cursor = l.Pos
+	e.view().showCursorCenter()
 }
 
 // For example, run:
@@ -3622,12 +2736,12 @@ func (e *Editor) gotoLocation(l Location) {
 // where the line and column start at 1, and columns are measured in bytes of the UTF-8 encoding.
 // More details see https://go.dev/gopls/command-line
 func findReferences(e *Editor) {
-	if !isGoFile(e.Filename) {
+	if !isGoFile(e.Buf().Path) {
 		return
 	}
 	// flush buffer to disk before running gopls
-	if e.Buffer.Dirty {
-		if err := e.Buffer.Save(); err != nil {
+	if e.Buf().Dirty {
+		if err := e.Buf().SaveFile(); err != nil {
 			log.Print(err)
 			e.message = err.Error()
 			return
@@ -3638,7 +2752,7 @@ func findReferences(e *Editor) {
 	defer cancel()
 	now := time.Now()
 	cmd := exec.CommandContext(ctx, "gopls", "references", fmt.Sprintf("%s:%d:%d",
-		e.Filename, e.Cursor.Row+1, e.Cursor.Col+1))
+		e.Buf().Path, e.view().Cursor.Row+1, e.view().Cursor.Col+1))
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		log.Print(err)
@@ -3658,17 +2772,9 @@ func findReferences(e *Editor) {
 		}
 		locations = append(locations, p)
 	}
-	start, end := e.Buffer.WordBounds(e.Cursor)
-	header := fmt.Sprintf("%d references for %q", len(locations), e.Buffer.GetRange(start, end))
+	start, end := e.Buf().WordBounds(e.view().Cursor)
+	header := fmt.Sprintf("%d references for %q", len(locations), e.Buf().GetRange(start, end))
 	e.ref = NewReferencesPanel(header, locations)
-}
-
-func bottomPanelRect(e *Editor) kero.Rect {
-	headerRow := 1
-	visibleRows := e.ref.VisibleRows()
-	rect := kero.Rect{X: 0, W: e.Width, H: visibleRows + headerRow}
-	rect.Y = e.Height - 1 - rect.H
-	return rect
 }
 
 // drawReferences renders a bottom overlay panel for LSP References.
@@ -3688,10 +2794,13 @@ func (e *Editor) drawReferences(f *kero.Frame, rect kero.Rect) {
 	// 4. Render header
 	f.Write(rect.X+1, rect.Y, e.ref.Header, style)
 
-	buffers := e.buffers
+	buffers := make([]*Buffer, 0, len(e.views))
+	for _, v := range e.views {
+		buffers = append(buffers, v.Buf)
+	}
 	getBuffer := func(path string) (*Buffer, error) {
 		for _, b := range buffers {
-			if b.Filename == path {
+			if b.Path == path {
 				return b, nil
 			}
 		}

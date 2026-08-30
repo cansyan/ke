@@ -1,46 +1,642 @@
-// more details see https://gemini.google.com/app/d142c077a211cd58
 package main
 
-
-/*
 import (
+	"bufio"
+	"bytes"
+	"go/format"
+	"io"
+	"os"
+	"path/filepath"
+	"regexp"
+	"slices"
+	"strings"
+	"unicode"
 	"unicode/utf8"
+
+	"github.com/mattn/go-runewidth"
 )
 
-// Position represents a zero-indexed coordinate inside a buffer.
-type Position struct {
-	Row int // Line index (0-based)
-	Col int // Byte offset within the line (0-based)
-}
-
-// Buffer holds text content and coordinate resolution logic.
+// Buffer holds raw text and file metadata (Shared between views).
 type Buffer struct {
-	id    string
-	lines [][]byte // Simplest storage model; or replaced with a Rope/Piece Table
+	Path  string
+	Lines [][]byte
+	Dirty bool
 }
 
-// NewBufferx creates a new buffer from raw bytes.
-func NewBuffer(id string, content []byte) *Buffer {
-	// Split by newline while retaining byte structure
-	// (For production, a Rope or Piece Table avoids large slice reallocations)
+func NewBuffer(path string, content []byte) *Buffer {
 	return &Buffer{
-		id:    id,
-		lines: bytesSplitLines(content),
+		Path:  path,
+		Lines: bytes.Split(content, []byte{'\n'}),
 	}
 }
 
-// Get the raw byte slice for a specific line (O(1) operation)
-func (b *Buffer) LineBytes(row int) []byte {
-	if row < 0 || row >= len(b.lines) {
-		return nil
+// Insert inserts text at the given position and returns the new cursor position.
+func (b *Buffer) Insert(p Position, text string) Position {
+	if p.Row < 0 || p.Row >= len(b.Lines) {
+		return p
 	}
-	return b.lines[row]
+
+	line := b.Lines[p.Row]
+	if p.Col < 0 {
+		p.Col = 0
+	}
+	if p.Col > len(line) {
+		p.Col = len(line)
+	}
+
+	prefix := line[:p.Col]
+	suffix := line[p.Col:]
+	newLines := bytes.Split(slices.Concat(prefix, []byte(text), suffix), []byte{'\n'})
+
+	// Single-line insertion fast path
+	if len(newLines) == 1 {
+		b.Lines[p.Row] = newLines[0]
+		return Position{
+			Row: p.Row,
+			Col: p.Col + len(text),
+		}
+	}
+
+	updated := make([][]byte, 0, len(b.Lines)+len(newLines)-1)
+	updated = append(updated, b.Lines[:p.Row]...)
+	for i := range newLines {
+		updated = append(updated, newLines[i])
+	}
+	updated = append(updated, b.Lines[p.Row+1:]...)
+
+	b.Lines = updated
+
+	return Position{
+		Row: p.Row + len(newLines) - 1,
+		Col: len(newLines[len(newLines)-1]) - len(suffix),
+	}
+}
+
+func (b *Buffer) ReplaceRange(start, end Position, newText string) Position {
+	// Boundary safety checks
+	if start.Row < 0 || start.Row >= len(b.Lines) {
+		return start
+	}
+	if end.Row >= len(b.Lines) {
+		end.Row = len(b.Lines) - 1
+		end.Col = len(b.Lines[end.Row])
+	}
+
+	// 1. Extract prefix before startCol and suffix after endCol
+	prefix := b.Lines[start.Row][:start.Col]
+	suffix := b.Lines[end.Row][end.Col:]
+
+	// 2. Split replacement text into lines
+	newLines := bytes.Split(slices.Concat(prefix, []byte(newText), suffix), []byte{'\n'})
+
+	// 3. inline replace, return early
+	if start.Row == end.Row && len(newLines) == 1 {
+		b.Lines[start.Row] = newLines[0]
+		return Position{Row: start.Row, Col: start.Col + len([]rune(newText))}
+	}
+
+	// 4. Splice newLines into b.Lines slice, replacing range [startLine : endLine+1]
+	updated := make([][]byte, 0, len(b.Lines)-(end.Row-start.Row+1)+len(newLines))
+	updated = append(updated, b.Lines[:start.Row]...)
+	for i := range newLines {
+		updated = append(updated, newLines[i])
+	}
+	updated = append(updated, b.Lines[end.Row+1:]...)
+
+	b.Lines = updated
+	return Position{
+		Row: start.Row + len(newLines) - 1,
+		Col: len(newLines[len(newLines)-1]) - len(suffix),
+	}
+}
+
+// orderPos guarantees start <= end (top-to-bottom, left-to-right)
+func orderPos(p1, p2 Position) (start, end Position) {
+	if p1.Row < p2.Row || (p1.Row == p2.Row && p1.Col <= p2.Col) {
+		return p1, p2
+	}
+	return p2, p1
+}
+
+// ClampPos ensures p falls within valid buffer bounds.
+func (b *Buffer) ClampPos(p Position) Position {
+	if len(b.Lines) == 0 {
+		return Position{Row: 0, Col: 0}
+	}
+
+	// Clamp Row
+	row := p.Row
+	if row < 0 {
+		row = 0
+	} else if row >= len(b.Lines) {
+		row = len(b.Lines) - 1
+	}
+
+	// Clamp Col within the valid row
+	lineLen := len(b.Lines[row])
+	col := p.Col
+	if col < 0 {
+		col = 0
+	} else if col > lineLen {
+		col = lineLen
+	}
+
+	return Position{Row: row, Col: col}
+}
+
+// GetRange extracts the text between two positions (inclusive start, exclusive end).
+// TODO
+func (b *Buffer) GetRange(p1, p2 Position) string {
+	start, end := orderPos(b.ClampPos(p1), b.ClampPos(p2))
+
+	if start == end {
+		return ""
+	}
+
+	// Single-line range fast path
+	if start.Row == end.Row {
+		return string(b.Lines[start.Row][start.Col:end.Col])
+	}
+
+	// Multi-line range path
+	var sb strings.Builder
+
+	// First line fragment
+	sb.WriteString(string(b.Lines[start.Row][start.Col:]))
+	sb.WriteRune('\n')
+
+	// Intermediate full lines
+	for l := start.Row + 1; l < end.Row; l++ {
+		sb.WriteString(string(b.Lines[l]))
+		sb.WriteRune('\n')
+	}
+
+	// Final line fragment
+	sb.WriteString(string(b.Lines[end.Row][:end.Col]))
+
+	return sb.String()
+}
+
+// DeleteRange removes text between two positions [p1, p2) and returns the new cursor position.
+func (b *Buffer) Delete(p1, p2 Position) Position {
+	start, end := orderPos(b.ClampPos(p1), b.ClampPos(p2))
+	if start == end {
+		return start
+	}
+
+	// Single-line deletion
+	if start.Row == end.Row {
+		b.Lines[start.Row] = slices.Delete(b.Lines[start.Row], start.Col, end.Col)
+		return start
+	}
+
+	// Multi-line deletion
+	startLinePrefix := append([]byte(nil), b.Lines[start.Row][:start.Col]...)
+	endLineSuffix := b.Lines[end.Row][end.Col:]
+
+	// Stitch start prefix and end suffix into one merged line
+	mergedLine := slices.Concat(startLinePrefix, endLineSuffix)
+
+	b.Lines[start.Row] = mergedLine
+	b.Lines = slices.Delete(b.Lines, start.Row+1, end.Row+1)
+	return start
+}
+
+// WordBounds finds the start and end byte Positions of the word surrounding pos on its line.
+func (b *Buffer) WordBounds(p Position) (start, end Position) {
+	if p.Row < 0 || p.Row >= len(b.Lines) {
+		return p, p
+	}
+
+	line := b.Lines[p.Row]
+	lineLen := len(line)
+
+	if lineLen == 0 {
+		return Position{Row: p.Row, Col: 0}, Position{Row: p.Row, Col: 0}
+	}
+
+	// Clamp p.Col to valid slice boundary [0, lineLen]
+	col := p.Col
+	if col < 0 {
+		col = 0
+	}
+	if col >= lineLen {
+		col = lineLen - 1
+	}
+
+	// Determine the character classification under the target position
+	targetRune, _ := utf8.DecodeRune(line[col:])
+	targetIsWord := isWordChar(targetRune)
+
+	// 1. Scan Backward to find the start of the word
+	startCol := col
+	for startCol > 0 {
+		r, size := utf8.DecodeLastRune(line[:startCol])
+		if isWordChar(r) != targetIsWord {
+			break
+		}
+		startCol -= size
+	}
+
+	// 2. Scan Forward to find the end of the word
+	endCol := col
+	for endCol < lineLen {
+		r, size := utf8.DecodeRune(line[endCol:])
+		if isWordChar(r) != targetIsWord {
+			break
+		}
+		endCol += size
+	}
+
+	return Position{Row: p.Row, Col: startCol}, Position{Row: p.Row, Col: endCol}
+}
+
+// FindNext searches forward starting after "from" for an exact query.
+// Returns the position matching query, and true if found.
+func (b *Buffer) FindNext(query string, from Position) (start, end Position, ok bool) {
+	return b.findNext(query, from, false)
+}
+
+// FindNextIgnoreCase searches forward starting after "from" for query text,
+// ignoring case.
+func (b *Buffer) FindNextIgnoreCase(query string, from Position) (start, end Position, ok bool) {
+	return b.findNext(query, from, true)
+}
+
+// findNext searches forward for the next occurrence of query starting from 'from'.
+// It wraps around to the top of the buffer if no match is found below 'from'.
+// The returned range [start, end) is half-open (end.Col is after the last matched byte).
+func (b *Buffer) findNext(query string, from Position, ignoreCase bool) (start, end Position, ok bool) {
+	if len(query) == 0 || len(b.Lines) == 0 {
+		return Position{}, Position{}, false
+	}
+
+	// Prepare target pattern bytes
+	queryBytes := []byte(query)
+	if ignoreCase {
+		queryBytes = []byte(strings.ToLower(query))
+	}
+	queryLen := len(queryBytes)
+
+	// Clamp starting row
+	startRow := from.Row
+	if startRow < 0 {
+		startRow = 0
+	} else if startRow >= len(b.Lines) {
+		startRow = len(b.Lines) - 1
+	}
+
+	totalLines := len(b.Lines)
+
+	// Iterate over all lines starting from 'startRow', wrapping around to cover the whole file
+	for i := range totalLines + 1 {
+		row := (startRow + i) % totalLines
+		line := b.Lines[row]
+
+		// Determine byte offset to start searching within this line
+		searchFromCol := 0
+		var targetLine []byte
+		if i == 0 { // First line being searched: start from 'from.Col'
+			searchFromCol = from.Col
+			if searchFromCol < 0 {
+				searchFromCol = 0
+			}
+			if searchFromCol > len(line) {
+				searchFromCol = len(line)
+			}
+			targetLine = line[searchFromCol:]
+			if ignoreCase {
+				targetLine = bytes.ToLower(targetLine)
+			}
+		} else if row == startRow {
+			// wrapped to the start line
+			targetLine = line[searchFromCol:from.Col]
+			if ignoreCase {
+				targetLine = bytes.ToLower(targetLine)
+			}
+		}
+
+		// Perform fast byte search
+		matchIdx := bytes.Index(targetLine, queryBytes)
+		if matchIdx != -1 {
+			matchStartCol := searchFromCol + matchIdx
+			matchEndCol := matchStartCol + queryLen
+
+			// Guard against full wrap-around returning a match before 'from' on the same line
+			// when 'from' is already past the match.
+			if i == totalLines-1 && row == startRow && searchFromCol > 0 && matchStartCol < from.Col {
+				continue
+			}
+
+			return Position{Row: row, Col: matchStartCol},
+				Position{Row: row, Col: matchEndCol},
+				true
+		}
+	}
+
+	return Position{}, Position{}, false
+}
+
+// FindPrev searches backward starting before fromPos for an exact query.
+// Returns the start and end positions matching query, and true if found.
+func (b *Buffer) FindPrev(query string, from Position) (start, end Position, ok bool) {
+	return b.findPrev(query, from, false)
+}
+
+// FindPrevIgnoreCase searches backward starting before fromPos for query text,
+// ignoring case.
+func (b *Buffer) FindPrevIgnoreCase(query string, from Position) (start, end Position, ok bool) {
+	return b.findPrev(query, from, true)
+}
+
+// findPrev searches backward for the occurrence of query immediately preceding 'from'.
+// It wraps around to the bottom of the buffer if no match is found above 'from'.
+// The returned range [start, end) is half-open (end.Col is after the last matched byte).
+func (b *Buffer) findPrev(query string, from Position, ignoreCase bool) (start, end Position, ok bool) {
+	if len(query) == 0 || len(b.Lines) == 0 {
+		return Position{}, Position{}, false
+	}
+
+	// Prepare target pattern bytes
+	queryBytes := []byte(query)
+	if ignoreCase {
+		queryBytes = []byte(strings.ToLower(query))
+	}
+	queryLen := len(queryBytes)
+
+	totalLines := len(b.Lines)
+
+	// Clamp starting row
+	startRow := from.Row
+	if startRow < 0 {
+		startRow = 0
+	} else if startRow >= totalLines {
+		startRow = totalLines - 1
+	}
+
+	// Iterate backward through all lines starting at 'startRow', wrapping around
+	for i := 0; i < totalLines; i++ {
+		// Decrement row index with modulo wrapping
+		row := (startRow - i + totalLines) % totalLines
+		line := b.Lines[row]
+
+		// Determine upper bound column for searching within this line
+		searchToCol := len(line)
+		if i == 0 { // First line being searched: search only BEFORE 'from.Col'
+			searchToCol = from.Col
+			if searchToCol < 0 {
+				searchToCol = 0
+			}
+			if searchToCol > len(line) {
+				searchToCol = len(line)
+			}
+		}
+
+		targetLine := line[:searchToCol]
+		if ignoreCase {
+			targetLine = []byte(strings.ToLower(string(targetLine)))
+		}
+
+		// Perform fast backward byte search
+		matchIdx := bytes.LastIndex(targetLine, queryBytes)
+		if matchIdx != -1 {
+			matchStartCol := matchIdx
+			matchEndCol := matchStartCol + queryLen
+
+			return Position{Row: row, Col: matchStartCol},
+				Position{Row: row, Col: matchEndCol},
+				true
+		}
+	}
+
+	return Position{}, Position{}, false
+}
+
+// ReplaceAll replaces every exact occurrence of query in the buffer.
+func (b *Buffer) ReplaceAll(query, replacement string) (count int) {
+	return b.replaceAll(query, replacement, false)
+}
+
+// ReplaceAllIgnoreCase replaces every case-insensitive occurrence of query.
+func (b *Buffer) ReplaceAllIgnoreCase(query, replacement string) (count int) {
+	return b.replaceAll(query, replacement, true)
+}
+
+// replaceAll replaces all occurrences of query with replacement in the buffer.
+// It returns the total number of substitutions made.
+func (b *Buffer) replaceAll(query, replacement string, ignoreCase bool) (count int) {
+	if len(query) == 0 || len(b.Lines) == 0 {
+		return 0
+	}
+
+	replacementBytes := []byte(replacement)
+
+	// Case 1: Exact Case Search (Fast Path using bytes.Count and bytes.ReplaceAll)
+	if !ignoreCase {
+		queryBytes := []byte(query)
+
+		for i, line := range b.Lines {
+			matches := bytes.Count(line, queryBytes)
+			if matches > 0 {
+				b.Lines[i] = bytes.ReplaceAll(line, queryBytes, replacementBytes)
+				count += matches
+			}
+		}
+		return count
+	}
+
+	// Case 2: Case-Insensitive Search (Using compiled Regex)
+	pattern := "(?i)" + regexp.QuoteMeta(query)
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return 0
+	}
+
+	for i, line := range b.Lines {
+		matches := re.FindAllIndex(line, -1)
+		if len(matches) > 0 {
+			b.Lines[i] = re.ReplaceAll(line, replacementBytes)
+			count += len(matches)
+		}
+	}
+
+	return count
+}
+
+// MoveWordRight moves the cursor to the end of the current word,
+// or across whitespace/punctuation to the end of the next word.
+func (b *Buffer) MoveWordRight(p Position) Position {
+	if p.Row >= len(b.Lines) {
+		return p
+	}
+
+	line := b.Lines[p.Row]
+
+	// If at or past line end, wrap to the start of the next line
+	if p.Col >= len(line) {
+		if p.Row+1 < len(b.Lines) {
+			return Position{Row: p.Row + 1, Col: 0}
+		}
+		return p // End of document
+	}
+
+	col := p.Col
+
+	// Skip leading non-word characters (whitespace, punctuation)
+	for col < len(line) {
+		r, size := utf8.DecodeRune(line[col:])
+		if isWordChar(r) {
+			break
+		}
+		col += size
+	}
+
+	// Consume the word characters until the end of word
+	for col < len(line) {
+		r, size := utf8.DecodeRune(line[col:])
+		if !isWordChar(r) {
+			break
+		}
+		col += size
+	}
+
+	return Position{Row: p.Row, Col: col}
+}
+
+// MoveWordLeft moves the cursor to the start of the current word,
+// or across whitespace/punctuation to the start of the previous word.
+func (b *Buffer) MoveWordLeft(p Position) Position {
+	if p.Row < 0 || p.Row >= len(b.Lines) {
+		return p
+	}
+
+	line := b.Lines[p.Row]
+	col := min(p.Col, len(line))
+
+	// If at start of line, move to end of previous line
+	if col == 0 {
+		if p.Row == 0 {
+			return Position{Row: 0, Col: 0}
+		}
+		prevLine := b.Lines[p.Row-1]
+		return Position{Row: p.Row - 1, Col: len(prevLine)}
+	}
+
+	i := col
+	// skip non-word characters (whitespace/punctuation)
+	for i > 0 {
+		r, size := utf8.DecodeLastRune(line[:i])
+		if isWordChar(r) {
+			break
+		}
+		i -= size
+	}
+	// skip word characters to the start of the word
+	for i > 0 {
+		r, size := utf8.DecodeLastRune(line[:i])
+		if !isWordChar(r) {
+			break
+		}
+		i -= size
+	}
+	return Position{Row: p.Row, Col: i}
+}
+
+// NextPos returns the Position after stepping one rune right, wrapping lines if needed.
+func (b *Buffer) NextRunePos(p Position) Position {
+	line := b.Lines[p.Row]
+	if p.Col < len(line) {
+		_, size := utf8.DecodeRune(line[p.Col:])
+		return Position{Row: p.Row, Col: p.Col + size}
+	}
+	if p.Row < len(b.Lines)-1 {
+		return Position{Row: p.Row + 1, Col: 0}
+	}
+	return p
+}
+
+// PrevPos returns the Position after stepping one rune left, wrapping lines if needed.
+func (b *Buffer) PrevRunePos(p Position) Position {
+	if p.Col > 0 {
+		_, size := utf8.DecodeLastRune(b.Lines[p.Row][:p.Col])
+		return Position{Row: p.Row, Col: p.Col - size}
+	}
+	if p.Row > 0 {
+		prevRow := p.Row - 1
+		return Position{Row: prevRow, Col: len(b.Lines[prevRow])}
+	}
+	return p
+}
+
+// LineStartNonSpace returns the Position of the first non-whitespace character
+// on the line specified by p.Row.
+// If the line contains only whitespace or is empty, it returns the start of the line (col 0).
+func (b *Buffer) LineStartNonSpace(p Position) Position {
+	// Guard against out-of-bounds row
+	if p.Row < 0 || p.Row >= len(b.Lines) {
+		return p
+	}
+
+	line := b.Lines[p.Row]
+	col := 0
+
+	for col < len(line) {
+		r, size := utf8.DecodeRune(line[col:])
+		if !unicode.IsSpace(r) {
+			return Position{Row: p.Row, Col: col}
+		}
+		col += size
+	}
+
+	// Line is empty or entirely whitespace
+	return Position{Row: p.Row, Col: 0}
+}
+
+func (b *Buffer) LineEnd(p Position) Position {
+	if p.Row < 0 || p.Row >= len(b.Lines) {
+		return p
+	}
+	return Position{Row: p.Row, Col: len(b.Lines[p.Row])}
+}
+
+// Format runs go/format on the buffer's content if it is a Go source file.
+// It returns true if the buffer was modified, and an error if formatting fails.
+func (b *Buffer) Format() (bool, error) {
+	// Only format Go files
+	if filepath.Ext(b.Path) != ".go" {
+		return false, nil
+	}
+
+	buf := bytes.Join(b.Lines, []byte{'\n'})
+	formatted, err := format.Source(buf)
+	if err != nil {
+		return false, err
+	}
+
+	// Handle trailing newline splitting gracefully
+	newLines := bytes.Split(bytes.TrimSuffix(formatted, []byte{'\n'}), []byte{'\n'})
+
+	b.Lines = newLines
+	b.Dirty = true
+
+	// TODO
+	// Clamp cursor to valid row/col bounds after formatting changes line lengths
+	// if b.Cursor.Row >= len(b.Lines) {
+	// 	b.Cursor.Row = max(0, len(b.Lines)-1)
+	// }
+	// if len(b.Lines) > 0 {
+	// 	b.Cursor.Col = min(b.Cursor.Col, len(b.Lines[b.Cursor.Row]))
+	// } else {
+	// 	b.Cursor.Col = 0
+	// }
+
+	return true, nil
 }
 
 // Convert (Row, Col Byte) -> Rune Index
 // Used when you need to know how many unicode characters precede the cursor.
 func (b *Buffer) ByteToRuneCol(pos Position) int {
-	line := b.LineBytes(pos.Row)
+	line := b.Lines[pos.Row]
 	if pos.Col >= len(line) {
 		return utf8.RuneCount(line)
 	}
@@ -50,7 +646,7 @@ func (b *Buffer) ByteToRuneCol(pos Position) int {
 // Convert (Row, Rune Index) -> Position (Byte Col)
 // Used when moving the cursor horizontally by 'N' runes (e.g., arrow keys).
 func (b *Buffer) RuneToByteCol(row int, runeCol int) Position {
-	line := b.LineBytes(row)
+	line := b.Lines[row]
 	if len(line) == 0 || runeCol <= 0 {
 		return Position{Row: row, Col: 0}
 	}
@@ -66,20 +662,217 @@ func (b *Buffer) RuneToByteCol(row int, runeCol int) Position {
 	return Position{Row: row, Col: byteIdx}
 }
 
-// Range represents a span of text within a single document.
-type Range struct {
-	Start Position
-	End   Position
-}
-
 // Safe Slicing using byte offsets (O(1) operation)
-func (b *Buffer) TextAt(r Range) []byte {
+func (b *Buffer) Text(start, end Position) []byte {
 	// Fast zero-copy slicing using byte offsets directly
-	if r.Start.Row == r.End.Row {
-		line := b.LineBytes(r.Start.Row)
-		return line[r.Start.Col:r.End.Col]
+	if start.Row == end.Row {
+		line := b.Lines[start.Row]
+		return line[start.Col:end.Col]
 	}
 	// Multi-line extraction logic...
 	return nil
 }
-*/
+
+// ByteToVisualCol converts a 0-indexed byte offset (col) on line p.Row
+// into a 0-indexed visual display column (terminal cell width).
+func (b *Buffer) ByteToVisualCol(p Position, tabWidth int) int {
+	if p.Row < 0 || p.Row >= len(b.Lines) {
+		return 0
+	}
+
+	line := b.Lines[p.Row]
+	if p.Col <= 0 {
+		return 0
+	}
+	if p.Col > len(line) {
+		p.Col = len(line)
+	}
+
+	visualCol := 0
+	byteIdx := 0
+
+	for byteIdx < p.Col {
+		r, size := utf8.DecodeRune(line[byteIdx:])
+		if r == utf8.RuneError && size == 1 {
+			// Skip invalid byte
+			byteIdx++
+			visualCol++
+			continue
+		}
+
+		if r == '\t' {
+			// Tab advances to the next tab stop
+			visualCol += tabWidth - (visualCol % tabWidth)
+		} else {
+			// Add terminal cell width (1 for standard ASCII, 2 for CJK/emojis, 0 for combining marks)
+			w := runewidth.RuneWidth(r)
+			if w > 0 {
+				visualCol += w
+			}
+		}
+
+		byteIdx += size
+	}
+
+	return visualCol
+}
+
+// VisualToByteCol converts a visual display column (terminal cell offset)
+// back to the closest 0-indexed byte offset on line row.
+func (b *Buffer) VisualToByteCol(row int, visualCol int, tabWidth int) int {
+	if row < 0 || row >= len(b.Lines) || visualCol <= 0 {
+		return 0
+	}
+
+	line := b.Lines[row]
+	vCol := 0
+	byteIdx := 0
+
+	for byteIdx < len(line) {
+		r, size := utf8.DecodeRune(line[byteIdx:])
+
+		var runeWidth int
+		if r == '\t' {
+			runeWidth = tabWidth - (vCol % tabWidth)
+		} else {
+			runeWidth = runewidth.RuneWidth(r)
+		}
+
+		// Stop if advancing past visualCol
+		if vCol+runeWidth > visualCol {
+			// Snap to whichever side is closer (or return current byteIdx)
+			break
+		}
+
+		vCol += runeWidth
+		byteIdx += size
+	}
+
+	return byteIdx
+}
+
+// BufferReader implements io.Reader over a Buffer.
+type BufferReader struct {
+	buf  *Buffer
+	row  int  // Current row index
+	col  int  // Current byte column index within b.Lines[row]
+	inNL bool // True if currently streaming the re-inserted '\n'
+}
+
+// NewReader returns an io.Reader that streams the full content of b,
+// re-inserting '\n' between lines.
+func (b *Buffer) NewReader() *BufferReader {
+	return &BufferReader{
+		buf: b,
+	}
+}
+
+// Read implements the io.Reader interface.
+func (r *BufferReader) Read(p []byte) (n int, err error) {
+	if r.buf == nil || r.row >= len(r.buf.Lines) {
+		return 0, io.EOF
+	}
+
+	for n < len(p) && r.row < len(r.buf.Lines) {
+		line := r.buf.Lines[r.row]
+
+		// 1. If sitting on a line boundary, yield the newline byte
+		if r.inNL {
+			p[n] = '\n'
+			n++
+			r.inNL = false
+			r.row++
+			r.col = 0
+			continue
+		}
+
+		// 2. Read remaining content from current line
+		if r.col < len(line) {
+			copied := copy(p[n:], line[r.col:])
+			n += copied
+			r.col += copied
+		}
+
+		// 3. If reached end of line content, mark next byte as newline
+		if r.col >= len(line) {
+			// Don't append newline after the very last line if it's empty/EOF
+			// (or keep it if your editor standard requires a trailing newline)
+			if r.row < len(r.buf.Lines)-1 {
+				r.inNL = true
+			} else {
+				// Last line finished
+				r.row++
+			}
+		}
+	}
+
+	if n == 0 && r.row >= len(r.buf.Lines) {
+		return 0, io.EOF
+	}
+
+	return n, nil
+}
+
+// SaveFile writes the lines back to disk.
+func (b *Buffer) SaveFile() error {
+	f, err := os.Create(b.Path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	// Stream directly to disk using a buffered writer
+	w := bufio.NewWriter(f)
+	if _, err := io.Copy(w, b.NewReader()); err != nil {
+		return err
+	}
+
+	if err := w.Flush(); err != nil {
+		return err
+	}
+	b.Dirty = false
+	return nil
+}
+
+// BufferFromFile opens a file and prepares a Buffer struct.
+// If the file does not exist, it creates a new empty buffer associated with that path.
+func BufferFromFile(path string) (*Buffer, error) {
+	if path == "" {
+		return &Buffer{
+			Path:  "",
+			Lines: [][]byte{{}},
+		}, nil
+	}
+
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return nil, err
+	}
+
+	file, err := os.Open(absPath)
+	if os.IsNotExist(err) {
+		// New/unsaved file: initialize with one empty line
+		return &Buffer{
+			Path:  absPath,
+			Lines: [][]byte{{}},
+		}, nil
+	} else if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	lines, err := readLines(file)
+	if err != nil {
+		return nil, err
+	}
+
+	// Guarantee at least one line exists in memory
+	if len(lines) == 0 {
+		lines = [][]byte{}
+	}
+
+	return &Buffer{
+		Path:  absPath,
+		Lines: lines,
+	}, nil
+}
