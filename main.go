@@ -597,7 +597,7 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 			v.Cursor = buf.Delete(Position{Row: v.Cursor.Row, Col: 0}, v.Cursor)
 		case "alt+backspace":
 			// delete word backwards
-			prev := buf.MoveWordLeft(v.Cursor)
+			prev := buf.WordStart(v.Cursor)
 			v.Cursor = buf.Delete(prev, v.Cursor)
 		case "cmd+shift+backspace":
 			// delete whole line
@@ -612,7 +612,7 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 	case kero.KeyLeft:
 		switch key.String() {
 		case "alt+left":
-			v.Cursor = buf.MoveWordLeft(v.Cursor)
+			v.Cursor = buf.WordStart(v.Cursor)
 		case "cmd+left":
 			p := buf.LineStartNonSpace(v.Cursor)
 			if v.Cursor == p {
@@ -633,7 +633,7 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 	case kero.KeyRight:
 		switch key.String() {
 		case "alt+right":
-			v.Cursor = buf.MoveWordRight(v.Cursor)
+			v.Cursor = buf.WordEnd(v.Cursor)
 		case "cmd+right":
 			v.Cursor = buf.LineEnd(v.Cursor)
 		case "shift+right":

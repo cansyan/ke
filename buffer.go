@@ -463,9 +463,8 @@ func (b *Buffer) replaceAll(query, replacement string, ignoreCase bool) (count i
 	return count
 }
 
-// MoveWordRight moves the cursor to the end of the current word,
-// or across whitespace/punctuation to the end of the next word.
-func (b *Buffer) MoveWordRight(p Position) Position {
+// WordEnd returns the position at the end of the current or next word starting from p.
+func (b *Buffer) WordEnd(p Position) Position {
 	if p.Row >= len(b.Lines) {
 		return p
 	}
@@ -503,9 +502,8 @@ func (b *Buffer) MoveWordRight(p Position) Position {
 	return Position{Row: p.Row, Col: col}
 }
 
-// MoveWordLeft moves the cursor to the start of the current word,
-// or across whitespace/punctuation to the start of the previous word.
-func (b *Buffer) MoveWordLeft(p Position) Position {
+// WordStart returns the position at the start of the current or previous word starting from p.
+func (b *Buffer) WordStart(p Position) Position {
 	if p.Row < 0 || p.Row >= len(b.Lines) {
 		return p
 	}
