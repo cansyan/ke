@@ -251,6 +251,10 @@ func (e *Editor) handleMouse(ctx *kero.Context, m kero.MouseEvent) error {
 	point := kero.Point{X: m.X, Y: m.Y}
 	switch m.Button {
 	case kero.MouseWheelUp:
+		if e.ref.Active {
+			e.ref.ScrollRow = max(0, e.ref.ScrollRow-1)
+			return nil
+		}
 		if textRect.Contains(point) {
 			p := e.palette
 			if p.Active && paletteRect.Contains(point) {
@@ -260,10 +264,11 @@ func (e *Editor) handleMouse(ctx *kero.Context, m kero.MouseEvent) error {
 			e.View().ScrollRow = max(0, e.View().ScrollRow-1)
 			return nil
 		}
-		if e.ref.Active {
-			e.ref.Offset = max(0, e.ref.Offset-1)
-		}
 	case kero.MouseWheelDown:
+		if e.ref.Active {
+			e.ref.ScrollRow = min(e.ref.ScrollRow+1, len(e.ref.Items)-e.ref.VisibleRows())
+			return nil
+		}
 		if textRect.Contains(point) {
 			p := e.palette
 			if p.Active && paletteRect.Contains(kero.Point{X: m.X, Y: m.Y}) {
@@ -272,9 +277,6 @@ func (e *Editor) handleMouse(ctx *kero.Context, m kero.MouseEvent) error {
 			}
 			e.View().ScrollRow = min(e.View().ScrollRow+1, len(e.Buf().Lines)-textRect.H)
 			return nil
-		}
-		if e.ref.Active {
-			e.ref.Offset = min(e.ref.Offset+1, len(e.ref.Items)-e.ref.VisibleRows())
 		}
 	case kero.MouseLeft:
 		switch m.Action {
@@ -294,6 +296,18 @@ func (e *Editor) handleMouse(ctx *kero.Context, m kero.MouseEvent) error {
 				e.palette.Close()
 			}
 
+			if e.ref.Active {
+				if rect := LayoutRefPanel(ctx.Width, ctx.Height); rect.Contains(point) {
+					index := m.Y - rect.Y - 1 + e.ref.ScrollRow // minus 1 for header
+					if index < 0 || index >= len(e.ref.Items) {
+						return nil
+					}
+					e.ref.Index = index
+					e.gotoLocation(e.ref.Items[index])
+					return nil
+				}
+			}
+
 			if textRect.Contains(point) {
 				e.View().Cursor = e.mouseToPosition(m, textRect)
 				if e.hasSelect() {
@@ -305,14 +319,7 @@ func (e *Editor) handleMouse(ctx *kero.Context, m kero.MouseEvent) error {
 				}
 				return nil
 			}
-			if rect := LayoutBottomPanel(ctx.Width, ctx.Height); e.ref.Active && rect.Contains(point) {
-				index := m.Y - rect.Y - 1 + e.ref.Offset // minus 1 for header
-				if index < 0 || index >= len(e.ref.Items) {
-					return nil
-				}
-				e.ref.Index = index
-				e.gotoLocation(e.ref.Items[index])
-			}
+
 		case kero.MouseRelease:
 			if textRect.Contains(point) {
 				// ctrl+mouse_left_release goto definition
@@ -749,8 +756,8 @@ func LayoutPalatte(totalWidth, totalHeight, paletteHeight int) kero.Rect {
 	return rect
 }
 
-// calculate the rectangle for the bottom overlay panel
-func LayoutBottomPanel(totalWidth, totalHeight int) kero.Rect {
+// calculate the rectangle for the references overlay panel
+func LayoutRefPanel(totalWidth, totalHeight int) kero.Rect {
 	header := 1
 	visibleRows := 10
 	rect := kero.Rect{X: 0, W: totalWidth, H: visibleRows + header}
@@ -931,7 +938,7 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 		case e.renaming:
 			e.drawRename(f, msgRect)
 		case e.ref.Active:
-			e.drawReferences(f, LayoutBottomPanel(fSize.Width, fSize.Height))
+			e.drawReferences(f, LayoutRefPanel(fSize.Width, fSize.Height))
 		default:
 			if e.message == "" {
 				e.message = "^S save | ^W close | ^Q quit | ^F find | ^P palette"
@@ -1530,7 +1537,7 @@ func (e *Editor) gotoDiagnostic() {
 	var err *scanner.Error
 	for _, d := range e.diags {
 		dRow := d.Pos.Line - 1
-		dCol := byteColumnToRuneIndex(string(v.Buf.Lines[dRow]), d.Pos.Column)
+		dCol := d.Pos.Column - 1
 		if dRow > v.Cursor.Row ||
 			(dRow == v.Cursor.Row && dCol > v.Cursor.Col) {
 			err = d
@@ -1542,7 +1549,7 @@ func (e *Editor) gotoDiagnostic() {
 	}
 
 	dRow := err.Pos.Line - 1
-	dCol := byteColumnToRuneIndex(string(v.Buf.Lines[dRow]), err.Pos.Column)
+	dCol := err.Pos.Column - 1
 	v.Cursor = v.Buf.ClampPos(Position{Row: dRow, Col: dCol})
 	v.showCursorCenter()
 }
@@ -2082,7 +2089,7 @@ func (p *Palette) symbolItems(e *Editor, query string) []PaletteItem {
 				ed.recordJump()
 				ed.View().Cursor = Position{
 					Row: sym.Line - 1,
-					Col: byteColumnToRuneIndex(string(e.Buf().Lines[sym.Line-1]), sym.Column),
+					Col: sym.Column - 1,
 				}
 				e.View().showCursorCenter()
 			},
@@ -2136,14 +2143,14 @@ func (p *Palette) commandItems(_ *Editor, query string) []PaletteItem {
 			}
 			e.startRename()
 		}},
-		{"list location", "", func(e *Editor) { e.ref.Active = !e.ref.Active }},
-		{"next location", "ctrl+shift+]", func(e *Editor) {
+		{"toggle reference", "", func(e *Editor) { e.ref.Active = !e.ref.Active }},
+		{"next reference", "ctrl+shift+]", func(e *Editor) {
 			if len(e.ref.Items) <= 1 {
 				return
 			}
 			e.gotoLocation(e.ref.Next())
 		}},
-		{"prev location", "ctrl+shift+[", func(e *Editor) {
+		{"prev reference", "ctrl+shift+[", func(e *Editor) {
 			if len(e.ref.Items) <= 1 {
 				return
 			}
@@ -2596,24 +2603,24 @@ func GotoDefinition(e *Editor) {
 }
 
 type ReferencesPanel struct {
-	Active  bool
-	Index   int
-	Items   []Location
-	Offset  int // vertical scrolling
-	MaxRows int // UI render cap (e.g., 10 items)
-	Header  string
+	Active    bool
+	Index     int // active item
+	Items     []Location
+	ScrollRow int // vertical scrolling
+	Height    int // UI render cap
+	Header    string
 }
 
 func NewReferencesPanel(header string, items []Location) ReferencesPanel {
-	return ReferencesPanel{Active: true, Header: header, Items: items, MaxRows: 10}
+	return ReferencesPanel{Active: true, Header: header, Items: items, Height: 10}
 }
 
 func (r *ReferencesPanel) VisibleRows() int {
-	maxRows := r.MaxRows
-	if maxRows == 0 {
-		maxRows = 10
+	h := r.Height
+	if h == 0 {
+		h = 10
 	}
-	return min(len(r.Items), maxRows)
+	return min(len(r.Items), h)
 }
 
 func (r *ReferencesPanel) Next() Location {
@@ -2628,11 +2635,11 @@ func (r *ReferencesPanel) Next() Location {
 
 	// Calculate scrolling offset to keep selected item inside dropdown viewport
 	visibleRows := r.VisibleRows()
-	offset := 0
+	scroll := 0
 	if r.Index >= visibleRows {
-		offset = r.Index - visibleRows + 1
+		scroll = r.Index - visibleRows + 1
 	}
-	r.Offset = offset
+	r.ScrollRow = scroll
 	return r.Items[r.Index]
 }
 
@@ -2648,11 +2655,11 @@ func (r *ReferencesPanel) Prev() Location {
 
 	// Calculate scrolling offset to keep selected item inside dropdown viewport
 	visibleRows := r.VisibleRows()
-	offset := 0
+	scroll := 0
 	if r.Index >= visibleRows {
-		offset = r.Index - visibleRows + 1
+		scroll = r.Index - visibleRows + 1
 	}
-	r.Offset = offset
+	r.ScrollRow = scroll
 	return r.Items[r.Index]
 }
 
@@ -2684,28 +2691,15 @@ func ParseLocation(s string) (Location, error) {
 	if err != nil {
 		return Location{}, err
 	}
-	_ = endCol // todo
+	_ = endCol
 	loc := Location{
 		Filename: filename,
 		Pos: Position{
 			Row: lineNo - 1,
-			Col: startCol - 1, // TODO: convert the Bytes Offset column to rune offset
+			Col: startCol - 1,
 		},
 	}
 	return loc, nil
-}
-
-// convert 1-base column number (byte count) to 0-base rune index
-func byteColumnToRuneIndex(line string, column int) int {
-	var o int
-	runes := []rune(line)
-	for i, r := range runes {
-		o += utf8.RuneLen(r)
-		if o >= column {
-			return i
-		}
-	}
-	return len(runes) - 1
 }
 
 func (e *Editor) gotoLocation(l Location) {
@@ -2784,14 +2778,7 @@ func (e *Editor) drawReferences(f *kero.Frame, rect kero.Rect) {
 	}
 
 	style := kero.NewStyle().Reverse()
-
-	// Calculate visible window bounds
-	total := len(e.ref.Items)
-	visibleRows := e.ref.VisibleRows()
-
-	// 3. Fill background for dropdown overlay rendered directly above row y
 	f.Fill(rect, ' ', style)
-	// 4. Render header
 	f.Write(rect.X+1, rect.Y, e.ref.Header, style)
 
 	buffers := make([]*Buffer, 0, len(e.views))
@@ -2812,10 +2799,10 @@ func (e *Editor) drawReferences(f *kero.Frame, rect kero.Rect) {
 		return b, nil
 	}
 
-	// 5. Render item rows
-	for i := range visibleRows {
-		idx := i + e.ref.Offset
-		if idx >= total {
+	// Render items
+	for i := range rect.H - 1 {
+		idx := i + e.ref.ScrollRow
+		if idx >= len(e.ref.Items) {
 			break
 		}
 

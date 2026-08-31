@@ -633,6 +633,7 @@ func (b *Buffer) Format() (bool, error) {
 	return true, nil
 }
 
+/*
 // Convert (Row, Col Byte) -> Rune Index
 // Used when you need to know how many unicode characters precede the cursor.
 func (b *Buffer) ByteToRuneCol(pos Position) int {
@@ -661,6 +662,7 @@ func (b *Buffer) RuneToByteCol(row int, runeCol int) Position {
 
 	return Position{Row: row, Col: byteIdx}
 }
+*/
 
 // Safe Slicing using byte offsets (O(1) operation)
 func (b *Buffer) Text(start, end Position) []byte {
