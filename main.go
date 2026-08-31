@@ -7,11 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"go/ast"
-	"go/importer"
 	"go/parser"
 	"go/scanner"
 	"go/token"
-	"go/types"
 	"io"
 	"log"
 	"os"
@@ -20,7 +18,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -82,7 +79,7 @@ func main() {
 	// set FPS for refreshing diagnostic
 	p := kero.New(e, kero.WithAltScreen(true), kero.WithKitty(true), kero.WithFPS(3), kero.WithMouse(true))
 	if err := p.Run(); err != nil {
-		panic(err)
+		log.Print(err)
 	}
 }
 
@@ -117,7 +114,7 @@ type View struct {
 func (v *View) SetSize(width, height int) {
 	v.Width = width
 	v.Height = height
-	v.showCursor()
+	v.ShowCursorSmart()
 }
 
 // Editor implements kero.App interface
@@ -149,10 +146,8 @@ type Editor struct {
 	// optional: record the time of last key, make it expire after a while
 	lastEvent kero.Event
 
-	diags       scanner.ErrorList
-	diagTimer   *time.Timer
-	diagChan    chan diagResult
-	diagVersion atomic.Uint64
+	diags    []*scanner.Error
+	diagChan chan []*scanner.Error
 
 	// reports whether the key comes from a paste action,
 	// to distinguish the manual KeyEnter or a pasted \n
@@ -186,9 +181,8 @@ func (e *Editor) Buf() *Buffer {
 }
 
 func (e *Editor) Init(ctx *kero.Context) error {
-	// e.view().SetSize(ctx.Width, ctx.Height)
-	// e.view().showCursor()
-	e.debounceDiagnose()
+	e.diagChan = make(chan []*scanner.Error, 1)
+	e.diagnose()
 	return nil
 }
 
@@ -337,7 +331,7 @@ func (e *Editor) handleMouse(ctx *kero.Context, m kero.MouseEvent) error {
 			}
 			// later drag expands selection
 			e.View().Cursor = e.mouseToPosition(m, textRect)
-			e.View().showCursor()
+			e.View().ShowCursorSmart()
 		}
 	}
 	return nil
@@ -355,7 +349,7 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 		return nil
 	}
 
-	defer e.View().showCursor()
+	defer e.View().ShowCursorSmart()
 	if e.saveAs {
 		return e.updateSaveAs(key)
 	}
@@ -396,10 +390,8 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 			completing = len(c.Items) > 0
 		case "ctrl+-":
 			e.JumpBack()
-			e.View().showCursorCenter()
 		case "ctrl+shift+-", "ctrl+_":
 			e.JumpForward()
-			e.View().showCursorCenter()
 		case "ctrl+w":
 			if buf.Dirty && !(e.LastEvent() == "ctrl+w") {
 				e.message = "warn: unsaved changes, press ctrl+s to save or ctrl+w again to close"
@@ -421,8 +413,11 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 		case "ctrl+shift+p":
 			e.palette.Open(e, "/")
 			return nil
+		case "ctrl+[":
+			e.gotoPrevDiag()
+			return nil
 		case "ctrl+]":
-			e.gotoDiagnostic()
+			e.gotoNextDiag()
 			return nil
 		case "ctrl+shift+]", "ctrl+}":
 			if len(e.ref.Items) <= 1 {
@@ -438,7 +433,8 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 			if err := e.save(); err != nil {
 				return err
 			}
-			e.debounceDiagnose()
+			// diagnostic doesn't reflect the buffer changes
+			e.diagnose()
 			return nil
 		case "ctrl+f":
 			e.startFind()
@@ -780,7 +776,7 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 	gutterRect, textRect, msgRect, statusRect := LayoutWindow(fSize.Width, fSize.Height, len(v.Buf.Lines))
 
 	// 1. Draw Gutter Area
-	for i := 0; i < gutterRect.H; i++ {
+	for i := range gutterRect.H {
 		lineIdx := v.ScrollRow + i
 		y := gutterRect.Y + i
 
@@ -803,7 +799,7 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 	}
 
 	// 2. Draw Text Viewport Area
-	for i := 0; i < textRect.H; i++ {
+	for i := range textRect.H {
 		lineIdx := v.ScrollRow + i
 		if lineIdx >= len(v.Buf.Lines) {
 			break
@@ -1192,7 +1188,7 @@ func (e *Editor) finishSaveAs() error {
 	if err := e.save(); err != nil {
 		return err
 	}
-	e.debounceDiagnose()
+	e.diagnose()
 	return nil
 }
 
@@ -1449,9 +1445,6 @@ func (v *View) moveDown() {
 func (e *Editor) markDirty() {
 	e.Buf().Dirty = true
 	e.message = ""
-	if isGoFile(e.Buf().Path) {
-		e.debounceDiagnose()
-	}
 }
 
 type diagResult struct {
@@ -1459,62 +1452,35 @@ type diagResult struct {
 	errs    scanner.ErrorList
 }
 
-// debounceDiagnose makes instant diagnose for dirty buffer,
-// and accurate diagnose for clean file.
-func (e *Editor) debounceDiagnose() {
-	if e.Buf() == nil || !isGoFile(e.Buf().Path) {
+// diagnose starts a goroutine to check file.
+func (e *Editor) diagnose() {
+	if e.Buf() == nil {
 		return
 	}
 
-	version := e.diagVersion.Add(1)
-	// cancel previous check
-	if e.diagTimer != nil {
-		e.diagTimer.Stop()
-	}
-	if e.diagChan == nil {
-		e.diagChan = make(chan diagResult, 4)
-	}
-	filename := e.Buf().Path
-	src := e.Buf().NewReader()
-	e.diagTimer = time.AfterFunc(300*time.Millisecond, func() {
-		var errs []*scanner.Error
-		if e.Buf().Dirty {
-			// suitable for instant editing
-			errs = CheckSemantics(filename, src)
-		} else {
-			diags, err := CheckFile(filename)
-			if err != nil {
-				log.Print(err)
-				e.message = err.Error()
-				return
-			}
-			errs = diags
-		}
-		result := diagResult{version: version, errs: errs}
-		select {
-		case <-e.diagChan:
-		default:
+	go func() {
+		diags, err := CheckFile(e.Buf().Path)
+		if err != nil {
+			log.Print(err)
+			e.message = err.Error()
+			return
 		}
 		select {
-		case e.diagChan <- result:
+		case e.diagChan <- diags:
 		default:
 		}
-	})
+	}()
 }
 
 func (e *Editor) applyDiagnostic() {
 	if e.diagChan == nil {
 		return
 	}
-	for {
-		select {
-		case result := <-e.diagChan:
-			if result.version == e.diagVersion.Load() {
-				e.diags = result.errs
-			}
-		default:
-			return
-		}
+	select {
+	case result := <-e.diagChan:
+		e.diags = result
+	default:
+		return
 	}
 }
 
@@ -1527,7 +1493,32 @@ func (e *Editor) diagnosticForLine(row int) *scanner.Error {
 	return nil
 }
 
-func (e *Editor) gotoDiagnostic() {
+func (e *Editor) gotoPrevDiag() {
+	if len(e.diags) == 0 {
+		return
+	}
+
+	v := e.View()
+	var se *scanner.Error
+	for i := len(e.diags) - 1; i >= 0; i-- {
+		d := e.diags[i]
+		dRow := d.Pos.Line - 1
+		dCol := d.Pos.Column - 1
+		if dRow < v.Cursor.Row || (dRow == v.Cursor.Row && dCol < v.Cursor.Col) {
+			se = d
+			break
+		}
+	}
+	if se == nil {
+		se = e.diags[len(e.diags)-1]
+	}
+	v.Cursor = v.Buf.Clamp(Position{
+		Row: se.Pos.Line - 1,
+		Col: se.Pos.Column - 1,
+	})
+}
+
+func (e *Editor) gotoNextDiag() {
 	if len(e.diags) == 0 {
 		return
 	}
@@ -1551,7 +1542,6 @@ func (e *Editor) gotoDiagnostic() {
 	dRow := err.Pos.Line - 1
 	dCol := err.Pos.Column - 1
 	v.Cursor = v.Buf.Clamp(Position{Row: dRow, Col: dCol})
-	v.showCursorCenter()
 }
 
 func isGoFile(path string) bool {
@@ -1616,6 +1606,47 @@ func (v *View) showCursorCenter() {
 	v.ScrollCol = max(vCol-(v.Width/2), 0)
 }
 
+// isCursorVisible returns true if the cursor is currently inside the visible viewport.
+func (v *View) isCursorVisible() bool {
+	if v.Width <= 0 || v.Height <= 0 {
+		return false
+	}
+
+	// Vertical check
+	if v.Cursor.Row < v.ScrollRow || v.Cursor.Row >= v.ScrollRow+v.Height {
+		return false
+	}
+
+	// Horizontal check
+	vCol := v.Buf.ByteToVisualCol(v.Cursor, 4)
+	if vCol < v.ScrollCol || vCol >= v.ScrollCol+v.Width {
+		return false
+	}
+
+	return true
+}
+
+// ShowCursorSmart minimal-scrolls for nearby moves, but centers for long-distance jumps.
+func (v *View) ShowCursorSmart() {
+	if v.isCursorVisible() {
+		return
+	}
+
+	// Check vertical jump distance
+	dist := v.Cursor.Row - v.ScrollRow
+	if dist < 0 {
+		dist = -dist
+	}
+
+	// If the jump is far outside the viewport (e.g. > 1 full viewport height), center it.
+	// Otherwise, just do standard minimal scrolling.
+	if dist > v.Height {
+		v.showCursorCenter()
+	} else {
+		v.showCursor()
+	}
+}
+
 func trimToWidth(s string, width int) string {
 	if width <= 0 {
 		return ""
@@ -1633,69 +1664,69 @@ func trimToWidth(s string, width int) string {
 //
 // It responds instantly(~5-20ms), as a tradeoff,
 // external module imports are not resolved and are filtered out.
-func CheckSemantics(filename string, src any) scanner.ErrorList {
-	fset := token.NewFileSet()
-	// 1. Parse AST with comments and full error reporting
-	file, err := parser.ParseFile(fset, filename, src, parser.AllErrors)
+// func CheckSemantics(filename string, src any) scanner.ErrorList {
+// 	fset := token.NewFileSet()
+// 	// 1. Parse AST with comments and full error reporting
+// 	file, err := parser.ParseFile(fset, filename, src, parser.AllErrors)
 
-	var errs scanner.ErrorList
+// 	var errs scanner.ErrorList
 
-	// 2. Collect syntax errors first
-	if err != nil {
-		if scannerErrs, ok := err.(scanner.ErrorList); ok {
-			return scannerErrs
-		}
-		// If syntax is broken, return early (type checking invalid AST causes redundant noise)
-		return errs
-	}
+// 	// 2. Collect syntax errors first
+// 	if err != nil {
+// 		if scannerErrs, ok := err.(scanner.ErrorList); ok {
+// 			return scannerErrs
+// 		}
+// 		// If syntax is broken, return early (type checking invalid AST causes redundant noise)
+// 		return errs
+// 	}
 
-	// 3. Configure type checker for semantic validation
-	pkgName := file.Name.Name
-	if pkgName == "" {
-		pkgName = "main"
-	}
+// 	// 3. Configure type checker for semantic validation
+// 	pkgName := file.Name.Name
+// 	if pkgName == "" {
+// 		pkgName = "main"
+// 	}
 
-	conf := types.Config{
-		// only resolve standard library imports, ignores third-party or local module
-		Importer: importer.Default(),
+// 	conf := types.Config{
+// 		// only resolve standard library imports, ignores third-party or local module
+// 		Importer: importer.Default(),
 
-		// Custom error handler to collect semantic diagnostics
-		Error: func(err error) {
-			if typeErr, ok := err.(types.Error); ok {
-				// Suppress import resolution errors for external modules during real-time typing
-				if strings.Contains(typeErr.Msg, "could not import") ||
-					strings.Contains(typeErr.Msg, "cannot find package") {
-					return
-				}
+// 		// Custom error handler to collect semantic diagnostics
+// 		Error: func(err error) {
+// 			if typeErr, ok := err.(types.Error); ok {
+// 				// Suppress import resolution errors for external modules during real-time typing
+// 				if strings.Contains(typeErr.Msg, "could not import") ||
+// 					strings.Contains(typeErr.Msg, "cannot find package") {
+// 					return
+// 				}
 
-				pos := fset.Position(typeErr.Pos)
-				errs.Add(pos, typeErr.Msg)
-			}
-		},
-	}
+// 				pos := fset.Position(typeErr.Pos)
+// 				errs.Add(pos, typeErr.Msg)
+// 			}
+// 		},
+// 	}
 
-	// Optional: Pass an empty Info struct to trigger full type resolution
-	info := &types.Info{
-		Types:      make(map[ast.Expr]types.TypeAndValue),
-		Defs:       make(map[*ast.Ident]types.Object),
-		Uses:       make(map[*ast.Ident]types.Object),
-		Implicits:  make(map[ast.Node]types.Object),
-		Selections: make(map[*ast.SelectorExpr]*types.Selection),
-	}
+// 	// Optional: Pass an empty Info struct to trigger full type resolution
+// 	info := &types.Info{
+// 		Types:      make(map[ast.Expr]types.TypeAndValue),
+// 		Defs:       make(map[*ast.Ident]types.Object),
+// 		Uses:       make(map[*ast.Ident]types.Object),
+// 		Implicits:  make(map[ast.Node]types.Object),
+// 		Selections: make(map[*ast.SelectorExpr]*types.Selection),
+// 	}
 
-	// 4. Run type checker on the AST
-	_, _ = conf.Check(pkgName, fset, []*ast.File{file}, info)
-	// Optional: Multi-file package type checking
-	/*
-		If your file references types or functions declared in another file in the same package,
-		go/types will report them as undefined if only a single file AST is passed.
-		To handle multi-file packages in your editor,
-		simply pass all parsed AST files in the same directory to conf.Check:
-		_, _ = conf.Check(pkgName, fset, []*ast.File{currentFileAST, otherFileAST1, otherFileAST2}, info)
-	*/
+// 	// 4. Run type checker on the AST
+// 	_, _ = conf.Check(pkgName, fset, []*ast.File{file}, info)
+// 	// Optional: Multi-file package type checking
+// 	/*
+// 		If your file references types or functions declared in another file in the same package,
+// 		go/types will report them as undefined if only a single file AST is passed.
+// 		To handle multi-file packages in your editor,
+// 		simply pass all parsed AST files in the same directory to conf.Check:
+// 		_, _ = conf.Check(pkgName, fset, []*ast.File{currentFileAST, otherFileAST1, otherFileAST2}, info)
+// 	*/
 
-	return errs
-}
+// 	return errs
+// }
 
 type SymbolPosition struct {
 	Name     string
@@ -1960,7 +1991,7 @@ func (e *Editor) jumpTo(target Location) {
 			log.Print(err)
 			return
 		}
-		e.debounceDiagnose()
+		e.diagnose()
 	}
 
 	// 2. Set cursor position
@@ -2091,7 +2122,6 @@ func (p *Palette) symbolItems(e *Editor, query string) []PaletteItem {
 					Row: sym.Line - 1,
 					Col: sym.Column - 1,
 				}
-				e.View().showCursorCenter()
 			},
 		})
 	}
@@ -2108,11 +2138,9 @@ func (p *Palette) commandItems(_ *Editor, query string) []PaletteItem {
 		// use readable name for cmd, easy to search
 		{"jump back", "ctrl+-", func(e *Editor) {
 			e.JumpBack()
-			e.View().showCursorCenter()
 		}},
 		{"jump forward", "ctrl+shift+-", func(e *Editor) {
 			e.JumpForward()
-			e.View().showCursorCenter()
 		}},
 		{"next buffer", "", func(e *Editor) {
 			e.NextBuffer()
@@ -2121,18 +2149,16 @@ func (p *Palette) commandItems(_ *Editor, query string) []PaletteItem {
 			e.PrevBuffer()
 		}},
 		{"LSP: check", "", func(e *Editor) {
-			diags, err := CheckFile(e.Buf().Path)
-			if err != nil {
-				e.message = err.Error()
-				return
-			}
-			e.diags = diags
+			e.diagnose()
 		}},
 		{"LSP: find references", "", findReferences},
 		{"LSP: format file", "", func(e *Editor) { e.Buf().Format() }},
 		{"LSP: goto definition", "ctrl+g", GotoDefinition},
-		{"LSP: goto diagnostic", "ctrl+]", func(e *Editor) {
-			e.gotoDiagnostic()
+		{"LSP: next diagnostic", "ctrl+]", func(e *Editor) {
+			e.gotoNextDiag()
+		}},
+		{"LSP: prev diagnostic", "ctrl+]", func(e *Editor) {
+			e.gotoPrevDiag()
 		}},
 		{"LSP: goto symbol", "ctrl+r", func(e *Editor) {
 			e.palette.Open(e, "@")
@@ -2203,7 +2229,6 @@ func (p *Palette) lineItems(e *Editor, query string) []PaletteItem {
 			Action: func(ed *Editor) {
 				ed.recordJump()
 				ed.View().Cursor = Position{Row: targetRow, Col: 0}
-				ed.View().showCursorCenter()
 			},
 		},
 	}
@@ -2328,7 +2353,7 @@ func (p *Palette) fileItems(e *Editor, query string) []PaletteItem {
 					log.Print(err)
 					return
 				}
-				ed.debounceDiagnose()
+				ed.diagnose()
 			},
 		})
 
@@ -2711,10 +2736,9 @@ func (e *Editor) gotoLocation(l Location) {
 			e.message = err.Error()
 			return
 		}
-		e.debounceDiagnose()
+		e.diagnose()
 	}
 	e.View().Cursor = l.Pos
-	e.View().showCursorCenter()
 }
 
 // For example, run:

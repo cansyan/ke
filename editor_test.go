@@ -23,19 +23,6 @@ func TestDisplayColumn(t *testing.T) {
 	}
 }
 
-func TestCheckGoSemantics(t *testing.T) {
-	diagnostics := CheckSemantics("example.go", []byte("package main\n\nfunc main( {\n"))
-	if len(diagnostics) == 0 {
-		t.Fatal("CheckSemantics returned no diagnostic for invalid Go")
-	}
-	if diagnostics[0].Pos.Line != 3 {
-		t.Errorf("vet line = %d, want 3", diagnostics[0].Pos.Line)
-	}
-	if diagnostics[0].Msg == "" {
-		t.Error("vet message is empty")
-	}
-}
-
 func TestEnsureCursorVisible_WithTabs(t *testing.T) {
 	buf := NewBuffer("", []byte("\thello world"))
 	// Mock width = 10 (marker + line number + space leaves textW = 7)
