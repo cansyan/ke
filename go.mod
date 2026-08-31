@@ -1,6 +1,6 @@
 module github.com/cansyan/ke
 
-go 1.23
+go 1.23.3
 
 require (
 	github.com/cansyan/kero v0.0.0-20260830125653-eed5fc099128
