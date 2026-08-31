@@ -256,7 +256,7 @@ func TestWordUnderCursor(t *testing.T) {
 	if start == end {
 		t.Fatalf("wordAt(%+v, %+v) returned empty range", v.Cursor.Row, v.Cursor.Col)
 	}
-	word := v.Buf.GetRange(start, end)
+	word := v.Buf.TextRange(start, end)
 	if word != "finishCommand" {
 		t.Fatalf("wordAt(%+v, %+v) = %q, want %q", v.Cursor.Row, v.Cursor.Col, word, "finishCommand")
 	}

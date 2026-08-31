@@ -70,7 +70,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	e.View().Cursor = e.Buf().ClampPos(Position{Row: row, Col: col})
+	e.View().Cursor = e.Buf().Clamp(Position{Row: row, Col: col})
 
 	f, err := os.OpenFile("/tmp/ke.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
@@ -383,7 +383,7 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 		switch key.String() {
 		case "ctrl+n":
 			start, end := buf.WordBounds(buf.PrevRunePos(v.Cursor))
-			word := buf.GetRange(start, end)
+			word := buf.TextRange(start, end)
 			c := &e.completion
 			c.Refresh(buf.NewReader(), word)
 			if len(c.Items) == 1 {
@@ -496,7 +496,7 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 		e.markDirty()
 		if e.completion.Active {
 			start, end := buf.WordBounds(buf.PrevRunePos(v.Cursor))
-			word := buf.GetRange(start, end)
+			word := buf.TextRange(start, end)
 			e.completion.Refresh(buf.NewReader(), word)
 			completing = len(e.completion.Items) > 0
 		}
@@ -702,11 +702,11 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 	case kero.KeyPgUp:
 		e.recordJump()
 		v.Cursor.Row -= v.Height
-		v.Cursor = buf.ClampPos(v.Cursor)
+		v.Cursor = buf.Clamp(v.Cursor)
 	case kero.KeyPgDown:
 		e.recordJump()
 		v.Cursor.Row += v.Height
-		v.Cursor = buf.ClampPos(v.Cursor)
+		v.Cursor = buf.Clamp(v.Cursor)
 	case kero.KeyEsc:
 		if e.completion.Active {
 			e.completion.Active = false
@@ -986,7 +986,7 @@ func (e *Editor) clearSelect() {
 
 func (e *Editor) copy() {
 	if e.hasSelect() {
-		e.clipboard = e.Buf().GetRange(e.View().SelAnchor, e.View().Cursor)
+		e.clipboard = e.Buf().TextRange(e.View().SelAnchor, e.View().Cursor)
 		e.clipIsLine = false
 		return
 	}
@@ -1090,7 +1090,7 @@ func (e *Editor) cut() {
 	}
 	// cut current line
 	p1 := Position{Row: e.View().Cursor.Row}
-	e.clipboard = e.Buf().GetRange(p1, e.Buf().LineEnd(e.View().Cursor))
+	e.clipboard = e.Buf().TextRange(p1, e.Buf().LineEnd(e.View().Cursor))
 	e.clipIsLine = true
 	e.View().Cursor = e.Buf().Delete(p1, Position{Row: e.View().Cursor.Row + 1})
 	e.markDirty()
@@ -1219,7 +1219,7 @@ func (e *Editor) startFind() {
 	e.findBlur = false
 	e.replacing = false
 	if e.hasSelect() {
-		e.findInput.SetTextAndSelectAll(e.Buf().GetRange(e.View().SelAnchor, e.View().Cursor))
+		e.findInput.SetTextAndSelectAll(e.Buf().TextRange(e.View().SelAnchor, e.View().Cursor))
 		return
 	}
 	if e.findInput.String() != "" {
@@ -1550,7 +1550,7 @@ func (e *Editor) gotoDiagnostic() {
 
 	dRow := err.Pos.Line - 1
 	dCol := err.Pos.Column - 1
-	v.Cursor = v.Buf.ClampPos(Position{Row: dRow, Col: dCol})
+	v.Cursor = v.Buf.Clamp(Position{Row: dRow, Col: dCol})
 	v.showCursorCenter()
 }
 
@@ -1965,7 +1965,7 @@ func (e *Editor) jumpTo(target Location) {
 
 	// 2. Set cursor position
 	if target.Pos.Row >= 0 && target.Pos.Row < len(e.Buf().Lines) {
-		e.View().Cursor = e.Buf().ClampPos(target.Pos)
+		e.View().Cursor = e.Buf().Clamp(target.Pos)
 	}
 }
 
@@ -2486,7 +2486,7 @@ func (e *Editor) drawCompletion(f *kero.Frame) {
 func (e *Editor) startRename() {
 	e.renaming = true
 	start, end := e.Buf().WordBounds(e.View().Cursor)
-	symbol := e.Buf().GetRange(start, end)
+	symbol := e.Buf().TextRange(start, end)
 	e.renameInput.SetTextAndSelectAll(symbol)
 }
 
@@ -2540,7 +2540,7 @@ func (e *Editor) updateRename(ev kero.KeyEvent) {
 					continue
 				}
 				newView := &View{Buf: newBuf}
-				newView.Cursor = newBuf.ClampPos(v.Cursor)
+				newView.Cursor = newBuf.Clamp(v.Cursor)
 				newView.ScrollRow = v.ScrollRow
 				newView.ScrollCol = v.ScrollCol
 				e.views[j] = newView
@@ -2767,7 +2767,7 @@ func findReferences(e *Editor) {
 		locations = append(locations, p)
 	}
 	start, end := e.Buf().WordBounds(e.View().Cursor)
-	header := fmt.Sprintf("%d references for %q", len(locations), e.Buf().GetRange(start, end))
+	header := fmt.Sprintf("%d references for %q", len(locations), e.Buf().TextRange(start, end))
 	e.ref = NewReferencesPanel(header, locations)
 }
 

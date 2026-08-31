@@ -118,8 +118,8 @@ func orderPos(p1, p2 Position) (start, end Position) {
 	return p2, p1
 }
 
-// ClampPos ensures p falls within valid buffer bounds.
-func (b *Buffer) ClampPos(p Position) Position {
+// Clamp ensures p falls within valid buffer bounds.
+func (b *Buffer) Clamp(p Position) Position {
 	if len(b.Lines) == 0 {
 		return Position{Row: 0, Col: 0}
 	}
@@ -144,10 +144,9 @@ func (b *Buffer) ClampPos(p Position) Position {
 	return Position{Row: row, Col: col}
 }
 
-// GetRange extracts the text between two positions (inclusive start, exclusive end).
-// TODO
-func (b *Buffer) GetRange(p1, p2 Position) string {
-	start, end := orderPos(b.ClampPos(p1), b.ClampPos(p2))
+// TextRange extracts the text between two positions [p1, p2).
+func (b *Buffer) TextRange(p1, p2 Position) string {
+	start, end := orderPos(b.Clamp(p1), b.Clamp(p2))
 
 	if start == end {
 		return ""
@@ -162,24 +161,24 @@ func (b *Buffer) GetRange(p1, p2 Position) string {
 	var sb strings.Builder
 
 	// First line fragment
-	sb.WriteString(string(b.Lines[start.Row][start.Col:]))
-	sb.WriteRune('\n')
+	sb.Write(b.Lines[start.Row][start.Col:])
+	sb.WriteByte('\n')
 
 	// Intermediate full lines
 	for l := start.Row + 1; l < end.Row; l++ {
-		sb.WriteString(string(b.Lines[l]))
-		sb.WriteRune('\n')
+		sb.Write(b.Lines[l])
+		sb.WriteByte('\n')
 	}
 
 	// Final line fragment
-	sb.WriteString(string(b.Lines[end.Row][:end.Col]))
+	sb.Write(b.Lines[end.Row][:end.Col])
 
 	return sb.String()
 }
 
-// DeleteRange removes text between two positions [p1, p2) and returns the new cursor position.
+// Delete removes text between two positions [p1, p2) and returns the new cursor position.
 func (b *Buffer) Delete(p1, p2 Position) Position {
-	start, end := orderPos(b.ClampPos(p1), b.ClampPos(p2))
+	start, end := orderPos(b.Clamp(p1), b.Clamp(p2))
 	if start == end {
 		return start
 	}
@@ -202,7 +201,7 @@ func (b *Buffer) Delete(p1, p2 Position) Position {
 	return start
 }
 
-// WordBounds finds the start and end byte Positions of the word surrounding pos on its line.
+// WordBounds finds the start and end Positions of the word surrounding pos on its line.
 func (b *Buffer) WordBounds(p Position) (start, end Position) {
 	if p.Row < 0 || p.Row >= len(b.Lines) {
 		return p, p
@@ -296,24 +295,19 @@ func (b *Buffer) findNext(query string, from Position, ignoreCase bool) (start, 
 		// Determine byte offset to start searching within this line
 		searchFromCol := 0
 		var targetLine []byte
-		if i == 0 { // First line being searched: start from 'from.Col'
-			searchFromCol = from.Col
-			if searchFromCol < 0 {
-				searchFromCol = 0
-			}
-			if searchFromCol > len(line) {
-				searchFromCol = len(line)
-			}
+		if i == 0 {
+			// First line being searched: start from 'from.Col'
+			searchFromCol = min(max(from.Col, 0), len(line))
 			targetLine = line[searchFromCol:]
-			if ignoreCase {
-				targetLine = bytes.ToLower(targetLine)
-			}
 		} else if row == startRow {
-			// wrapped to the start line
+			// come back to beginning , search only before 'from.Col'
 			targetLine = line[searchFromCol:from.Col]
-			if ignoreCase {
-				targetLine = bytes.ToLower(targetLine)
-			}
+		} else {
+			targetLine = line
+		}
+
+		if ignoreCase {
+			targetLine = bytes.ToLower(targetLine)
 		}
 
 		// Perform fast byte search
@@ -375,32 +369,35 @@ func (b *Buffer) findPrev(query string, from Position, ignoreCase bool) (start, 
 	}
 
 	// Iterate backward through all lines starting at 'startRow', wrapping around
-	for i := 0; i < totalLines; i++ {
+	for i := range totalLines + 1 {
 		// Decrement row index with modulo wrapping
 		row := (startRow - i + totalLines) % totalLines
 		line := b.Lines[row]
 
 		// Determine upper bound column for searching within this line
+		searchFromCol := 0
 		searchToCol := len(line)
-		if i == 0 { // First line being searched: search only BEFORE 'from.Col'
-			searchToCol = from.Col
-			if searchToCol < 0 {
-				searchToCol = 0
-			}
-			if searchToCol > len(line) {
-				searchToCol = len(line)
-			}
+		var targetLine []byte
+		if i == 0 {
+			// First line being searched: search only BEFORE 'from.Col'
+			searchToCol = min(max(from.Col, 0), len(line))
+			targetLine = line[:searchToCol]
+		} else if row == startRow {
+			// come back to beginning , search only AFTER from.Col
+			targetLine = line[from.Col:]
+			searchFromCol = from.Col
+		} else {
+			targetLine = line
 		}
 
-		targetLine := line[:searchToCol]
 		if ignoreCase {
-			targetLine = []byte(strings.ToLower(string(targetLine)))
+			targetLine = bytes.ToLower(targetLine)
 		}
 
 		// Perform fast backward byte search
 		matchIdx := bytes.LastIndex(targetLine, queryBytes)
 		if matchIdx != -1 {
-			matchStartCol := matchIdx
+			matchStartCol := searchFromCol + matchIdx
 			matchEndCol := matchStartCol + queryLen
 
 			return Position{Row: row, Col: matchStartCol},
