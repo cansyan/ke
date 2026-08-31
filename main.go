@@ -114,7 +114,6 @@ type View struct {
 func (v *View) SetSize(width, height int) {
 	v.Width = width
 	v.Height = height
-	v.ShowCursorSmart()
 }
 
 // Editor implements kero.App interface
@@ -199,20 +198,16 @@ func (e *Editor) LastEvent() string {
 func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 	// refresh diagnostic as soon as possible
 	e.applyDiagnostic()
-	v := e.View()
-	if v.Width == 0 || v.Height == 0 {
-		_, textRect, _, _ := LayoutWindow(ctx.Width, ctx.Height, len(e.Buf().Lines))
-		v.SetSize(textRect.W, textRect.H)
-	}
 
 	switch ev := ev.(type) {
 	case kero.TickEvent:
 		return nil
 	case kero.ResizeEvent:
-		_, textRect, _, _ := LayoutWindow(ev.Width, ev.Height, len(e.Buf().Lines))
+		_, textRect, _, _, _ := LayoutWindow(ev.Width, ev.Height, len(e.Buf().Lines), e.ref.Active)
 		for _, v := range e.views {
 			v.SetSize(textRect.W, textRect.H)
 		}
+		return nil
 	case kero.PasteStartEvent:
 		e.pasting = true
 	case kero.PasteEndEvent:
@@ -240,36 +235,41 @@ func (e *Editor) mouseToPosition(m kero.MouseEvent, textRect kero.Rect) Position
 }
 
 func (e *Editor) handleMouse(ctx *kero.Context, m kero.MouseEvent) error {
-	_, textRect, _, _ := LayoutWindow(ctx.Width, ctx.Height, len(e.Buf().Lines))
+	_, textRect, refRect, _, _ := LayoutWindow(ctx.Width, ctx.Height, len(e.Buf().Lines), e.ref.Active)
 	paletteRect := LayoutPalatte(ctx.Width, ctx.Height, e.palette.VisibleRows()+1)
 	point := kero.Point{X: m.X, Y: m.Y}
 	switch m.Button {
 	case kero.MouseWheelUp:
-		if e.ref.Active {
+		p := e.palette
+		if p.Active && paletteRect.Contains(point) {
+			e.palette.Offset = max(0, p.Offset-1)
+			return nil
+		}
+
+		if e.ref.Active && refRect.Contains(point) {
 			e.ref.ScrollRow = max(0, e.ref.ScrollRow-1)
 			return nil
 		}
+
 		if textRect.Contains(point) {
-			p := e.palette
-			if p.Active && paletteRect.Contains(point) {
-				e.palette.Offset = max(0, p.Offset-1)
-				return nil
-			}
 			e.View().ScrollRow = max(0, e.View().ScrollRow-1)
 			return nil
 		}
 	case kero.MouseWheelDown:
-		if e.ref.Active {
+		p := e.palette
+		if p.Active && paletteRect.Contains(kero.Point{X: m.X, Y: m.Y}) {
+			e.palette.Offset = min(p.Offset+1, len(p.Items)-p.VisibleRows())
+			return nil
+		}
+
+		if e.ref.Active && refRect.Contains(point) {
 			e.ref.ScrollRow = min(e.ref.ScrollRow+1, len(e.ref.Items)-e.ref.VisibleRows())
 			return nil
 		}
+
 		if textRect.Contains(point) {
-			p := e.palette
-			if p.Active && paletteRect.Contains(kero.Point{X: m.X, Y: m.Y}) {
-				e.palette.Offset = min(p.Offset+1, len(p.Items)-p.VisibleRows())
-				return nil
-			}
 			e.View().ScrollRow = min(e.View().ScrollRow+1, len(e.Buf().Lines)-textRect.H)
+			log.Print(e.View().ScrollRow)
 			return nil
 		}
 	case kero.MouseLeft:
@@ -291,8 +291,8 @@ func (e *Editor) handleMouse(ctx *kero.Context, m kero.MouseEvent) error {
 			}
 
 			if e.ref.Active {
-				if rect := LayoutRefPanel(ctx.Width, ctx.Height); rect.Contains(point) {
-					index := m.Y - rect.Y - 1 + e.ref.ScrollRow // minus 1 for header
+				if refRect.Contains(point) {
+					index := m.Y - refRect.Y - 1 + e.ref.ScrollRow // minus 1 for header
 					if index < 0 || index >= len(e.ref.Items) {
 						return nil
 					}
@@ -349,7 +349,12 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 		return nil
 	}
 
-	defer e.View().ShowCursorSmart()
+	defer func() {
+		_, textRect, _, _, _ := LayoutWindow(ctx.Width, ctx.Height, len(e.Buf().Lines), e.ref.Active)
+		e.View().SetSize(textRect.W, textRect.H)
+		e.View().ShowCursorSmart()
+	}()
+
 	if e.saveAs {
 		return e.updateSaveAs(key)
 	}
@@ -731,16 +736,20 @@ func gutterWidth(lines int) int {
 }
 
 // LayoutWindow splits a total available screen Rect into component Rects.
-func LayoutWindow(totalWidth, totalHeight, lineCount int) (gutterRect, textRect, msgRect, statusRect kero.Rect) {
+func LayoutWindow(totalWidth, totalHeight, lineCount int, showBottomPanel bool) (gutterRect, textRect, bottomPanelRect, msgRect, statusRect kero.Rect) {
 	remaining := kero.Rect{W: totalWidth, H: totalHeight}
 
 	remaining, statusRect = kero.SplitHorizontal(remaining, remaining.H-1)
-	remaining, msgRect = kero.SplitHorizontal(remaining, remaining.H-1)
+	if !showBottomPanel {
+		remaining, msgRect = kero.SplitHorizontal(remaining, remaining.H-1)
+	} else {
+		remaining, bottomPanelRect = kero.SplitHorizontal(remaining, remaining.H-10)
+	}
 
 	gutterWidth := gutterWidth(lineCount)
 	gutterRect, textRect = kero.SplitVertical(remaining, gutterWidth)
 
-	return gutterRect, textRect, msgRect, statusRect
+	return gutterRect, textRect, bottomPanelRect, msgRect, statusRect
 }
 
 func LayoutPalatte(totalWidth, totalHeight, paletteHeight int) kero.Rect {
@@ -749,16 +758,6 @@ func LayoutPalatte(totalWidth, totalHeight, paletteHeight int) kero.Rect {
 		rect.X = totalWidth / 4
 		rect.W = totalWidth / 2
 	}
-	return rect
-}
-
-// calculate the rectangle for the references overlay panel
-func LayoutRefPanel(totalWidth, totalHeight int) kero.Rect {
-	header := 1
-	visibleRows := 10
-	rect := kero.Rect{X: 0, W: totalWidth, H: visibleRows + header}
-	statusBar := 1
-	rect.Y = totalHeight - statusBar - rect.H
 	return rect
 }
 
@@ -773,7 +772,7 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 
 	v := e.View()
 	fSize := f.Size()
-	gutterRect, textRect, msgRect, statusRect := LayoutWindow(fSize.Width, fSize.Height, len(v.Buf.Lines))
+	gutterRect, textRect, bottomPanelRect, msgRect, statusRect := LayoutWindow(fSize.Width, fSize.Height, len(v.Buf.Lines), e.ref.Active)
 
 	// 1. Draw Gutter Area
 	for i := range gutterRect.H {
@@ -933,8 +932,6 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 			e.drawFind(f, msgRect)
 		case e.renaming:
 			e.drawRename(f, msgRect)
-		case e.ref.Active:
-			e.drawReferences(f, LayoutRefPanel(fSize.Width, fSize.Height))
 		default:
 			if e.message == "" {
 				e.message = "^S save | ^W close | ^Q quit | ^F find | ^P palette"
@@ -944,6 +941,10 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 			}
 			f.Write(msgRect.X, msgRect.Y, trimToWidth(" "+e.message, ctx.Width), messageStyle)
 		}
+	}
+
+	if e.ref.Active {
+		e.drawReferences(f, bottomPanelRect)
 	}
 
 	if e.completion.Active {
@@ -1445,11 +1446,6 @@ func (v *View) moveDown() {
 func (e *Editor) markDirty() {
 	e.Buf().Dirty = true
 	e.message = ""
-}
-
-type diagResult struct {
-	version uint64
-	errs    scanner.ErrorList
 }
 
 // diagnose starts a goroutine to check file.
@@ -2169,7 +2165,9 @@ func (p *Palette) commandItems(_ *Editor, query string) []PaletteItem {
 			}
 			e.startRename()
 		}},
-		{"toggle reference", "", func(e *Editor) { e.ref.Active = !e.ref.Active }},
+		{"toggle reference", "", func(e *Editor) {
+			e.ref.Active = !e.ref.Active
+		}},
 		{"next reference", "ctrl+shift+]", func(e *Editor) {
 			if len(e.ref.Items) <= 1 {
 				return
@@ -2475,7 +2473,7 @@ func (e *Editor) drawCompletion(f *kero.Frame) {
 		return
 	}
 
-	_, textRect, _, _ := LayoutWindow(f.Size().Width, f.Size().Height, len(e.Buf().Lines))
+	_, textRect, _, _, _ := LayoutWindow(f.Size().Width, f.Size().Height, len(e.Buf().Lines), e.ref.Active)
 
 	c := e.completion
 	visibleRows := min(len(c.Items), 10)
@@ -2739,6 +2737,7 @@ func (e *Editor) gotoLocation(l Location) {
 		e.diagnose()
 	}
 	e.View().Cursor = l.Pos
+	e.View().ShowCursorSmart()
 }
 
 // For example, run:
