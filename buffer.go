@@ -3,15 +3,16 @@ package main
 import (
 	"bytes"
 	"io"
-	"log"
 	"os"
 	"path/filepath"
 	"regexp"
 	"slices"
+	"sort"
 	"strings"
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/cansyan/ke/lsp"
 	"github.com/mattn/go-runewidth"
 )
 
@@ -799,7 +800,6 @@ func BufferFromFile(path string) (*Buffer, error) {
 	if err != nil {
 		return nil, err
 	}
-	log.Printf("%s %d lines", path, len(lines))
 
 	// Guarantee at least one line exists in memory
 	if len(lines) == 0 {
@@ -810,4 +810,57 @@ func BufferFromFile(path string) (*Buffer, error) {
 		Path:  absPath,
 		Lines: lines,
 	}, nil
+}
+
+// ApplyTextEdits applies a slice of LSP TextEdits to a Buffer in-memory.
+func (b *Buffer) ApplyTextEdits(edits []lsp.TextEdit) {
+	if len(edits) == 0 {
+		return
+	}
+
+	// 1. Sort edits in reverse order (highest line/character first)
+	sort.Slice(edits, func(i, j int) bool {
+		r1 := edits[i].Range.Start
+		r2 := edits[j].Range.Start
+		if r1.Line != r2.Line {
+			return r1.Line > r2.Line
+		}
+		return r1.Character > r2.Character
+	})
+
+	// 2. Apply each edit from bottom to top
+	for _, edit := range edits {
+		b.applySingleEdit(edit)
+	}
+
+	b.Dirty = true
+}
+
+func (b *Buffer) applySingleEdit(edit lsp.TextEdit) {
+	startLine := edit.Range.Start.Line
+	endLine := edit.Range.End.Line
+
+	if startLine >= len(b.Lines) {
+		return
+	}
+
+	// Convert UTF-16 character offsets to byte offsets
+	startByte := LSPCharToByteOffset(b.Lines[startLine], edit.Range.Start.Character)
+
+	if endLine >= len(b.Lines) {
+		endLine = len(b.Lines) - 1
+	}
+	endByte := LSPCharToByteOffset(b.Lines[endLine], edit.Range.End.Character)
+
+	startPos := Position{
+		Row: startLine,
+		Col: startByte,
+	}
+	endPos := Position{
+		Row: endLine,
+		Col: endByte,
+	}
+
+	// Delegate range replacement directly to Buffer
+	b.ReplaceRange(startPos, endPos, edit.NewText)
 }

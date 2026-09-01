@@ -88,3 +88,27 @@ type ReferenceParams struct {
 	TextDocumentPositionParams
 	Context ReferenceContext `json:"context"`
 }
+
+// TextEdit represents a textual edit applicable to a text document.
+type TextEdit struct {
+	Range   Range  `json:"range"`
+	NewText string `json:"newText"`
+}
+
+// WorkspaceEdit represents changes to many resources managed in the workspace.
+type WorkspaceEdit struct {
+	// Changes maps file URIs to a slice of TextEdits
+	Changes         map[string][]TextEdit `json:"changes,omitempty"`
+	DocumentChanges []TextDocumentEdit    `json:"documentChanges,omitempty"`
+}
+
+type TextDocumentEdit struct {
+	TextDocument VersionedTextDocumentIdentifier `json:"textDocument"`
+	Edits        []TextEdit                      `json:"edits"`
+}
+
+// RenameParams parameters for textDocument/rename request.
+type RenameParams struct {
+	TextDocumentPositionParams
+	NewName string `json:"newName"`
+}

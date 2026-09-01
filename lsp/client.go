@@ -341,3 +341,45 @@ func (c *Client) FindReferences(uri string, line, char int, includeDecl bool) ([
 		return nil, fmt.Errorf("find references request timed out")
 	}
 }
+
+func (c *Client) Rename(uri string, line, char int, newName string) (*WorkspaceEdit, error) {
+	params := RenameParams{
+		TextDocumentPositionParams: TextDocumentPositionParams{
+			TextDocument: TextDocumentIdentifier{URI: uri},
+			Position:     Position{Line: line, Character: char},
+		},
+		NewName: newName,
+	}
+
+	respChan := make(chan []byte, 1)
+	id := c.SendRequest("textDocument/rename", params)
+
+	c.pendingMu.Lock()
+	if c.pending == nil {
+		c.pending = make(map[int64]chan []byte)
+	}
+	c.pending[id] = respChan
+	c.pendingMu.Unlock()
+
+	defer func() {
+		c.pendingMu.Lock()
+		delete(c.pending, id)
+		c.pendingMu.Unlock()
+	}()
+
+	select {
+	case data := <-respChan:
+		if len(data) == 0 || string(data) == "null" {
+			return nil, nil // No edits returned or invalid symbol
+		}
+
+		var edit WorkspaceEdit
+		if err := json.Unmarshal(data, &edit); err != nil {
+			return nil, fmt.Errorf("failed to parse rename workspace edit: %w", err)
+		}
+		return &edit, nil
+
+	case <-time.After(5 * time.Second):
+		return nil, fmt.Errorf("rename request timed out")
+	}
+}

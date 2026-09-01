@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"bytes"
-	"context"
 	"fmt"
 	"go/ast"
 	"go/format"
@@ -13,7 +12,6 @@ import (
 	"log"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -37,7 +35,6 @@ func parsePathArg(arg string) (path string, row, col int) {
 		return arg, 0, 0
 	}
 
-	fmt.Print(1)
 	path = parts[0]
 	if len(parts) > 1 {
 		var errRow error
@@ -370,7 +367,8 @@ func (e *Editor) handleMouse(ctx *kero.Context, m kero.MouseEvent) error {
 						return nil
 					}
 					e.ref.Index = index
-					e.Goto(e.ref.Items[index])
+					loc := e.ref.Items[index]
+					e.Goto(loc.Path, loc.Row, loc.Col)
 					return nil
 				}
 			}
@@ -501,12 +499,14 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 			if len(e.ref.Items) <= 1 {
 				return nil
 			}
-			e.Goto(e.ref.Next())
+			loc := e.ref.Next()
+			e.Goto(loc.Path, loc.Row, loc.Col)
 		case "ctrl+shift+[", "ctrl+{":
 			if len(e.ref.Items) <= 1 {
 				return nil
 			}
-			e.Goto(e.ref.Prev())
+			loc := e.ref.Prev()
+			e.Goto(loc.Path, loc.Row, loc.Col)
 		case "ctrl+s":
 			if err := e.SaveFile(); err != nil {
 				e.message = err.Error()
@@ -1568,12 +1568,9 @@ func (e *Editor) markDirty() {
 }
 
 // Goto records jump history before navigating.
-func (e *Editor) Goto(l Location) {
+func (e *Editor) Goto(path string, row, col int) error {
 	e.recordJump()
-	if err := e.jumpTo(l); err != nil {
-		log.Print(err)
-		e.message = err.Error()
-	}
+	return e.jumpTo(Location{Path: path, Row: row, Col: col})
 }
 
 func (e *Editor) GotoPrevDiag() {
@@ -1600,7 +1597,7 @@ func (e *Editor) GotoPrevDiag() {
 	}
 	dRow := prev.Range.Start.Line
 	dCol := LSPCharToByteOffset(v.Buf.Lines[dRow], prev.Range.Start.Character)
-	e.Goto(Location{Path: v.Buf.Path, Pos: Position{Row: dRow, Col: dCol}})
+	e.Goto(v.Buf.Path, dRow, dCol)
 }
 
 func (e *Editor) GotoNextDiag() {
@@ -1627,7 +1624,7 @@ func (e *Editor) GotoNextDiag() {
 	}
 	dRow := next.Range.Start.Line
 	dCol := LSPCharToByteOffset(v.Buf.Lines[dRow], next.Range.Start.Character)
-	e.Goto(Location{Path: v.Buf.Path, Pos: Position{Row: dRow, Col: dCol}})
+	e.Goto(v.Buf.Path, dRow, dCol)
 }
 
 func isGoFile(path string) bool {
@@ -1934,6 +1931,7 @@ func formatReceiver(expr ast.Expr) string {
 }
 
 // OpenFile loads a file into memory or focuses it if already loaded.
+// TODO: consider return a Buffer pointer for further operations
 func (e *Editor) OpenFile(path string) error {
 	if path != "" {
 		absPath, err := filepath.Abs(path)
@@ -2033,7 +2031,7 @@ func (j *JumpList) Push(path string, pos Position) {
 	if len(j.items) > 0 && j.index >= 0 && j.index < len(j.items) {
 		curr := j.items[j.index]
 		// Avoid pushing duplicate positions in the same file
-		if curr.Path == path && curr.Pos == pos {
+		if curr.Path == path && curr.Row == pos.Row && curr.Col == pos.Col {
 			return
 		}
 	}
@@ -2043,7 +2041,7 @@ func (j *JumpList) Push(path string, pos Position) {
 		j.items = j.items[:j.index+1]
 	}
 
-	j.items = append(j.items, Location{Path: path, Pos: pos})
+	j.items = append(j.items, Location{Path: path, Row: pos.Row, Col: pos.Col})
 	if len(j.items) > maxJumps {
 		j.items = j.items[1:]
 	}
@@ -2111,7 +2109,7 @@ func (e *Editor) jumpTo(target Location) error {
 	}
 
 	// 2. Safely clamp position to valid buffer bounds
-	v.Cursor = buf.Clamp(target.Pos)
+	v.Cursor = buf.Clamp(Position{Row: target.Row, Col: target.Col})
 
 	// 3. Clear active selection on jump to prevent state leakage
 	v.Selecting = false
@@ -2307,13 +2305,15 @@ func (p *Palette) commandItems(_ *Editor, query string) []PaletteItem {
 			if len(e.ref.Items) <= 1 {
 				return
 			}
-			e.Goto(e.ref.Next())
+			loc := e.ref.Next()
+			e.Goto(loc.Path, loc.Row, loc.Col)
 		}},
 		{"prev reference", "ctrl+shift+[", func(e *Editor) {
 			if len(e.ref.Items) <= 1 {
 				return
 			}
-			e.Goto(e.ref.Prev())
+			loc := e.ref.Prev()
+			e.Goto(loc.Path, loc.Row, loc.Col)
 		}},
 	}
 
@@ -2653,56 +2653,10 @@ func (e *Editor) updateRename(ev kero.KeyEvent) {
 		e.renaming = false
 	case kero.KeyEnter:
 		newName := e.renameInput.String()
-		// try save
-		if e.Buf().Dirty {
-			if err := e.Buf().SaveFile(); err != nil {
-				log.Print(err)
-				e.message = err.Error()
-				return
-			}
-		}
-
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		/*
-			For example run:
-				gopls rename -w -l main.go:1639:6 NewBufferX
-			Output:
-				/Users/aha/code/ke/editor_test.go
-				/Users/aha/code/ke/buffer_test.go
-				/Users/aha/code/ke/main.go
-		*/
-		now := time.Now()
-		cmd := exec.CommandContext(ctx, "gopls", "rename", "-w", "-l", fmt.Sprintf("%s:%d:%d",
-			e.Buf().Path, e.View().Cursor.Row+1, e.View().Cursor.Col+1), newName)
-		out, err := cmd.CombinedOutput()
+		err := e.Rename(newName)
 		if err != nil {
 			log.Print(err)
 			e.message = err.Error()
-			return
-		}
-		log.Printf("run %q in %.1fs:\n%s", cmd, time.Since(now).Seconds(), string(out))
-
-		// reload buffer
-		editedFiles := strings.Split(string(out), "\n")
-		for i := range editedFiles {
-			for j := range e.views {
-				v := e.views[j]
-				if v.Buf.Path != editedFiles[i] {
-					continue
-				}
-				newBuf, err := BufferFromFile(editedFiles[i])
-				if err != nil {
-					log.Print(err)
-					continue
-				}
-				newView := &View{Buf: newBuf}
-				newView.Cursor = newBuf.Clamp(v.Cursor)
-				newView.ScrollRow = v.ScrollRow
-				newView.ScrollCol = v.ScrollCol
-				e.views[j] = newView
-				break
-			}
 		}
 		e.renaming = false
 	default:
@@ -2752,11 +2706,10 @@ func (e *Editor) GotoDefinition() error {
 
 	// Jump to the first resolved location
 	target := locs[0]
-	targetPath := uriToPath(target.URI)
-	e.Goto(Location{Path: targetPath, Pos: Position{
-		Row: target.Range.Start.Line,
-		Col: LSPCharToByteOffset(buf.Lines[target.Range.Start.Line], target.Range.Start.Character),
-	}})
+	path := uriToPath(target.URI)
+	row := target.Range.Start.Line
+	col := LSPCharToByteOffset(buf.Lines[row], target.Range.Start.Character)
+	e.Goto(path, row, col)
 	return nil
 }
 
@@ -2827,7 +2780,8 @@ func (r *ReferencesPanel) Prev() Location {
 // It is used for jump history, references, and other navigation features.
 type Location struct {
 	Path string
-	Pos  Position
+	Row  int // line index (0-based)
+	Col  int // byte offset within line (0-based)
 }
 
 func (e *Editor) FindReferences() error {
@@ -2864,11 +2818,9 @@ func (e *Editor) FindReferences() error {
 	for _, l := range locs {
 		locations = append(locations, Location{
 			Path: uriToPath(l.URI),
-			Pos: Position{
-				Row: l.Range.Start.Line,
-				Col: LSPCharToByteOffset(buf.Lines[l.Range.Start.Line], l.Range.Start.Character),
-			}},
-		)
+			Row:  l.Range.Start.Line,
+			Col:  LSPCharToByteOffset(buf.Lines[l.Range.Start.Line], l.Range.Start.Character),
+		})
 	}
 	start, end := buf.WordBounds(e.View().Cursor)
 	header := fmt.Sprintf("%d references for %q", len(locations), buf.TextRange(start, end))
@@ -2927,9 +2879,9 @@ func (e *Editor) drawReferences(f *kero.Frame, rect kero.Rect) {
 			continue
 		}
 
-		line := string(buf.Lines[item.Pos.Row])
-		text := fmt.Sprintf("%s %s:%d:%d: %s", indicator, filepath.Base(item.Path), item.Pos.Row+1,
-			item.Pos.Col+1, line)
+		line := string(buf.Lines[item.Row])
+		text := fmt.Sprintf("%s %s:%d:%d: %s", indicator, filepath.Base(item.Path), item.Row+1,
+			item.Col+1, line)
 		runes := []rune(text)
 
 		if len(runes) > rect.W {
@@ -2994,9 +2946,9 @@ func (e *Editor) handleDiagnostics(uri string, diags []lsp.Diagnostic) {
 	e.diagnostics[filePath] = diags
 	e.mu.Unlock()
 
-	for _, d := range diags {
-		log.Printf("%s:%d severity:%d %s", filePath, d.Range.Start.Line, d.Severity, d.Message)
-	}
+	// for _, d := range diags {
+	// 	log.Printf("%s:%d severity:%d %s", filePath, d.Range.Start.Line, d.Severity, d.Message)
+	// }
 }
 
 // StartDebouncer launches the background worker goroutine.
@@ -3351,24 +3303,101 @@ func (b *Buffer) Format() (bool, error) {
 	return true, nil
 }
 
-// SaveFile writes the lines back to disk.
-// TODO: deprecated
-func (b *Buffer) SaveFile() error {
-	f, err := os.Create(b.Path)
+func (e *Editor) Rename(newName string) error {
+	v := e.View()
+	if v == nil || v.Buf == nil || e.lspClient == nil || newName == "" {
+		return nil
+	}
+
+	buf := v.Buf
+	cursor := v.Cursor
+
+	if cursor.Row >= len(buf.Lines) {
+		return nil
+	}
+
+	lspChar := ByteOffsetToLSPChar(buf.Lines[cursor.Row], cursor.Col)
+	uri := pathToURI(buf.Path)
+
+	e.message = "Renaming symbol..."
+
+	// Request workspace edits from gopls
+	workspaceEdit, err := e.lspClient.Rename(uri, cursor.Row, lspChar, newName)
 	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	// Stream directly to disk using a buffered writer
-	w := bufio.NewWriter(f)
-	if _, err := io.Copy(w, b.NewReader()); err != nil {
+		log.Print(err)
+		e.message = "Rename failed: " + err.Error()
 		return err
 	}
 
-	if err := w.Flush(); err != nil {
+	if workspaceEdit == nil || (len(workspaceEdit.Changes) == 0 && len(workspaceEdit.DocumentChanges) == 0) {
+		e.message = "No symbol found to rename"
+		return nil
+	}
+
+	// Normalizing changes from both WorkspaceEdit representations
+	editsPerFile := make(map[string][]lsp.TextEdit)
+
+	// 1. Direct changes map
+	for uri, edits := range workspaceEdit.Changes {
+		editsPerFile[uri] = append(editsPerFile[uri], edits...)
+	}
+
+	// 2. DocumentChanges array (preferred by modern gopls)
+	for _, docEdit := range workspaceEdit.DocumentChanges {
+		uri := docEdit.TextDocument.URI
+		editsPerFile[uri] = append(editsPerFile[uri], docEdit.Edits...)
+	}
+
+	totalEdits := 0
+	affectedFiles := 0
+
+	// Apply edits across all files returned by gopls
+	for fileURI, edits := range editsPerFile {
+		filePath := uriToPath(fileURI)
+		// TODO: load buffer
+		err := e.OpenFile(filePath)
+		if err != nil {
+			continue
+		}
+		targetBuf := e.Buf()
+
+		// Apply edits in-memory
+		targetBuf.ApplyTextEdits(edits)
+
+		// Notify LSP server of changed buffer content
+		e.NotifyBufferChanged(targetBuf)
+
+		totalEdits += len(edits)
+		affectedFiles++
+
+		// TODO: consider to clamp the cursor, save the file after applying edits
+	}
+
+	// Clamp current view cursor in case active line shrank
+	v.Cursor = buf.Clamp(v.Cursor)
+
+	// come back to the original buffer after renaming
+	if err := e.OpenFile(buf.Path); err != nil {
 		return err
 	}
-	b.Dirty = false
+
+	e.message = fmt.Sprintf("Renamed symbol: applied %d edits across %d file(s)", totalEdits, affectedFiles)
 	return nil
 }
+
+// Helper: Fetch buffer from active editor memory, or load file if unopened
+// func (e *Editor) getOrLoadBuffer(filePath string) *Buffer {
+// 	for _, b := range e.buffers {
+// 		if b.Path == filePath {
+// 			return b
+// 		}
+// 	}
+// 	// Load unopened file into memory buffer so edits apply seamlessly
+// 	b, err := NewBuffer(filePath)
+// 	if err != nil {
+// 		return nil
+// 	}
+// 	e.buffers = append(e.buffers, b)
+// 	e.NotifyBufferOpened(b)
+// 	return b
+// }
