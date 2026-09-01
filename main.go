@@ -372,7 +372,7 @@ func (e *Editor) handleMouse(ctx *kero.Context, m kero.MouseEvent) error {
 						return nil
 					}
 					e.ref.Index = index
-					e.gotoLocation(e.ref.Items[index])
+					e.Goto(e.ref.Items[index])
 					return nil
 				}
 			}
@@ -503,12 +503,12 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 			if len(e.ref.Items) <= 1 {
 				return nil
 			}
-			e.gotoLocation(e.ref.Next())
+			e.Goto(e.ref.Next())
 		case "ctrl+shift+[", "ctrl+{":
 			if len(e.ref.Items) <= 1 {
 				return nil
 			}
-			e.gotoLocation(e.ref.Prev())
+			e.Goto(e.ref.Prev())
 		case "ctrl+s":
 			if err := e.SaveFile(); err != nil {
 				e.message = err.Error()
@@ -1593,7 +1593,7 @@ func (e *Editor) gotoPrevDiag() {
 	}
 	dRow := prev.Range.Start.Line
 	dCol := LSPCharToByteOffset(v.Buf.Lines[dRow], prev.Range.Start.Character)
-	e.gotoLocation(Location{Path: v.Buf.Path, Pos: Position{Row: dRow, Col: dCol}})
+	e.Goto(Location{Path: v.Buf.Path, Pos: Position{Row: dRow, Col: dCol}})
 }
 
 func (e *Editor) gotoNextDiag() {
@@ -1620,7 +1620,7 @@ func (e *Editor) gotoNextDiag() {
 	}
 	dRow := next.Range.Start.Line
 	dCol := LSPCharToByteOffset(v.Buf.Lines[dRow], next.Range.Start.Character)
-	e.gotoLocation(Location{Path: v.Buf.Path, Pos: Position{Row: dRow, Col: dCol}})
+	e.Goto(Location{Path: v.Buf.Path, Pos: Position{Row: dRow, Col: dCol}})
 }
 
 func isGoFile(path string) bool {
@@ -2082,22 +2082,37 @@ func (e *Editor) recordJump() {
 	e.jumps.Push(e.Buf().Path, e.View().Cursor)
 }
 
-// jumpTo restores a recorded location, switching buffers if necessary.
-func (e *Editor) jumpTo(target Location) {
-	// 1. Switch buffer if the target is in a different file
-	if target.Path != "" && target.Path != e.Buf().Path {
-		err := e.OpenFile(target.Path)
-		if err != nil {
-			log.Print(err)
-			return
-		}
-		// e.diagnose()
+// jumpTo handles the core logic of switching buffers, updating cursor,
+// clamping positions, and updating the viewport.
+// It is used by JumpBack and JumpForward.
+func (e *Editor) jumpTo(target Location) error {
+	v := e.View()
+	if v == nil {
+		return nil
 	}
 
-	// 2. Set cursor position
-	if target.Pos.Row >= 0 && target.Pos.Row < len(e.Buf().Lines) {
-		e.View().Cursor = e.Buf().Clamp(target.Pos)
+	// 1. Switch buffer if needed (normalize paths in production if necessary)
+	if target.Path != "" && target.Path != e.Buf().Path {
+		if err := e.OpenFile(target.Path); err != nil {
+			return err
+		}
 	}
+
+	buf := e.Buf()
+	if buf == nil {
+		return nil
+	}
+
+	// 2. Safely clamp position to valid buffer bounds
+	v.Cursor = buf.Clamp(target.Pos)
+
+	// 3. Clear active selection on jump to prevent state leakage
+	v.Selecting = false
+
+	// 4. Ensure view updates to show new cursor position
+	v.ShowCursorSmart()
+
+	return nil
 }
 
 // JumpBack moves to the previous position in jump history.
@@ -2106,7 +2121,10 @@ func (e *Editor) JumpBack() {
 		return
 	}
 	if target, ok := e.jumps.Back(e.Buf().Path, e.View().Cursor); ok {
-		e.jumpTo(target)
+		if err := e.jumpTo(target); err != nil {
+			log.Print(err)
+			e.message = err.Error()
+		}
 	}
 }
 
@@ -2116,7 +2134,10 @@ func (e *Editor) JumpForward() {
 		return
 	}
 	if target, ok := e.jumps.Forward(); ok {
-		e.jumpTo(target)
+		if err := e.jumpTo(target); err != nil {
+			log.Print(err)
+			e.message = err.Error()
+		}
 	}
 }
 
@@ -2277,13 +2298,13 @@ func (p *Palette) commandItems(_ *Editor, query string) []PaletteItem {
 			if len(e.ref.Items) <= 1 {
 				return
 			}
-			e.gotoLocation(e.ref.Next())
+			e.Goto(e.ref.Next())
 		}},
 		{"prev reference", "ctrl+shift+[", func(e *Editor) {
 			if len(e.ref.Items) <= 1 {
 				return
 			}
-			e.gotoLocation(e.ref.Prev())
+			e.Goto(e.ref.Prev())
 		}},
 	}
 
@@ -2723,7 +2744,7 @@ func (e *Editor) GotoDefinition() error {
 	// Jump to the first resolved location
 	target := locs[0]
 	targetPath := uriToPath(target.URI)
-	e.gotoLocation(Location{Path: targetPath, Pos: Position{
+	e.Goto(Location{Path: targetPath, Pos: Position{
 		Row: target.Range.Start.Line,
 		Col: LSPCharToByteOffset(buf.Lines[target.Range.Start.Line], target.Range.Start.Character),
 	}})
@@ -2830,19 +2851,13 @@ func ParseLocation(s string) (Location, error) {
 	return loc, nil
 }
 
-// record current position before going to the location
-func (e *Editor) gotoLocation(l Location) {
+// Goto records jump history before navigating.
+func (e *Editor) Goto(l Location) {
 	e.recordJump()
-	if e.Buf().Path != l.Path {
-		err := e.OpenFile(l.Path)
-		if err != nil {
-			log.Print(err)
-			e.message = err.Error()
-			return
-		}
+	if err := e.jumpTo(l); err != nil {
+		log.Print(err)
+		e.message = err.Error()
 	}
-	e.View().Cursor = l.Pos
-	e.View().ShowCursorSmart()
 }
 
 // For example, run:
