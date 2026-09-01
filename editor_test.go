@@ -25,18 +25,20 @@ func TestDisplayColumn(t *testing.T) {
 
 func TestEnsureCursorVisible_WithTabs(t *testing.T) {
 	buf := NewBuffer("", []byte("\thello world"))
-	// Mock width = 10 (marker + line number + space leaves textW = 7)
-	v := &View{Buf: buf, Width: 10, Height: 10, Cursor: Position{Row: 0, Col: 0}}
+	// Mock total width = 10, marker + line number + space leaves view.Width = 7
+	v := &View{Buf: buf, Width: 7, Height: 10, Cursor: Position{Row: 0, Col: 0}}
 
 	v.showCursorCenter()
 	if v.ScrollCol != 0 {
 		t.Fatalf("expected colOffset = 0, got %d", v.ScrollCol)
 	}
 
-	// Move cursor to 'w' in "world" (rune index 7: '\t', h, e, l, l, o, ' ') -> display column 4 + 6 = 10
+	// Move cursor to 'w' in "world" (byte offset 7: '\t', h, e, l, l, o, ' ')
 	v.Cursor.Col = 7
+	// display column 4 + 6 = 10
+	vCol := v.Buf.ByteToVisualCol(v.Cursor, 4)
 	v.showCursorCenter()
-	if v.ScrollCol != 5 {
+	if v.ScrollCol != vCol-v.Width+1 {
 		t.Fatalf("expected colOffset = 4, got %d", v.ScrollCol)
 	}
 

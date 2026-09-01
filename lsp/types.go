@@ -30,10 +30,10 @@ type TextDocumentContentChangeEvent struct {
 	Text string `json:"text"`
 }
 
-type PublishDiagnosticsParams struct {
-	URI         string       `json:"uri"`
-	Diagnostics []Diagnostic `json:"diagnostics"`
-}
+// type PublishDiagnosticsParams struct {
+// 	URI         string       `json:"uri"`
+// 	Diagnostics []Diagnostic `json:"diagnostics"`
+// }
 
 type DidSaveTextDocumentParams struct {
 	TextDocument TextDocumentIdentifier `json:"textDocument"`
@@ -50,11 +50,11 @@ const (
 	DiagnosticSeverityHint    = 4
 )
 
-type Diagnostic struct {
-	Range    Range  `json:"range"`
-	Severity int    `json:"severity,omitempty"` // 1: Error, 2: Warning, 3: Info, 4: Hint
-	Message  string `json:"message"`
-}
+// type Diagnostic struct {
+// 	Range    Range  `json:"range"`
+// 	Severity int    `json:"severity,omitempty"` // 1: Error, 2: Warning, 3: Info, 4: Hint
+// 	Message  string `json:"message"`
+// }
 
 type Range struct {
 	Start Position `json:"start"`
@@ -64,4 +64,16 @@ type Range struct {
 type Position struct {
 	Line      int `json:"line"`      // 0-based
 	Character int `json:"character"` // 0-based UTF-16 code units
+}
+
+// TextDocumentPositionParams contains parameters for location-based requests
+type TextDocumentPositionParams struct {
+	TextDocument TextDocumentIdentifier `json:"textDocument"`
+	Position     Position               `json:"position"` // 0-based Line, Character
+}
+
+// Location represents a location inside a resource, such as a line inside a text file.
+type Location struct {
+	URI   string `json:"uri"`
+	Range Range  `json:"range"`
 }

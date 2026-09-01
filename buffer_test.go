@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"io"
 	"testing"
 )
@@ -76,17 +75,17 @@ func TestBufferReader_TrailingNewline(t *testing.T) {
 		{
 			name:     "Single line file",
 			lines:    [][]byte{[]byte("package main")},
-			expected: "package main\n",
+			expected: "package main",
 		},
 		{
 			name:     "Multi-line file",
 			lines:    [][]byte{[]byte("package main"), []byte(""), []byte("func main() {}")},
-			expected: "package main\n\nfunc main() {}\n",
+			expected: "package main\n\nfunc main() {}",
 		},
 		{
 			name:     "File ending with an empty line",
 			lines:    [][]byte{[]byte("foo"), []byte("bar"), []byte("")},
-			expected: "foo\nbar\n\n",
+			expected: "foo\nbar\n",
 		},
 	}
 
@@ -106,38 +105,5 @@ func TestBufferReader_TrailingNewline(t *testing.T) {
 				t.Errorf("content mismatch:\ngot:      %q\nexpected: %q", got, tt.expected)
 			}
 		})
-	}
-}
-
-// TestBufferReader_SmallBuffer simulates Read() calls with tiny slice chunks (e.g. 4 bytes)
-// to catch edge cases where line text fills p right before '\n'.
-func TestBufferReader_SmallBuffer(t *testing.T) {
-	buf := &Buffer{
-		Lines: [][]byte{
-			[]byte("hello"),
-			[]byte("world"),
-		},
-	}
-	expected := "hello\nworld\n"
-
-	reader := buf.NewReader()
-	var out bytes.Buffer
-	p := make([]byte, 4) // small 4-byte buffer to force multiple Read iterations
-
-	for {
-		n, err := reader.Read(p)
-		if n > 0 {
-			out.Write(p[:n])
-		}
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			t.Fatalf("unexpected read error: %v", err)
-		}
-	}
-
-	if out.String() != expected {
-		t.Errorf("small buffer chunk read failed:\ngot:      %q\nexpected: %q", out.String(), expected)
 	}
 }

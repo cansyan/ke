@@ -393,7 +393,7 @@ func (e *Editor) handleMouse(ctx *kero.Context, m kero.MouseEvent) error {
 			if textRect.Contains(point) {
 				// ctrl+mouse_left_release goto definition
 				if m.Mod == kero.ModCtrl {
-					GotoDefinition(e)
+					e.GotoDefinition()
 				}
 				return nil
 			}
@@ -485,7 +485,7 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 		case "ctrl+r":
 			e.palette.Open(e, "@")
 		case "ctrl+g":
-			GotoDefinition(e)
+			e.GotoDefinition()
 			return nil
 		case "ctrl+p":
 			e.palette.Open(e, "")
@@ -1682,6 +1682,10 @@ func (v *View) showCursorCenter() {
 	// vCol := v.Buf.ByteToVisualCol(v.Cursor, tabWidth)
 	// v.ScrollCol = max(vCol-(v.Width/2), 0)
 
+	if v.Width <= 0 {
+		return
+	}
+
 	vCol := v.Buf.ByteToVisualCol(v.Cursor, 4)
 
 	// 1. Cursor is to the left of the viewport -> scroll LEFT
@@ -1945,7 +1949,12 @@ func (e *Editor) OpenFile(path string) error {
 		return err
 	}
 
-	e.views = append(e.views, &View{Buf: buf})
+	newView := &View{Buf: buf}
+	if e.View() != nil {
+		newView.Width = e.View().Width
+		newView.Height = e.View().Height
+	}
+	e.views = append(e.views, newView)
 	e.active = len(e.views) - 1
 	e.NotifyBufferOpened(buf)
 	return nil
@@ -2243,7 +2252,9 @@ func (p *Palette) commandItems(_ *Editor, query string) []PaletteItem {
 			// e.diagnose()
 		}},
 		{"LSP: find references", "", findReferences},
-		{"LSP: goto definition", "ctrl+g", GotoDefinition},
+		{"LSP: goto definition", "ctrl+g", func(e *Editor) {
+			e.GotoDefinition()
+		}},
 		{"LSP: next diagnostic", "ctrl+]", func(e *Editor) {
 			e.gotoNextDiag()
 		}},
@@ -2680,41 +2691,43 @@ func (e *Editor) drawRename(f *kero.Frame, rect kero.Rect) {
 	e.renameInput.Draw(f, kero.Rect{X: inputX, Y: rect.Y, W: rect.W - inputX, H: rect.H}, normal)
 }
 
-func GotoDefinition(e *Editor) {
-	if !isGoFile(e.Buf().Path) {
-		return
-	}
-	// flush buffer to disk before running gopls
-	if e.Buf().Dirty {
-		if err := e.Buf().SaveFile(); err != nil {
-			log.Print(err)
-			e.message = err.Error()
-			return
-		}
+func (e *Editor) GotoDefinition() error {
+	v := e.View()
+	if v == nil || v.Buf == nil || !isGoFile(v.Buf.Path) || e.lspClient == nil {
+		return nil
 	}
 
-	// For example, run:
-	//   gopls definition main.go:33:2
-	// ouput:
-	//   /Users/cse/code/ke/main.go:33:2-7: defined here as var parts []string
-	now := time.Now()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "gopls", "definition", fmt.Sprintf("%s:%d:%d",
-		e.Buf().Path, e.View().Cursor.Row+1, e.View().Cursor.Col+1))
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		log.Print(err)
-		e.message = err.Error()
-		return
+	buf := v.Buf
+	cursor := v.Cursor
+
+	if cursor.Row >= len(buf.Lines) {
+		return nil
 	}
-	log.Printf("run %q in %.1fs:\n%s", cmd, time.Since(now).Seconds(), string(out))
-	l, err := ParseLocation(string(out))
+
+	lineBytes := buf.Lines[cursor.Row]
+	lspChar := ByteOffsetToLSPChar(lineBytes, cursor.Col)
+	uri := pathToURI(buf.Path)
+
+	// Call gopls
+	locs, err := e.lspClient.GotoDefinition(uri, cursor.Row, lspChar)
 	if err != nil {
-		log.Print(err)
-		return
+		e.message = "Goto definition failed: " + err.Error()
+		return err
 	}
-	e.gotoLocation(l)
+
+	if len(locs) == 0 {
+		e.message = "No definition found"
+		return nil
+	}
+
+	// Jump to the first resolved location
+	target := locs[0]
+	targetPath := uriToPath(target.URI)
+	e.gotoLocation(Location{Path: targetPath, Pos: Position{
+		Row: target.Range.Start.Line,
+		Col: LSPCharToByteOffset(buf.Lines[target.Range.Start.Line], target.Range.Start.Character),
+	}})
+	return nil
 }
 
 type ReferencesPanel struct {
@@ -3172,6 +3185,33 @@ func ByteOffsetToVisualCol(line []byte, byteOffset int, tabWidth int) int {
 		currByte += size
 	}
 	return col
+}
+
+// ByteOffsetToLSPChar converts byte offset on a line to UTF-16 code units for LSP.
+func ByteOffsetToLSPChar(line []byte, byteOffset int) int {
+	if byteOffset <= 0 {
+		return 0
+	}
+	utf16Count := 0
+	currByte := 0
+
+	for currByte < byteOffset && currByte < len(line) {
+		r, size := utf8.DecodeRune(line[currByte:])
+		if r == utf8.RuneError && size == 1 {
+			currByte++
+			utf16Count++
+			continue
+		}
+
+		// Runes >= U+10000 require surrogate pairs (2 units) in UTF-16
+		if r >= 0x10000 {
+			utf16Count += 2
+		} else {
+			utf16Count++
+		}
+		currByte += size
+	}
+	return utf16Count
 }
 
 // GetVisibleDiagnostics maps buffer diagnostics into visible viewport line & column ranges.
