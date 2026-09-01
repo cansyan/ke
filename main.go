@@ -4,12 +4,10 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"go/ast"
 	"go/format"
 	"go/parser"
-	"go/scanner"
 	"go/token"
 	"io"
 	"log"
@@ -494,10 +492,10 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 			e.palette.Open(e, "/")
 			return nil
 		case "ctrl+[":
-			e.gotoPrevDiag()
+			e.GotoPrevDiag()
 			return nil
 		case "ctrl+]":
-			e.gotoNextDiag()
+			e.GotoNextDiag()
 			return nil
 		case "ctrl+shift+]", "ctrl+}":
 			if len(e.ref.Items) <= 1 {
@@ -1569,7 +1567,16 @@ func (e *Editor) markDirty() {
 	}
 }
 
-func (e *Editor) gotoPrevDiag() {
+// Goto records jump history before navigating.
+func (e *Editor) Goto(l Location) {
+	e.recordJump()
+	if err := e.jumpTo(l); err != nil {
+		log.Print(err)
+		e.message = err.Error()
+	}
+}
+
+func (e *Editor) GotoPrevDiag() {
 	diags, ok := e.diagnostics[e.Buf().Path]
 	if !ok {
 		return
@@ -1596,7 +1603,7 @@ func (e *Editor) gotoPrevDiag() {
 	e.Goto(Location{Path: v.Buf.Path, Pos: Position{Row: dRow, Col: dCol}})
 }
 
-func (e *Editor) gotoNextDiag() {
+func (e *Editor) GotoNextDiag() {
 	diags, ok := e.diagnostics[e.Buf().Path]
 	if !ok {
 		return
@@ -2272,15 +2279,17 @@ func (p *Palette) commandItems(_ *Editor, query string) []PaletteItem {
 		{"LSP: check", "", func(e *Editor) {
 			// e.diagnose()
 		}},
-		{"LSP: find references", "", findReferences},
+		{"LSP: find references", "", func(e *Editor) {
+			e.FindReferences()
+		}},
 		{"LSP: goto definition", "ctrl+g", func(e *Editor) {
 			e.GotoDefinition()
 		}},
 		{"LSP: next diagnostic", "ctrl+]", func(e *Editor) {
-			e.gotoNextDiag()
+			e.GotoNextDiag()
 		}},
 		{"LSP: prev diagnostic", "ctrl+]", func(e *Editor) {
-			e.gotoPrevDiag()
+			e.GotoPrevDiag()
 		}},
 		{"LSP: goto symbol", "ctrl+r", func(e *Editor) {
 			e.palette.Open(e, "@")
@@ -2813,105 +2822,58 @@ func (r *ReferencesPanel) Prev() Location {
 }
 
 // Location represents coordinate within a specified file.
+// It is similar to lsp.Location, but converted to a more editor-friendly
+// format with byte offsets instead of LSP character positions.
+// It is used for jump history, references, and other navigation features.
 type Location struct {
 	Path string
 	Pos  Position
 }
 
-func ParseLocation(s string) (Location, error) {
-	parts := strings.Split(s, ":")
-	if len(parts) < 3 {
-		return Location{}, errors.New("unknown position: " + s)
-	}
-	filename := parts[0]
-	lineNo, err := strconv.Atoi(parts[1])
-	if err != nil {
-		return Location{}, err
-	}
-	segments := strings.Split(parts[2], "-")
-	if len(segments) != 2 {
-		return Location{}, errors.New("unknown position: " + s)
-	}
-	startCol, err := strconv.Atoi(segments[0])
-	if err != nil {
-		return Location{}, err
-	}
-	endCol, err := strconv.Atoi(segments[1])
-	if err != nil {
-		return Location{}, err
-	}
-	_ = endCol
-	loc := Location{
-		Path: filename,
-		Pos: Position{
-			Row: lineNo - 1,
-			Col: startCol - 1,
-		},
-	}
-	return loc, nil
-}
-
-// Goto records jump history before navigating.
-func (e *Editor) Goto(l Location) {
-	e.recordJump()
-	if err := e.jumpTo(l); err != nil {
-		log.Print(err)
-		e.message = err.Error()
-	}
-}
-
-// For example, run:
-//
-//	gopls references main.go:34:2
-//
-// ouput:
-//
-//	/Users/cse/code/ke/main.go:35:9-14
-//	/Users/cse/code/ke/main.go:39:9-14
-//
-// Positions within files are specified as file.go:line:column triples,
-// where the line and column start at 1, and columns are measured in bytes of the UTF-8 encoding.
-// More details see https://go.dev/gopls/command-line
-func findReferences(e *Editor) {
-	if !isGoFile(e.Buf().Path) {
-		return
-	}
-	// flush buffer to disk before running gopls
-	if e.Buf().Dirty {
-		if err := e.Buf().SaveFile(); err != nil {
-			log.Print(err)
-			e.message = err.Error()
-			return
-		}
+func (e *Editor) FindReferences() error {
+	v := e.View()
+	if v == nil || v.Buf == nil || e.lspClient == nil {
+		return nil
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	now := time.Now()
-	cmd := exec.CommandContext(ctx, "gopls", "references", fmt.Sprintf("%s:%d:%d",
-		e.Buf().Path, e.View().Cursor.Row+1, e.View().Cursor.Col+1))
-	out, err := cmd.CombinedOutput()
+	buf := v.Buf
+	cursor := v.Cursor
+
+	if cursor.Row >= len(buf.Lines) {
+		return nil
+	}
+
+	lineBytes := buf.Lines[cursor.Row]
+	lspChar := ByteOffsetToLSPChar(lineBytes, cursor.Col)
+	uri := pathToURI(buf.Path)
+
+	// Query gopls (include declaration = true)
+	locs, err := e.lspClient.FindReferences(uri, cursor.Row, lspChar, true)
 	if err != nil {
-		log.Print(err)
-		e.message = err.Error()
-		return
+		e.message = "Find references failed: " + err.Error()
+		return err
 	}
-	log.Printf("run %q in %.1fs:\n%s", cmd, time.Since(now).Seconds(), string(out))
-	rawLines := strings.Split(string(out), "\n")
-	if len(rawLines) == 0 {
-		return
+
+	if len(locs) == 0 {
+		e.message = "No references found"
+		return nil
 	}
-	locations := make([]Location, 0, len(rawLines))
-	for _, line := range rawLines {
-		p, err := ParseLocation(line)
-		if err != nil {
-			continue
-		}
-		locations = append(locations, p)
+
+	// Multiple references
+	locations := make([]Location, 0, len(locs))
+	for _, l := range locs {
+		locations = append(locations, Location{
+			Path: uriToPath(l.URI),
+			Pos: Position{
+				Row: l.Range.Start.Line,
+				Col: LSPCharToByteOffset(buf.Lines[l.Range.Start.Line], l.Range.Start.Character),
+			}},
+		)
 	}
-	start, end := e.Buf().WordBounds(e.View().Cursor)
-	header := fmt.Sprintf("%d references for %q", len(locations), e.Buf().TextRange(start, end))
+	start, end := buf.WordBounds(e.View().Cursor)
+	header := fmt.Sprintf("%d references for %q", len(locations), buf.TextRange(start, end))
 	e.ref = NewReferencesPanel(header, locations)
+	return nil
 }
 
 // drawReferences renders a bottom overlay panel for LSP References.
@@ -2977,50 +2939,6 @@ func (e *Editor) drawReferences(f *kero.Frame, rect kero.Rect) {
 	}
 }
 
-// CheckFile checks file on disk, make accurate diagnoses.
-// TODO: deprecated
-func CheckFile(path string) ([]*scanner.Error, error) {
-	if !isGoFile(path) {
-		return nil, errors.New("Go file only")
-	}
-
-	/*
-	   gopls check main.go
-	   /Users/cse/code/ke/main.go:35:2-6: declared and not used: part
-	   /Users/cse/code/ke/main.go:36:9-14: undefined: parts
-	*/
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	now := time.Now()
-	cmd := exec.CommandContext(ctx, "gopls", "check", path)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return nil, err
-	}
-	log.Printf("run %q in %.1fs", cmd, time.Since(now).Seconds())
-	rawLines := strings.Split(string(out), "\n")
-	if len(rawLines) == 0 {
-		return nil, nil
-	}
-	errs := make([]*scanner.Error, 0, len(rawLines))
-	for _, line := range rawLines {
-		before, after, ok := strings.Cut(line, " ")
-		if !ok {
-			continue
-		}
-		loc, err := ParseLocation(before)
-		if err != nil {
-			log.Print(err)
-			continue
-		}
-		errs = append(errs, &scanner.Error{
-			Pos: token.Position{Line: loc.Pos.Row + 1, Column: loc.Pos.Col + 1},
-			Msg: after,
-		})
-	}
-	return errs, nil
-}
-
 // Convert absolute filepath to file:// URI
 func pathToURI(path string) string {
 	abs, _ := filepath.Abs(path)
@@ -3053,7 +2971,7 @@ func (e *Editor) NotifyBufferChanged(buf *Buffer) {
 	version := e.docVers[buf.Path]
 
 	// Create a safe snapshot of current buffer content
-	content := joinLinesSnapshot(buf.Lines)
+	content := string(bytes.Join(buf.Lines, []byte{'\n'}))
 
 	e.lspClient.SendNotification("textDocument/didChange", lsp.DidChangeTextDocumentParams{
 		TextDocument: lsp.VersionedTextDocumentIdentifier{
@@ -3064,19 +2982,6 @@ func (e *Editor) NotifyBufferChanged(buf *Buffer) {
 			{Text: content},
 		},
 	})
-}
-
-// TODO: seems unnecessary
-// Helper to safely join lines into a single string
-func joinLinesSnapshot(lines [][]byte) string {
-	var builder bytes.Buffer
-	for i, line := range lines {
-		builder.Write(line)
-		if i < len(lines)-1 {
-			builder.WriteByte('\n')
-		}
-	}
-	return builder.String()
 }
 
 // Async callback triggered by readLoop when gopls pushes diagnostics

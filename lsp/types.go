@@ -77,3 +77,14 @@ type Location struct {
 	URI   string `json:"uri"`
 	Range Range  `json:"range"`
 }
+
+// ReferenceContext controls whether the symbol's declaration is included.
+type ReferenceContext struct {
+	IncludeDeclaration bool `json:"includeDeclaration"`
+}
+
+// ReferenceParams contains parameters for textDocument/references requests.
+type ReferenceParams struct {
+	TextDocumentPositionParams
+	Context ReferenceContext `json:"context"`
+}

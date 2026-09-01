@@ -297,3 +297,47 @@ func (c *Client) handleServerNotification(method string, params json.RawMessage)
 		// Ignore unhandled notifications (e.g., window/logMessage, $/progress)
 	}
 }
+
+func (c *Client) FindReferences(uri string, line, char int, includeDecl bool) ([]Location, error) {
+	params := ReferenceParams{
+		TextDocumentPositionParams: TextDocumentPositionParams{
+			TextDocument: TextDocumentIdentifier{URI: uri},
+			Position:     Position{Line: line, Character: char},
+		},
+		Context: ReferenceContext{
+			IncludeDeclaration: includeDecl,
+		},
+	}
+
+	respChan := make(chan []byte, 1)
+	id := c.SendRequest("textDocument/references", params)
+
+	c.pendingMu.Lock()
+	if c.pending == nil {
+		c.pending = make(map[int64]chan []byte)
+	}
+	c.pending[id] = respChan
+	c.pendingMu.Unlock()
+
+	defer func() {
+		c.pendingMu.Lock()
+		delete(c.pending, id)
+		c.pendingMu.Unlock()
+	}()
+
+	select {
+	case data := <-respChan:
+		if len(data) == 0 || string(data) == "null" {
+			return nil, nil // No references found
+		}
+
+		var locs []Location
+		if err := json.Unmarshal(data, &locs); err != nil {
+			return nil, fmt.Errorf("failed to parse references response: %w", err)
+		}
+		return locs, nil
+
+	case <-time.After(3 * time.Second):
+		return nil, fmt.Errorf("find references request timed out")
+	}
+}
