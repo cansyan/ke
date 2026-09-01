@@ -7,21 +7,26 @@ import (
 	"errors"
 	"fmt"
 	"go/ast"
+	"go/format"
 	"go/parser"
 	"go/scanner"
 	"go/token"
 	"io"
 	"log"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/cansyan/ke/lsp"
 	"github.com/cansyan/kero"
 	"github.com/mattn/go-runewidth"
 )
@@ -34,6 +39,7 @@ func parsePathArg(arg string) (path string, row, col int) {
 		return arg, 0, 0
 	}
 
+	fmt.Print(1)
 	path = parts[0]
 	if len(parts) > 1 {
 		var errRow error
@@ -53,8 +59,45 @@ func parsePathArg(arg string) (path string, row, col int) {
 	return path, row - 1, col - 1
 }
 
+// FindWorkspaceDir traverses parent directories looking for project markers,
+// returns absolute root path.
+func FindWorkspaceDir(filePath string) string {
+	dir := filepath.Dir(filePath)
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		return dir
+	}
+
+	markers := []string{"go.mod", ".git", "go.work"}
+
+	curr := absDir
+	for {
+		for _, marker := range markers {
+			markerPath := filepath.Join(curr, marker)
+			if _, err := os.Stat(markerPath); err == nil {
+				return curr // Found workspace root
+			}
+		}
+
+		parent := filepath.Dir(curr)
+		if parent == curr {
+			break // Reached filesystem root
+		}
+		curr = parent
+	}
+
+	// Fall back to the directory containing the file
+	return absDir
+}
+
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
+	f, err := os.OpenFile("/tmp/ke.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer f.Close()
+	log.SetOutput(f)
 
 	var path string
 	var row, col int
@@ -62,19 +105,12 @@ func main() {
 		path, row, col = parsePathArg(os.Args[1])
 	}
 
-	e := &Editor{}
-	err := e.OpenFile(path)
+	e, err := NewEditor(path, row, col)
 	if err != nil {
-		log.Fatal(err)
+		fmt.Print(err)
+		return
 	}
-	e.View().Cursor = e.Buf().Clamp(Position{Row: row, Col: col})
-
-	f, err := os.OpenFile("/tmp/ke.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer f.Close()
-	log.SetOutput(f)
+	defer e.Close()
 
 	// set FPS for refreshing diagnostic
 	p := kero.New(e, kero.WithAltScreen(true), kero.WithKitty(true), kero.WithFPS(3), kero.WithMouse(true))
@@ -145,8 +181,8 @@ type Editor struct {
 	// optional: record the time of last key, make it expire after a while
 	lastEvent kero.Event
 
-	diags    []*scanner.Error
-	diagChan chan []*scanner.Error
+	// diags    []*scanner.Error
+	// diagChan chan []*scanner.Error
 
 	// reports whether the key comes from a paste action,
 	// to distinguish the manual KeyEnter or a pasted \n
@@ -160,6 +196,50 @@ type Editor struct {
 	renameInput TextInput
 
 	ref ReferencesPanel
+
+	lspClient *lsp.Client
+	docVers   map[string]int // file path -> version sequence
+
+	// Diagnostics storage for UI rendering: filePath -> diagnostics list
+	diagnostics map[string][]lsp.Diagnostic
+	mu          sync.RWMutex
+
+	// Debouncer fields
+	changeChan chan *Buffer
+	stopChan   chan struct{}
+}
+
+// NewEditor return a new editor.
+// Caller should Close the editor before program exit.
+func NewEditor(filePath string, row, col int) (*Editor, error) {
+	e := &Editor{
+		docVers:     make(map[string]int),
+		diagnostics: make(map[string][]lsp.Diagnostic),
+	}
+
+	// 1. Start gopls
+	client, err := lsp.StartClient("gopls", e.handleDiagnostics)
+	if err != nil {
+		return nil, fmt.Errorf("failed to start gopls: %w", err)
+	}
+	e.lspClient = client
+
+	// 2. Send Initialize request
+	workspace := FindWorkspaceDir(filePath)
+	client.SendRequest("initialize", lsp.InitializeParams{
+		ProcessID: os.Getpid(),
+		RootURI:   "file://" + workspace,
+	})
+	client.SendNotification("initialized", struct{}{})
+
+	// 3. prepare diagnostic
+	go e.StartDebouncer()
+
+	if err := e.OpenFile(filePath); err != nil {
+		return nil, err
+	}
+	e.View().Cursor = e.Buf().Clamp(Position{Row: row, Col: col})
+	return e, nil
 }
 
 // View returns the currently focused View.
@@ -180,8 +260,7 @@ func (e *Editor) Buf() *Buffer {
 }
 
 func (e *Editor) Init(ctx *kero.Context) error {
-	e.diagChan = make(chan []*scanner.Error, 1)
-	e.diagnose()
+	e.View().SetSize(ctx.Width, ctx.Height)
 	return nil
 }
 
@@ -196,9 +275,6 @@ func (e *Editor) LastEvent() string {
 }
 
 func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
-	// refresh diagnostic as soon as possible
-	e.applyDiagnostic()
-
 	switch ev := ev.(type) {
 	case kero.TickEvent:
 		return nil
@@ -269,7 +345,6 @@ func (e *Editor) handleMouse(ctx *kero.Context, m kero.MouseEvent) error {
 
 		if textRect.Contains(point) {
 			e.View().ScrollRow = min(e.View().ScrollRow+1, len(e.Buf().Lines)-textRect.H)
-			log.Print(e.View().ScrollRow)
 			return nil
 		}
 	case kero.MouseLeft:
@@ -435,11 +510,10 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 			}
 			e.gotoLocation(e.ref.Prev())
 		case "ctrl+s":
-			if err := e.save(); err != nil {
+			if err := e.SaveFile(); err != nil {
+				e.message = err.Error()
 				return err
 			}
-			// diagnostic doesn't reflect the buffer changes
-			e.diagnose()
 			return nil
 		case "ctrl+f":
 			e.startFind()
@@ -774,6 +848,9 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 	fSize := f.Size()
 	gutterRect, textRect, bottomPanelRect, msgRect, statusRect := LayoutWindow(fSize.Width, fSize.Height, len(v.Buf.Lines), e.ref.Active)
 
+	tabWidth := 4
+	gutterMap, lineDiags := v.GetVisibleDiagnostics(e.diagnostics[e.Buf().Path], tabWidth)
+
 	// 1. Draw Gutter Area
 	for i := range gutterRect.H {
 		lineIdx := v.ScrollRow + i
@@ -784,16 +861,16 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 			continue
 		}
 
-		gutterText := fmt.Sprintf(" %*d ", gutterRect.W-2, lineIdx+1)
-		if lineIdx == v.Cursor.Row {
-			f.Write(gutterRect.X, y, gutterText, gutterActiveStyle)
-		} else {
-			f.Write(gutterRect.X, y, gutterText, gutterStyle)
-		}
-
-		if v := e.diagnosticForLine(lineIdx); v != nil {
+		if _, ok := gutterMap[i]; ok {
 			red := kero.NewStyle().Foreground(kero.ColorRed)
 			f.Set(gutterRect.X, y, 'x', red)
+		}
+
+		gutterText := fmt.Sprintf("%*d ", gutterRect.W-2, lineIdx+1)
+		if lineIdx == v.Cursor.Row {
+			f.Write(gutterRect.X+1, y, gutterText, gutterActiveStyle)
+		} else {
+			f.Write(gutterRect.X+1, y, gutterText, gutterStyle)
 		}
 	}
 
@@ -818,11 +895,11 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 
 		f.Write(textRect.X, y, visPadded, textStyle)
 
-		// show disanostic if appear
-		if v := e.diagnosticForLine(lineIdx); v != nil {
+		if diags, ok := lineDiags[i]; ok && len(diags) > 0 {
+			d := diags[0]
 			red := kero.NewStyle().Foreground(kero.ColorRed)
-			dx := max(textRect.X+len(visPadded), fSize.Width-len(v.Msg))
-			f.Write(dx, y, v.Msg, red)
+			dx := max(textRect.X+len(visPadded), fSize.Width-len(d.Message))
+			f.Write(dx, y, d.Message, red)
 		}
 
 		// highlight selection if any
@@ -884,7 +961,7 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 		f.Set(cursorX, cursorY, ch, cursorStyle)
 	}
 
-	// statusY := ctx.Height - 1
+	// Draw status bar
 	if statusRect.H > 0 {
 		var names strings.Builder
 		for i, b := range e.views {
@@ -913,14 +990,24 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 		if s := e.LastEvent(); s != "" {
 			f.Write(fSize.Width-runewidth.StringWidth(s), statusRect.Y, s, statusStyle)
 		}
-		if len(e.diags) > 0 {
-			warn := fmt.Sprintf("%d diagnostic", len(e.diags))
-			statusWidth := runewidth.StringWidth(status)
-			eventWidth := runewidth.StringWidth(e.LastEvent())
-			remainWidth := fSize.Width - statusWidth - eventWidth
-			if remainWidth > 0 {
-				f.Write(statusRect.X+statusWidth+1, statusRect.Y, trimToWidth("| "+warn, remainWidth), statusStyle.Background(kero.ColorRed))
+		if diags, ok := e.diagnostics[e.Buf().Path]; ok {
+			// avoid showing diagnostic count when there is no error, only warning
+			var n int
+			for _, d := range diags {
+				if d.Severity == lsp.DiagnosticSeverityError {
+					n++
+				}
 			}
+			if n > 0 {
+				msg := fmt.Sprintf("%d diagnostic error", len(diags))
+				statusWidth := runewidth.StringWidth(status)
+				eventWidth := runewidth.StringWidth(e.LastEvent())
+				remainWidth := fSize.Width - statusWidth - eventWidth
+				if remainWidth > 0 {
+					f.Write(statusRect.X+statusWidth+1, statusRect.Y, trimToWidth("| "+msg, remainWidth), statusStyle.Background(kero.ColorRed))
+				}
+			}
+
 		}
 	}
 
@@ -1131,28 +1218,55 @@ func padTab(s string, tabSize int) string {
 	return result.String()
 }
 
-func (e *Editor) save() error {
-	if e.Buf() == nil {
+func (e *Editor) SaveFile() error {
+	buf := e.Buf()
+	if buf == nil {
 		return nil
 	}
-	if e.Buf().Path == "" {
+	if buf.Path == "" {
 		e.startSaveAs()
 		return nil
 	}
 
-	if _, err := e.Buf().Format(); err != nil {
-		log.Print(err)
+	// 1. Format in-memory buffer if it's a Go file
+	if isGoFile(buf.Path) {
+		changed, err := buf.Format()
+		if err != nil {
+			log.Printf("failed to format: %s", err)
+		} else if changed {
+			e.View().Cursor = buf.Clamp(e.View().Cursor)
+		}
 	}
 
-	if err := e.Buf().SaveFile(); err != nil {
-		e.message = "error: " + err.Error()
-		return nil
+	// 2. Stream buffer content to disk
+	f, err := os.Create(buf.Path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	w := bufio.NewWriter(f)
+	if _, err := io.Copy(w, buf.NewReader()); err != nil {
+		return err
+	}
+	if err := w.Flush(); err != nil {
+		return err
 	}
 
-	e.message = fmt.Sprintf("saved %s", filepath.Base(e.Buf().Path))
+	buf.Dirty = false
+	e.message = fmt.Sprintf("saved %s", buf.Path)
+
+	// 3. Notify LSP server if active
+	if e.lspClient != nil {
+		e.lspClient.SendNotification("textDocument/didSave", lsp.DidSaveTextDocumentParams{
+			TextDocument: lsp.TextDocumentIdentifier{
+				URI: pathToURI(buf.Path),
+			},
+		})
+	}
+
 	return nil
 }
-
 func (e *Editor) startSaveAs() {
 	e.saveAs = true
 	e.saveInput.SetText(e.Buf().Path)
@@ -1186,10 +1300,10 @@ func (e *Editor) finishSaveAs() error {
 	}
 	e.Buf().Path = p
 	e.saveAs = false
-	if err := e.save(); err != nil {
+	if err := e.SaveFile(); err != nil {
 		return err
 	}
-	e.diagnose()
+	// e.diagnose()
 	return nil
 }
 
@@ -1446,98 +1560,67 @@ func (v *View) moveDown() {
 func (e *Editor) markDirty() {
 	e.Buf().Dirty = true
 	e.message = ""
-}
 
-// diagnose starts a goroutine to check file.
-func (e *Editor) diagnose() {
-	if e.Buf() == nil {
-		return
-	}
-
-	go func() {
-		diags, err := CheckFile(e.Buf().Path)
-		if err != nil {
-			log.Print(err)
-			e.message = err.Error()
-			return
-		}
-		select {
-		case e.diagChan <- diags:
-		default:
-		}
-	}()
-}
-
-func (e *Editor) applyDiagnostic() {
-	if e.diagChan == nil {
-		return
-	}
+	// Non-blocking send: pushes buffer state to debouncer
 	select {
-	case result := <-e.diagChan:
-		e.diags = result
+	case e.changeChan <- e.Buf():
 	default:
-		return
+		// Queue full; safe to drop because the latest pointer will be picked up
 	}
-}
-
-func (e *Editor) diagnosticForLine(row int) *scanner.Error {
-	for _, d := range e.diags {
-		if d.Pos.Line-1 == row {
-			return d
-		}
-	}
-	return nil
 }
 
 func (e *Editor) gotoPrevDiag() {
-	if len(e.diags) == 0 {
+	diags, ok := e.diagnostics[e.Buf().Path]
+	if !ok {
+		return
+	}
+	if len(diags) == 0 {
 		return
 	}
 
 	v := e.View()
-	var se *scanner.Error
-	for i := len(e.diags) - 1; i >= 0; i-- {
-		d := e.diags[i]
-		dRow := d.Pos.Line - 1
-		dCol := d.Pos.Column - 1
+	var prev lsp.Diagnostic
+	for _, d := range slices.Backward(diags) {
+		dRow := d.Range.Start.Line
+		dCol := LSPCharToByteOffset(v.Buf.Lines[dRow], d.Range.Start.Character)
 		if dRow < v.Cursor.Row || (dRow == v.Cursor.Row && dCol < v.Cursor.Col) {
-			se = d
+			prev = d
 			break
 		}
 	}
-	if se == nil {
-		se = e.diags[len(e.diags)-1]
+	if prev.Message == "" {
+		prev = diags[len(diags)-1]
 	}
-	v.Cursor = v.Buf.Clamp(Position{
-		Row: se.Pos.Line - 1,
-		Col: se.Pos.Column - 1,
-	})
+	dRow := prev.Range.Start.Line
+	dCol := LSPCharToByteOffset(v.Buf.Lines[dRow], prev.Range.Start.Character)
+	e.gotoLocation(Location{Path: v.Buf.Path, Pos: Position{Row: dRow, Col: dCol}})
 }
 
 func (e *Editor) gotoNextDiag() {
-	if len(e.diags) == 0 {
+	diags, ok := e.diagnostics[e.Buf().Path]
+	if !ok {
+		return
+	}
+	if len(diags) == 0 {
 		return
 	}
 
 	v := e.View()
-	// find next diagnostic
-	var err *scanner.Error
-	for _, d := range e.diags {
-		dRow := d.Pos.Line - 1
-		dCol := d.Pos.Column - 1
-		if dRow > v.Cursor.Row ||
-			(dRow == v.Cursor.Row && dCol > v.Cursor.Col) {
-			err = d
+	var next lsp.Diagnostic
+	for _, d := range diags {
+		dRow := d.Range.Start.Line
+		dCol := LSPCharToByteOffset(v.Buf.Lines[dRow], d.Range.Start.Character)
+		if dRow > v.Cursor.Row || (dRow == v.Cursor.Row && dCol > v.Cursor.Col) {
+			next = d
 			break
 		}
 	}
-	if err == nil {
-		err = e.diags[0]
+	if next.Message == "" {
+		next = diags[0]
 	}
-
-	dRow := err.Pos.Line - 1
-	dCol := err.Pos.Column - 1
-	v.Cursor = v.Buf.Clamp(Position{Row: dRow, Col: dCol})
+	dRow := next.Range.Start.Line
+	dCol := LSPCharToByteOffset(v.Buf.Lines[dRow], next.Range.Start.Character)
+	e.gotoLocation(Location{Path: v.Buf.Path, Pos: Position{Row: dRow, Col: dCol}})
 }
 
 func isGoFile(path string) bool {
@@ -1592,18 +1675,34 @@ func (v *View) showCursor() {
 
 // showCursorCenter centers the cursor in the viewport both vertically and horizontally.
 func (v *View) showCursorCenter() {
-	tabWidth := 4
-
 	// Center vertically
 	v.ScrollRow = max(v.Cursor.Row-(v.Height/2), 0)
 
 	// Center horizontally
-	vCol := v.Buf.ByteToVisualCol(v.Cursor, tabWidth)
-	v.ScrollCol = max(vCol-(v.Width/2), 0)
+	// vCol := v.Buf.ByteToVisualCol(v.Cursor, tabWidth)
+	// v.ScrollCol = max(vCol-(v.Width/2), 0)
+
+	vCol := v.Buf.ByteToVisualCol(v.Cursor, 4)
+
+	// 1. Cursor is to the left of the viewport -> scroll LEFT
+	if vCol < v.ScrollCol {
+		v.ScrollCol = vCol
+	}
+
+	// 2. Cursor is to the right of the viewport -> scroll RIGHT
+	// Right-most visible visual column index is (ScrollCol + Width - 1)
+	if vCol >= v.ScrollCol+v.Width {
+		v.ScrollCol = vCol - v.Width + 1
+	}
+
+	// Clamp to left boundary
+	if v.ScrollCol < 0 {
+		v.ScrollCol = 0
+	}
 }
 
-// isCursorVisible returns true if the cursor is currently inside the visible viewport.
-func (v *View) isCursorVisible() bool {
+// cursorVisible returns true if the cursor is currently inside the visible viewport.
+func (v *View) cursorVisible() bool {
 	if v.Width <= 0 || v.Height <= 0 {
 		return false
 	}
@@ -1624,7 +1723,7 @@ func (v *View) isCursorVisible() bool {
 
 // ShowCursorSmart minimal-scrolls for nearby moves, but centers for long-distance jumps.
 func (v *View) ShowCursorSmart() {
-	if v.isCursorVisible() {
+	if v.cursorVisible() {
 		return
 	}
 
@@ -1837,7 +1936,6 @@ func (e *Editor) OpenFile(path string) error {
 	for i, v := range e.views {
 		if v.Buf.Path == path {
 			e.active = i
-			e.diags = nil
 			return nil
 		}
 	}
@@ -1849,7 +1947,7 @@ func (e *Editor) OpenFile(path string) error {
 
 	e.views = append(e.views, &View{Buf: buf})
 	e.active = len(e.views) - 1
-	e.diags = nil
+	e.NotifyBufferOpened(buf)
 	return nil
 }
 
@@ -1864,21 +1962,18 @@ func (e *Editor) CloseBuffer() {
 	if e.active >= len(e.views) {
 		e.active = len(e.views) - 1
 	}
-	e.diags = nil
 	e.message = ""
 }
 
 func (e *Editor) NextBuffer() {
 	if len(e.views) > 1 {
 		e.active = (e.active + 1) % len(e.views)
-		e.diags = nil
 	}
 }
 
 func (e *Editor) PrevBuffer() {
 	if len(e.views) > 1 {
 		e.active = (e.active - 1 + len(e.views)) % len(e.views)
-		e.diags = nil
 	}
 }
 
@@ -1922,7 +2017,7 @@ func (j *JumpList) Push(path string, pos Position) {
 	if len(j.items) > 0 && j.index >= 0 && j.index < len(j.items) {
 		curr := j.items[j.index]
 		// Avoid pushing duplicate positions in the same file
-		if curr.Filename == path && curr.Pos == pos {
+		if curr.Path == path && curr.Pos == pos {
 			return
 		}
 	}
@@ -1932,7 +2027,7 @@ func (j *JumpList) Push(path string, pos Position) {
 		j.items = j.items[:j.index+1]
 	}
 
-	j.items = append(j.items, Location{Filename: path, Pos: pos})
+	j.items = append(j.items, Location{Path: path, Pos: pos})
 	if len(j.items) > maxJumps {
 		j.items = j.items[1:]
 	}
@@ -1981,13 +2076,13 @@ func (e *Editor) recordJump() {
 // jumpTo restores a recorded location, switching buffers if necessary.
 func (e *Editor) jumpTo(target Location) {
 	// 1. Switch buffer if the target is in a different file
-	if target.Filename != "" && target.Filename != e.Buf().Path {
-		err := e.OpenFile(target.Filename)
+	if target.Path != "" && target.Path != e.Buf().Path {
+		err := e.OpenFile(target.Path)
 		if err != nil {
 			log.Print(err)
 			return
 		}
-		e.diagnose()
+		// e.diagnose()
 	}
 
 	// 2. Set cursor position
@@ -2145,10 +2240,9 @@ func (p *Palette) commandItems(_ *Editor, query string) []PaletteItem {
 			e.PrevBuffer()
 		}},
 		{"LSP: check", "", func(e *Editor) {
-			e.diagnose()
+			// e.diagnose()
 		}},
 		{"LSP: find references", "", findReferences},
-		{"LSP: format file", "", func(e *Editor) { e.Buf().Format() }},
 		{"LSP: goto definition", "ctrl+g", GotoDefinition},
 		{"LSP: next diagnostic", "ctrl+]", func(e *Editor) {
 			e.gotoNextDiag()
@@ -2304,7 +2398,6 @@ func (p *Palette) fileItems(e *Editor, query string) []PaletteItem {
 			Action: func(ed *Editor) {
 				ed.recordJump()
 				ed.active = bufIdx
-				e.diags = nil
 			},
 		})
 	}
@@ -2351,7 +2444,7 @@ func (p *Palette) fileItems(e *Editor, query string) []PaletteItem {
 					log.Print(err)
 					return
 				}
-				ed.diagnose()
+				// ed.diagnose()
 			},
 		})
 
@@ -2570,7 +2663,6 @@ func (e *Editor) updateRename(ev kero.KeyEvent) {
 				break
 			}
 		}
-		e.diags = nil
 		e.renaming = false
 	default:
 		e.renameInput.Update(ev)
@@ -2688,8 +2780,8 @@ func (r *ReferencesPanel) Prev() Location {
 
 // Location represents coordinate within a specified file.
 type Location struct {
-	Filename string
-	Pos      Position
+	Path string
+	Pos  Position
 }
 
 func ParseLocation(s string) (Location, error) {
@@ -2716,7 +2808,7 @@ func ParseLocation(s string) (Location, error) {
 	}
 	_ = endCol
 	loc := Location{
-		Filename: filename,
+		Path: filename,
 		Pos: Position{
 			Row: lineNo - 1,
 			Col: startCol - 1,
@@ -2725,16 +2817,16 @@ func ParseLocation(s string) (Location, error) {
 	return loc, nil
 }
 
+// record current position before going to the location
 func (e *Editor) gotoLocation(l Location) {
 	e.recordJump()
-	if e.Buf().Path != l.Filename {
-		err := e.OpenFile(l.Filename)
+	if e.Buf().Path != l.Path {
+		err := e.OpenFile(l.Path)
 		if err != nil {
 			log.Print(err)
 			e.message = err.Error()
 			return
 		}
-		e.diagnose()
 	}
 	e.View().Cursor = l.Pos
 	e.View().ShowCursorSmart()
@@ -2839,14 +2931,14 @@ func (e *Editor) drawReferences(f *kero.Frame, rect kero.Rect) {
 			itemStyle = itemStyle.Bold()
 		}
 
-		buf, err := getBuffer(item.Filename)
+		buf, err := getBuffer(item.Path)
 		if err != nil {
 			log.Print(err)
 			continue
 		}
 
 		line := string(buf.Lines[item.Pos.Row])
-		text := fmt.Sprintf("%s %s:%d:%d: %s", indicator, filepath.Base(item.Filename), item.Pos.Row+1,
+		text := fmt.Sprintf("%s %s:%d:%d: %s", indicator, filepath.Base(item.Path), item.Pos.Row+1,
 			item.Pos.Col+1, line)
 		runes := []rune(text)
 
@@ -2858,6 +2950,7 @@ func (e *Editor) drawReferences(f *kero.Frame, rect kero.Rect) {
 }
 
 // CheckFile checks file on disk, make accurate diagnoses.
+// TODO: deprecated
 func CheckFile(path string) ([]*scanner.Error, error) {
 	if !isGoFile(path) {
 		return nil, errors.New("Go file only")
@@ -2898,4 +2991,424 @@ func CheckFile(path string) ([]*scanner.Error, error) {
 		})
 	}
 	return errs, nil
+}
+
+// Convert absolute filepath to file:// URI
+func pathToURI(path string) string {
+	abs, _ := filepath.Abs(path)
+	return "file://" + abs
+}
+
+// Notify LSP when a buffer is opened
+func (e *Editor) NotifyBufferOpened(buf *Buffer) {
+	uri := pathToURI(buf.Path)
+	e.docVers[buf.Path] = 1
+
+	content := string(bytes.Join(buf.Lines, []byte{'\n'}))
+	e.lspClient.SendNotification("textDocument/didOpen", lsp.DidOpenTextDocumentParams{
+		TextDocument: lsp.TextDocumentItem{
+			URI:        uri,
+			LanguageID: "go",
+			Version:    1,
+			Text:       content,
+		},
+	})
+}
+
+// Notify LSP as the user edits (Call from your debouncer or OnContentChanged).
+// Sending full document updates on didChange is simple, fast, and robust
+// for files under a few thousand lines.
+// gopls handles full updates rapidly without needing complex incremental edit diffing
+func (e *Editor) NotifyBufferChanged(buf *Buffer) {
+	uri := pathToURI(buf.Path)
+	e.docVers[buf.Path]++
+	version := e.docVers[buf.Path]
+
+	// Create a safe snapshot of current buffer content
+	content := joinLinesSnapshot(buf.Lines)
+
+	e.lspClient.SendNotification("textDocument/didChange", lsp.DidChangeTextDocumentParams{
+		TextDocument: lsp.VersionedTextDocumentIdentifier{
+			URI:     uri,
+			Version: version,
+		},
+		ContentChanges: []lsp.TextDocumentContentChangeEvent{
+			{Text: content},
+		},
+	})
+}
+
+// TODO: seems unnecessary
+// Helper to safely join lines into a single string
+func joinLinesSnapshot(lines [][]byte) string {
+	var builder bytes.Buffer
+	for i, line := range lines {
+		builder.Write(line)
+		if i < len(lines)-1 {
+			builder.WriteByte('\n')
+		}
+	}
+	return builder.String()
+}
+
+// Async callback triggered by readLoop when gopls pushes diagnostics
+func (e *Editor) handleDiagnostics(uri string, diags []lsp.Diagnostic) {
+	// Convert URI back to file path if needed
+	filePath := uriToPath(uri)
+
+	// Post event to TUI thread or protect map with a RWMutex
+	e.mu.Lock()
+	e.diagnostics[filePath] = diags
+	e.mu.Unlock()
+
+	for _, d := range diags {
+		log.Printf("%s:%d severity:%d %s", filePath, d.Range.Start.Line, d.Severity, d.Message)
+	}
+}
+
+// StartDebouncer launches the background worker goroutine.
+func (e *Editor) StartDebouncer() {
+	e.changeChan = make(chan *Buffer, 100)
+	e.stopChan = make(chan struct{})
+
+	go func() {
+		var (
+			timer   *time.Timer
+			timerCh <-chan time.Time
+			lastBuf *Buffer
+		)
+
+		for {
+			select {
+			case buf := <-e.changeChan:
+				lastBuf = buf
+
+				// Stop active timer if user typed another character
+				if timer != nil {
+					timer.Stop()
+				}
+				// 150ms debounce delay (optimal for instant feel without flooding)
+				timer = time.NewTimer(150 * time.Millisecond)
+				timerCh = timer.C
+
+			case <-timerCh:
+				if lastBuf != nil {
+					e.NotifyBufferChanged(lastBuf)
+					lastBuf = nil
+				}
+				timerCh = nil
+
+			case <-e.stopChan:
+				if timer != nil {
+					timer.Stop()
+				}
+				return
+			}
+		}
+	}()
+}
+
+// Close shuts down the background worker cleanly.
+func (e *Editor) Close() {
+	close(e.stopChan)
+	e.lspClient.Close()
+}
+
+// LineDiagnostic holds rendered positions bounded to a single line.
+type LineDiagnostic struct {
+	StartCol int // 0-based visual cell offset on line
+	EndCol   int // 0-based visual cell offset on line
+	Severity int // 1: Error, 2: Warning, 3: Info, 4: Hint
+	Message  string
+}
+
+// ConvertLSPCharToByteOffset converts UTF-16 code unit offset (LSP)
+// to byte index within a UTF-8 encoded line buffer.
+func LSPCharToByteOffset(line []byte, utf16Char int) int {
+	if utf16Char <= 0 {
+		return 0
+	}
+
+	byteIdx := 0
+	utf16Count := 0
+
+	for byteIdx < len(line) {
+		r, size := utf8.DecodeRune(line[byteIdx:])
+		if r == utf8.RuneError && size == 1 {
+			byteIdx++
+			utf16Count++
+			continue
+		}
+
+		// Runes >= U+10000 require surrogate pairs in UTF-16 (2 units)
+		needed := 1
+		if r >= 0x10000 {
+			needed = 2
+		}
+
+		if utf16Count+needed > utf16Char {
+			break
+		}
+
+		utf16Count += needed
+		byteIdx += size
+	}
+
+	return byteIdx
+}
+
+// ByteOffsetToVisualCol converts byte offset on a line to visual display cells (handling tabs).
+func ByteOffsetToVisualCol(line []byte, byteOffset int, tabWidth int) int {
+	col := 0
+	currByte := 0
+
+	for currByte < byteOffset && currByte < len(line) {
+		r, size := utf8.DecodeRune(line[currByte:])
+		if r == '\t' {
+			col += tabWidth - (col % tabWidth)
+		} else {
+			col++ // Assuming standard 1-cell width (use wcwidth for full CJK/Emoji support)
+		}
+		currByte += size
+	}
+	return col
+}
+
+// GetVisibleDiagnostics maps buffer diagnostics into visible viewport line & column ranges.
+func (v *View) GetVisibleDiagnostics(diags []lsp.Diagnostic, tabWidth int) (map[int]int, map[int][]LineDiagnostic) {
+	// Gutter indicators: viewportRow -> highest severity (1 is Error, 2 is Warning)
+	gutterMap := make(map[int]int)
+	// Text underlines: viewportRow -> list of column ranges
+	underlineMap := make(map[int][]LineDiagnostic)
+
+	if v.Buf == nil || len(diags) == 0 {
+		return gutterMap, underlineMap
+	}
+
+	viewStartRow := v.ScrollRow
+	viewEndRow := v.ScrollRow + v.Height
+
+	for _, d := range diags {
+		diagStartRow := d.Range.Start.Line
+		diagEndRow := d.Range.End.Line
+
+		// Skip diagnostics completely outside visible viewport
+		if diagEndRow < viewStartRow || diagStartRow >= viewEndRow {
+			continue
+		}
+
+		// 1. Process Gutter Indicators for all affected lines in viewport
+		for r := diagStartRow; r <= diagEndRow; r++ {
+			if r >= viewStartRow && r < viewEndRow {
+				vRow := r - viewStartRow
+				existingSev, found := gutterMap[vRow]
+				// Higher priority to lower severity numbers (1 = Error)
+				if !found || d.Severity < existingSev {
+					gutterMap[vRow] = d.Severity
+				}
+			}
+		}
+
+		// 2. Process Underline Highlights line by line
+		for r := diagStartRow; r <= diagEndRow; r++ {
+			if r < viewStartRow || r >= viewEndRow || r >= len(v.Buf.Lines) {
+				continue
+			}
+
+			lineBytes := v.Buf.Lines[r]
+			var startByte, endByte int
+
+			if r == diagStartRow {
+				startByte = LSPCharToByteOffset(lineBytes, d.Range.Start.Character)
+			} else {
+				startByte = 0
+			}
+
+			if r == diagEndRow {
+				endByte = LSPCharToByteOffset(lineBytes, d.Range.End.Character)
+			} else {
+				endByte = len(lineBytes)
+			}
+
+			// Handle single-character zero-length ranges from LSP (e.g., missing semicolons)
+			if startByte == endByte {
+				if endByte < len(lineBytes) {
+					_, size := utf8.DecodeRune(lineBytes[endByte:])
+					endByte += size
+				} else {
+					endByte = startByte + 1
+				}
+			}
+
+			startCol := ByteOffsetToVisualCol(lineBytes, startByte, tabWidth)
+			endCol := ByteOffsetToVisualCol(lineBytes, endByte, tabWidth)
+
+			// Map to viewport visual columns
+			vStartCol := startCol - v.ScrollCol
+			vEndCol := endCol - v.ScrollCol
+
+			// Clip to viewport horizontal boundaries
+			if vEndCol > 0 && vStartCol < v.Width {
+				if vStartCol < 0 {
+					vStartCol = 0
+				}
+				if vEndCol > v.Width {
+					vEndCol = v.Width
+				}
+
+				vRow := r - viewStartRow
+				underlineMap[vRow] = append(underlineMap[vRow], LineDiagnostic{
+					StartCol: vStartCol,
+					EndCol:   vEndCol,
+					Severity: d.Severity,
+					Message:  d.Message,
+				})
+			}
+		}
+	}
+
+	return gutterMap, underlineMap
+}
+
+/*
+func (v *View) Render(diags []lsp.Diagnostic) {
+	tabWidth := 4
+	gutterMap, underlineMap := v.GetVisibleDiagnostics(diags, tabWidth)
+
+	for vRow := 0; vRow < v.Height; vRow++ {
+		bufRow := v.ScrollRow + vRow
+		if bufRow >= len(v.Buf.Lines) {
+			break
+		}
+
+		// 1. Draw Gutter Symbol
+		gutterSymbol := " "
+		gutterStyle := NormalStyle
+
+		if sev, ok := gutterMap[vRow]; ok {
+			switch sev {
+			case 1: // Error
+				gutterSymbol = "E" // or "●"
+				gutterStyle = RedStyle
+			case 2: // Warning
+				gutterSymbol = "W" // or "▲"
+				gutterStyle = YellowStyle
+			case 3: // Info
+				gutterSymbol = "I"
+				gutterStyle = BlueStyle
+			}
+		}
+		DrawCell(0, vRow, gutterSymbol, gutterStyle)
+
+		// 2. Render Text Cells with Underline Styles
+		lineHighlights := underlineMap[vRow]
+		lineBytes := v.Buf.Lines[bufRow]
+
+		for vCol := 0; vCol < v.Width; vCol++ {
+			cellChar := GetViewportCellChar(lineBytes, v.ScrollCol+vCol)
+			cellStyle := NormalStyle
+
+			// Apply diagnostic underline/background styling
+			for _, hl := range lineHighlights {
+				if vCol >= hl.StartCol && vCol < hl.EndCol {
+					cellStyle = ApplyUnderline(cellStyle, hl.Severity)
+					break
+				}
+			}
+
+			// Render cell offset by gutter width
+			DrawCell(vCol+GutterWidth, vRow, cellChar, cellStyle)
+		}
+	}
+}
+
+func ApplyUnderline(baseStyle Style, severity int) Style {
+	switch severity {
+	case 1: // Error
+		return baseStyle.WithUnderline(true).WithUnderlineColor(Red)
+	case 2: // Warning
+		return baseStyle.WithUnderline(true).WithUnderlineColor(Yellow)
+	default:
+		return baseStyle.WithUnderline(true)
+	}
+}
+*/
+
+// uriToPath converts a file:// URI into a clean, platform-native file path.
+func uriToPath(uri string) string {
+	// If it's already a local filepath, clean and return it
+	if !strings.HasPrefix(uri, "file://") {
+		return filepath.Clean(uri)
+	}
+
+	u, err := url.Parse(uri)
+	if err != nil {
+		// Fallback for malformed URIs
+		trimmed := strings.TrimPrefix(uri, "file://")
+		decoded, err := url.PathUnescape(trimmed)
+		if err != nil {
+			return filepath.Clean(trimmed)
+		}
+		return filepath.Clean(decoded)
+	}
+
+	// Unescape percent-encoded sequences (e.g. %20 -> space)
+	path := u.Path
+
+	// Windows URI normalization:
+	// "file:///C:/path/file.go" parsed by url.Parse yields Path "/C:/path/file.go"
+	if runtime.GOOS == "windows" {
+		if len(path) > 2 && path[0] == '/' && path[2] == ':' {
+			path = path[1:] // Strip leading slash: "C:/path/file.go"
+		}
+		path = strings.ReplaceAll(path, "/", `\`)
+	}
+
+	return filepath.Clean(path)
+}
+
+// Format runs go/format on the buffer's content if it is a Go source file.
+// It returns true if the buffer was modified, and an error if formatting fails.
+func (b *Buffer) Format() (bool, error) {
+	src := bytes.Join(b.Lines, []byte{'\n'})
+
+	formatted, err := format.Source(src)
+	if err != nil {
+		return false, err // Return syntax/format error without modifying buffer
+	}
+
+	// if no changes, return early
+	if bytes.Equal(src, formatted) {
+		return false, nil
+	}
+
+	// standard gofmt always formats source with a trailing newline,
+	// so we can safely replace the buffer content.
+	newLines := bytes.Split(formatted, []byte{'\n'})
+
+	b.Lines = newLines
+	b.Dirty = true
+	return true, nil
+}
+
+// SaveFile writes the lines back to disk.
+// TODO: deprecated
+func (b *Buffer) SaveFile() error {
+	f, err := os.Create(b.Path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	// Stream directly to disk using a buffered writer
+	w := bufio.NewWriter(f)
+	if _, err := io.Copy(w, b.NewReader()); err != nil {
+		return err
+	}
+
+	if err := w.Flush(); err != nil {
+		return err
+	}
+	b.Dirty = false
+	return nil
 }

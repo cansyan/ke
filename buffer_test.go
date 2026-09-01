@@ -1,6 +1,10 @@
 package main
 
-import "testing"
+import (
+	"bytes"
+	"io"
+	"testing"
+)
 
 func TestFindNextWrapsWithinStartingLine(t *testing.T) {
 	b := NewBuffer("", []byte("target middle\nother line"))
@@ -60,5 +64,80 @@ func TestFindAndReplaceAllAreCaseSensitive(t *testing.T) {
 	}
 	if got := string(b.Lines[0]); got != "Target x TARGET" {
 		t.Fatalf("ReplaceAll() result = %q, want %q", got, "Target x TARGET")
+	}
+}
+
+func TestBufferReader_TrailingNewline(t *testing.T) {
+	tests := []struct {
+		name     string
+		lines    [][]byte
+		expected string
+	}{
+		{
+			name:     "Single line file",
+			lines:    [][]byte{[]byte("package main")},
+			expected: "package main\n",
+		},
+		{
+			name:     "Multi-line file",
+			lines:    [][]byte{[]byte("package main"), []byte(""), []byte("func main() {}")},
+			expected: "package main\n\nfunc main() {}\n",
+		},
+		{
+			name:     "File ending with an empty line",
+			lines:    [][]byte{[]byte("foo"), []byte("bar"), []byte("")},
+			expected: "foo\nbar\n\n",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			buf := &Buffer{Lines: tt.lines}
+			reader := buf.NewReader()
+
+			// Read entire content via io.ReadAll (uses varying buffer chunk sizes)
+			gotBytes, err := io.ReadAll(reader)
+			if err != nil {
+				t.Fatalf("unexpected error reading buffer: %v", err)
+			}
+
+			got := string(gotBytes)
+			if got != tt.expected {
+				t.Errorf("content mismatch:\ngot:      %q\nexpected: %q", got, tt.expected)
+			}
+		})
+	}
+}
+
+// TestBufferReader_SmallBuffer simulates Read() calls with tiny slice chunks (e.g. 4 bytes)
+// to catch edge cases where line text fills p right before '\n'.
+func TestBufferReader_SmallBuffer(t *testing.T) {
+	buf := &Buffer{
+		Lines: [][]byte{
+			[]byte("hello"),
+			[]byte("world"),
+		},
+	}
+	expected := "hello\nworld\n"
+
+	reader := buf.NewReader()
+	var out bytes.Buffer
+	p := make([]byte, 4) // small 4-byte buffer to force multiple Read iterations
+
+	for {
+		n, err := reader.Read(p)
+		if n > 0 {
+			out.Write(p[:n])
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("unexpected read error: %v", err)
+		}
+	}
+
+	if out.String() != expected {
+		t.Errorf("small buffer chunk read failed:\ngot:      %q\nexpected: %q", out.String(), expected)
 	}
 }

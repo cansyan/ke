@@ -1,10 +1,9 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
-	"go/format"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -215,13 +214,7 @@ func (b *Buffer) WordBounds(p Position) (start, end Position) {
 	}
 
 	// Clamp p.Col to valid slice boundary [0, lineLen]
-	col := p.Col
-	if col < 0 {
-		col = 0
-	}
-	if col >= lineLen {
-		col = lineLen - 1
-	}
+	col := min(max(0, p.Col), lineLen-1)
 
 	// Determine the character classification under the target position
 	targetRune, _ := utf8.DecodeRune(line[col:])
@@ -594,40 +587,6 @@ func (b *Buffer) LineEnd(p Position) Position {
 	return Position{Row: p.Row, Col: len(b.Lines[p.Row])}
 }
 
-// Format runs go/format on the buffer's content if it is a Go source file.
-// It returns true if the buffer was modified, and an error if formatting fails.
-func (b *Buffer) Format() (bool, error) {
-	// Only format Go files
-	if filepath.Ext(b.Path) != ".go" {
-		return false, nil
-	}
-
-	buf := bytes.Join(b.Lines, []byte{'\n'})
-	formatted, err := format.Source(buf)
-	if err != nil {
-		return false, err
-	}
-
-	// Handle trailing newline splitting gracefully
-	newLines := bytes.Split(bytes.TrimSuffix(formatted, []byte{'\n'}), []byte{'\n'})
-
-	b.Lines = newLines
-	b.Dirty = true
-
-	// TODO
-	// Clamp cursor to valid row/col bounds after formatting changes line lengths
-	// if b.Cursor.Row >= len(b.Lines) {
-	// 	b.Cursor.Row = max(0, len(b.Lines)-1)
-	// }
-	// if len(b.Lines) > 0 {
-	// 	b.Cursor.Col = min(b.Cursor.Col, len(b.Lines[b.Cursor.Row]))
-	// } else {
-	// 	b.Cursor.Col = 0
-	// }
-
-	return true, nil
-}
-
 /*
 // Convert (Row, Col Byte) -> Rune Index
 // Used when you need to know how many unicode characters precede the cursor.
@@ -771,33 +730,32 @@ func (r *BufferReader) Read(p []byte) (n int, err error) {
 	}
 
 	for n < len(p) && r.row < len(r.buf.Lines) {
-		line := r.buf.Lines[r.row]
-
-		// 1. If sitting on a line boundary, yield the newline byte
+		// 1. Handle pending inter-line newline byte
 		if r.inNL {
 			p[n] = '\n'
 			n++
 			r.inNL = false
-			r.row++
-			r.col = 0
 			continue
 		}
 
-		// 2. Read remaining content from current line
+		line := r.buf.Lines[r.row]
+
+		// 2. Copy text bytes from current line into p
 		if r.col < len(line) {
 			copied := copy(p[n:], line[r.col:])
 			n += copied
 			r.col += copied
 		}
 
-		// 3. If reached end of line content, mark next byte as newline
-		if r.col >= len(line) {
-			// Don't append newline after the very last line if it's empty/EOF
-			// (or keep it if your editor standard requires a trailing newline)
+		// 3. Once line text is fully read, advance row position
+		if r.col == len(line) {
 			if r.row < len(r.buf.Lines)-1 {
+				// Intermediate line: queue a newline and advance row
 				r.inNL = true
+				r.row++
+				r.col = 0
 			} else {
-				// Last line finished
+				// Final line: finished reading, do NOT emit trailing newline
 				r.row++
 			}
 		}
@@ -808,27 +766,6 @@ func (r *BufferReader) Read(p []byte) (n int, err error) {
 	}
 
 	return n, nil
-}
-
-// SaveFile writes the lines back to disk.
-func (b *Buffer) SaveFile() error {
-	f, err := os.Create(b.Path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	// Stream directly to disk using a buffered writer
-	w := bufio.NewWriter(f)
-	if _, err := io.Copy(w, b.NewReader()); err != nil {
-		return err
-	}
-
-	if err := w.Flush(); err != nil {
-		return err
-	}
-	b.Dirty = false
-	return nil
 }
 
 // BufferFromFile opens a file and prepares a Buffer struct.
@@ -862,10 +799,11 @@ func BufferFromFile(path string) (*Buffer, error) {
 	if err != nil {
 		return nil, err
 	}
+	log.Printf("%s %d lines", path, len(lines))
 
 	// Guarantee at least one line exists in memory
 	if len(lines) == 0 {
-		lines = [][]byte{}
+		lines = [][]byte{{}}
 	}
 
 	return &Buffer{
