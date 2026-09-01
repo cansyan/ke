@@ -480,6 +480,8 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 			e.CloseBuffer()
 		case "ctrl+r":
 			e.palette.Open(e, "@")
+		case "ctrl+shift+r":
+			e.palette.Open(e, "#")
 		case "ctrl+g":
 			e.GotoDefinition()
 			return nil
@@ -1573,6 +1575,32 @@ func (e *Editor) Goto(path string, row, col int) error {
 	return e.jumpTo(Location{Path: path, Row: row, Col: col})
 }
 
+func (e *Editor) GotoLSPLocation(l lsp.Location) error {
+	e.recordJump()
+
+	v := e.View()
+	if v == nil {
+		return nil
+	}
+
+	path := uriToPath(l.URI)
+	// 1. Switch buffer if needed (normalize paths in production if necessary)
+	if path != "" && path != e.Buf().Path {
+		if err := e.OpenFile(path); err != nil {
+			return err
+		}
+	}
+
+	buf := e.Buf()
+	if buf == nil {
+		return nil
+	}
+
+	row := l.Range.Start.Line
+	col := LSPCharToByteOffset(buf.Lines[row], l.Range.Start.Character)
+	return e.jumpTo(Location{Path: path, Row: row, Col: col})
+}
+
 func (e *Editor) GotoPrevDiag() {
 	diags, ok := e.diagnostics[e.Buf().Path]
 	if !ok {
@@ -1761,76 +1789,6 @@ func trimToWidth(s string, width int) string {
 	return string(runes[:width])
 }
 
-// CheckSemantics checks syntax and type error.
-// filename is used for position resolution (e.g., "main.go").
-// src can be a string, []byte, or io.Reader.
-//
-// It responds instantly(~5-20ms), as a tradeoff,
-// external module imports are not resolved and are filtered out.
-// func CheckSemantics(filename string, src any) scanner.ErrorList {
-// 	fset := token.NewFileSet()
-// 	// 1. Parse AST with comments and full error reporting
-// 	file, err := parser.ParseFile(fset, filename, src, parser.AllErrors)
-
-// 	var errs scanner.ErrorList
-
-// 	// 2. Collect syntax errors first
-// 	if err != nil {
-// 		if scannerErrs, ok := err.(scanner.ErrorList); ok {
-// 			return scannerErrs
-// 		}
-// 		// If syntax is broken, return early (type checking invalid AST causes redundant noise)
-// 		return errs
-// 	}
-
-// 	// 3. Configure type checker for semantic validation
-// 	pkgName := file.Name.Name
-// 	if pkgName == "" {
-// 		pkgName = "main"
-// 	}
-
-// 	conf := types.Config{
-// 		// only resolve standard library imports, ignores third-party or local module
-// 		Importer: importer.Default(),
-
-// 		// Custom error handler to collect semantic diagnostics
-// 		Error: func(err error) {
-// 			if typeErr, ok := err.(types.Error); ok {
-// 				// Suppress import resolution errors for external modules during real-time typing
-// 				if strings.Contains(typeErr.Msg, "could not import") ||
-// 					strings.Contains(typeErr.Msg, "cannot find package") {
-// 					return
-// 				}
-
-// 				pos := fset.Position(typeErr.Pos)
-// 				errs.Add(pos, typeErr.Msg)
-// 			}
-// 		},
-// 	}
-
-// 	// Optional: Pass an empty Info struct to trigger full type resolution
-// 	info := &types.Info{
-// 		Types:      make(map[ast.Expr]types.TypeAndValue),
-// 		Defs:       make(map[*ast.Ident]types.Object),
-// 		Uses:       make(map[*ast.Ident]types.Object),
-// 		Implicits:  make(map[ast.Node]types.Object),
-// 		Selections: make(map[*ast.SelectorExpr]*types.Selection),
-// 	}
-
-// 	// 4. Run type checker on the AST
-// 	_, _ = conf.Check(pkgName, fset, []*ast.File{file}, info)
-// 	// Optional: Multi-file package type checking
-// 	/*
-// 		If your file references types or functions declared in another file in the same package,
-// 		go/types will report them as undefined if only a single file AST is passed.
-// 		To handle multi-file packages in your editor,
-// 		simply pass all parsed AST files in the same directory to conf.Check:
-// 		_, _ = conf.Check(pkgName, fset, []*ast.File{currentFileAST, otherFileAST1, otherFileAST2}, info)
-// 	*/
-
-// 	return errs
-// }
-
 type SymbolPosition struct {
 	Name     string
 	Receiver string
@@ -1847,7 +1805,8 @@ func (s SymbolPosition) String() string {
 }
 
 // ExtractSymbols collects all top-level symbols in the file.
-// It is in-memory and fast.
+// It is in-memory and fast, and does not require a running LSP server.
+// TODO: kind of duplicates the lsp.Client.DocumentSymbols
 func ExtractSymbols(filename string, src any) []SymbolPosition {
 	fset := token.NewFileSet()
 	file, err := parser.ParseFile(fset, filename, src, 0)
@@ -1861,12 +1820,12 @@ func ExtractSymbols(filename string, src any) []SymbolPosition {
 		switch d := decl.(type) {
 		case *ast.FuncDecl:
 			pos := fset.Position(d.Name.Pos())
-			kind := "func"
+			kind := "Func"
 
 			// Extract receiver type if this function is a method
 			var recv string
 			if d.Recv != nil && len(d.Recv.List) > 0 {
-				kind = "method"
+				kind = "Method"
 				recv = formatReceiver(d.Recv.List[0].Type)
 			}
 
@@ -1882,11 +1841,11 @@ func ExtractSymbols(filename string, src any) []SymbolPosition {
 				switch s := spec.(type) {
 				case *ast.TypeSpec:
 					pos := fset.Position(s.Name.Pos())
-					kind := "type"
+					kind := "Type"
 					if _, ok := s.Type.(*ast.StructType); ok {
-						kind = "struct"
+						kind = "Struct"
 					} else if _, ok := s.Type.(*ast.InterfaceType); ok {
-						kind = "interface"
+						kind = "Interface"
 					}
 					results = append(results, SymbolPosition{
 						Name:     s.Name.Name,
@@ -1895,9 +1854,9 @@ func ExtractSymbols(filename string, src any) []SymbolPosition {
 					})
 
 				case *ast.ValueSpec:
-					kind := "var"
+					kind := "Var"
 					if d.Tok == token.CONST {
-						kind = "const"
+						kind = "Const"
 					}
 					for _, name := range s.Names {
 						pos := fset.Position(name.Pos())
@@ -2162,7 +2121,7 @@ type Palette struct {
 	Index   int // selected item
 	Offset  int // scrolling offset
 	MaxRows int // UI render cap (e.g., 10 items)
-	symbols []SymbolPosition
+	symbols []lsp.DocumentSymbol
 }
 
 // Open initializes the palette with a starting prefix ("@", ":", "/", or "").
@@ -2192,6 +2151,8 @@ func (p *Palette) Refresh(e *Editor) {
 	switch {
 	case strings.HasPrefix(input, "@"):
 		p.Items = p.symbolItems(e, strings.TrimPrefix(input, "@"))
+	case strings.HasPrefix(input, "#"):
+		p.Items = p.workspaceSymbolItems(e, strings.TrimPrefix(input, "#"))
 	case strings.HasPrefix(input, ":"):
 		p.Items = p.lineItems(e, strings.TrimPrefix(input, ":"))
 	case strings.HasPrefix(input, "/"):
@@ -2219,16 +2180,20 @@ func (p *Palette) symbolItems(e *Editor, query string) []PaletteItem {
 	}
 
 	if p.symbols == nil {
-		p.symbols = ExtractSymbols(e.Buf().Path, e.Buf().NewReader())
+		symbols, err := e.lspClient.DocumentSymbols(pathToURI(e.Buf().Path))
+		if err != nil {
+			log.Printf("failed to fetch document symbols: %v", err)
+			return nil
+		}
+		p.symbols = symbols
 	}
 	var items []PaletteItem
 
 	for _, sym := range p.symbols {
-
 		if query != "" {
 			match := true
 			for _, q := range queries {
-				if !strings.Contains(strings.ToLower(sym.String()), q) {
+				if !strings.Contains(strings.ToLower(sym.Name), q) {
 					match = false
 					break
 				}
@@ -2238,16 +2203,42 @@ func (p *Palette) symbolItems(e *Editor, query string) []PaletteItem {
 			}
 		}
 
+		row := sym.Range.Start.Line
+		col := LSPCharToByteOffset(e.Buf().Lines[row], sym.Range.Start.Character)
 		items = append(items, PaletteItem{
-			Label:  sym.String(),
-			Detail: sym.Kind,
-			// Kind: sym.Kind,
+			Label:  sym.Name,
+			Detail: sym.Kind.String(),
 			Action: func(ed *Editor) {
 				ed.recordJump()
 				ed.View().Cursor = Position{
-					Row: sym.Line - 1,
-					Col: sym.Column - 1,
+					Row: row,
+					Col: col,
 				}
+			},
+		})
+	}
+	return items
+}
+
+func (p *Palette) workspaceSymbolItems(e *Editor, query string) []PaletteItem {
+	if e.Buf() == nil {
+		return nil
+	}
+
+	symbols, err := e.lspClient.WorkspaceSymbols(query)
+	if err != nil {
+		log.Printf("failed to fetch workspace symbols: %v", err)
+		return nil
+	}
+
+	var items []PaletteItem
+	for _, sym := range symbols {
+		items = append(items, PaletteItem{
+			Label:  sym.Name,
+			Detail: sym.Kind.String(),
+			Action: func(ed *Editor) {
+				// TODO
+				ed.GotoLSPLocation(sym.Location)
 			},
 		})
 	}
@@ -2291,6 +2282,9 @@ func (p *Palette) commandItems(_ *Editor, query string) []PaletteItem {
 		}},
 		{"LSP: goto symbol", "ctrl+r", func(e *Editor) {
 			e.palette.Open(e, "@")
+		}},
+		{"LSP: goto symbol in workspace", "ctrl+shift+r", func(e *Editor) {
+			e.palette.Open(e, "#")
 		}},
 		{"LSP: rename symbol", "", func(e *Editor) {
 			if !isGoFile(e.Buf().Path) {
@@ -3354,7 +3348,6 @@ func (e *Editor) Rename(newName string) error {
 	// Apply edits across all files returned by gopls
 	for fileURI, edits := range editsPerFile {
 		filePath := uriToPath(fileURI)
-		// TODO: load buffer
 		err := e.OpenFile(filePath)
 		if err != nil {
 			continue
@@ -3384,20 +3377,3 @@ func (e *Editor) Rename(newName string) error {
 	e.message = fmt.Sprintf("Renamed symbol: applied %d edits across %d file(s)", totalEdits, affectedFiles)
 	return nil
 }
-
-// Helper: Fetch buffer from active editor memory, or load file if unopened
-// func (e *Editor) getOrLoadBuffer(filePath string) *Buffer {
-// 	for _, b := range e.buffers {
-// 		if b.Path == filePath {
-// 			return b
-// 		}
-// 	}
-// 	// Load unopened file into memory buffer so edits apply seamlessly
-// 	b, err := NewBuffer(filePath)
-// 	if err != nil {
-// 		return nil
-// 	}
-// 	e.buffers = append(e.buffers, b)
-// 	e.NotifyBufferOpened(b)
-// 	return b
-// }

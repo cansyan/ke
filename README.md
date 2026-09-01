@@ -59,5 +59,3 @@ Technical decisions:
 - future key chords, Ctrl+K or Ctrl+X as leader key are good, but both taken. 
 - early version should keep things tiny, avoid duplicate selection, mutilple cursor, undo/redo
 - using / as command prefix is more convenient than > (shift+.)
-- in-process semantics checking ignores external file/module, benefits instant feedback
-- using gopls cli commands, skipping massive details of LSP communications.

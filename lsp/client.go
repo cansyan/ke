@@ -265,19 +265,6 @@ func (c *Client) GotoDefinition(uri string, line, char int) ([]Location, error) 
 	}
 }
 
-// Diagnostic represents an item reported by textDocument/publishDiagnostics.
-type Diagnostic struct {
-	Range    Range  `json:"range"`
-	Severity int    `json:"severity,omitempty"` // 1: Error, 2: Warning, 3: Information, 4: Hint
-	Code     string `json:"code,omitempty"`
-	Message  string `json:"message"`
-}
-
-type PublishDiagnosticsParams struct {
-	URI         string       `json:"uri"`
-	Diagnostics []Diagnostic `json:"diagnostics"`
-}
-
 // handleServerNotification dispatches incoming async notifications from the LSP server.
 func (c *Client) handleServerNotification(method string, params json.RawMessage) {
 	switch method {
@@ -382,4 +369,163 @@ func (c *Client) Rename(uri string, line, char int, newName string) (*WorkspaceE
 	case <-time.After(5 * time.Second):
 		return nil, fmt.Errorf("rename request timed out")
 	}
+}
+
+func (c *Client) DocumentSymbols(uri string) ([]DocumentSymbol, error) {
+	params := DocumentSymbolParams{
+		TextDocument: TextDocumentIdentifier{URI: uri},
+	}
+
+	respChan := make(chan []byte, 1)
+	id := c.SendRequest("textDocument/documentSymbol", params)
+
+	c.pendingMu.Lock()
+	if c.pending == nil {
+		c.pending = make(map[int64]chan []byte)
+	}
+	c.pending[id] = respChan
+	c.pendingMu.Unlock()
+
+	defer func() {
+		c.pendingMu.Lock()
+		delete(c.pending, id)
+		c.pendingMu.Unlock()
+	}()
+
+	select {
+	case data := <-respChan:
+		if len(data) == 0 || string(data) == "null" {
+			return nil, nil
+		}
+		return decodeDocumentSymbols(data)
+	case <-time.After(3 * time.Second):
+		return nil, fmt.Errorf("document symbols request timed out")
+	}
+}
+
+func (c *Client) GetFileSymbols(uri string) ([]DocumentSymbol, error) {
+	return c.DocumentSymbols(uri)
+}
+
+func (c *Client) FileSymbols(uri string) ([]DocumentSymbol, error) {
+	return c.DocumentSymbols(uri)
+}
+
+func (c *Client) WorkspaceSymbols(query string) ([]SymbolInformation, error) {
+	params := WorkspaceSymbolParams{Query: query}
+
+	respChan := make(chan []byte, 1)
+	id := c.SendRequest("workspace/symbol", params)
+
+	c.pendingMu.Lock()
+	if c.pending == nil {
+		c.pending = make(map[int64]chan []byte)
+	}
+	c.pending[id] = respChan
+	c.pendingMu.Unlock()
+
+	defer func() {
+		c.pendingMu.Lock()
+		delete(c.pending, id)
+		c.pendingMu.Unlock()
+	}()
+
+	select {
+	case data := <-respChan:
+		if len(data) == 0 || string(data) == "null" {
+			return nil, nil
+		}
+
+		var symbols []SymbolInformation
+		if err := json.Unmarshal(data, &symbols); err == nil {
+			return symbols, nil
+		}
+
+		var single SymbolInformation
+		if err := json.Unmarshal(data, &single); err == nil && single.Name != "" {
+			return []SymbolInformation{single}, nil
+		}
+
+		return nil, fmt.Errorf("failed to parse workspace symbols response")
+	case <-time.After(5 * time.Second):
+		return nil, fmt.Errorf("workspace symbols request timed out")
+	}
+}
+
+func (c *Client) GetWorkspaceSymbols(query string) ([]SymbolInformation, error) {
+	return c.WorkspaceSymbols(query)
+}
+
+func decodeDocumentSymbols(data []byte) ([]DocumentSymbol, error) {
+	if len(data) == 0 || string(data) == "null" {
+		return nil, nil
+	}
+
+	var items []map[string]json.RawMessage
+	if err := json.Unmarshal(data, &items); err == nil && len(items) > 0 {
+		if _, hasChildren := items[0]["children"]; hasChildren {
+			var hier []DocumentSymbol
+			if err := json.Unmarshal(data, &hier); err == nil {
+				return hier, nil
+			}
+		}
+		if _, hasLocation := items[0]["location"]; hasLocation {
+			var flat []SymbolInformation
+			if err := json.Unmarshal(data, &flat); err == nil {
+				out := make([]DocumentSymbol, 0, len(flat))
+				for _, s := range flat {
+					selection := s.Location.Range
+					out = append(out, DocumentSymbol{
+						Name:           s.Name,
+						Kind:           s.Kind,
+						Deprecated:     s.Deprecated,
+						Range:          s.Location.Range,
+						SelectionRange: selection,
+					})
+				}
+				return out, nil
+			}
+		}
+	}
+
+	var hier []DocumentSymbol
+	if err := json.Unmarshal(data, &hier); err == nil {
+		return hier, nil
+	}
+
+	var flat []SymbolInformation
+	if err := json.Unmarshal(data, &flat); err == nil {
+		out := make([]DocumentSymbol, 0, len(flat))
+		for _, s := range flat {
+			selection := s.Location.Range
+			out = append(out, DocumentSymbol{
+				Name:           s.Name,
+				Kind:           s.Kind,
+				Deprecated:     s.Deprecated,
+				Range:          s.Location.Range,
+				SelectionRange: selection,
+			})
+		}
+		return out, nil
+	}
+
+	return nil, fmt.Errorf("failed to parse document symbols response")
+}
+
+func decodeWorkspaceSymbols(data []byte) ([]SymbolInformation, error) {
+	if len(data) == 0 || string(data) == "null" {
+		return nil, nil
+	}
+
+	var symbols []SymbolInformation
+	if err := json.Unmarshal(data, &symbols); err == nil {
+		return symbols, nil
+	}
+
+	var single SymbolInformation
+	if err := json.Unmarshal(data, &single); err == nil && single.Name != "" {
+		return []SymbolInformation{single}, nil
+	}
+
+	return nil, fmt.Errorf("failed to parse workspace symbols response")
 }
