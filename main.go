@@ -258,6 +258,7 @@ func (e *Editor) Buf() *Buffer {
 
 func (e *Editor) Init(ctx *kero.Context) error {
 	e.View().SetSize(ctx.Width, ctx.Height)
+	e.View().ShowCursorSmart()
 	return nil
 }
 
@@ -369,8 +370,7 @@ func (e *Editor) handleMouse(ctx *kero.Context, m kero.MouseEvent) error {
 						return nil
 					}
 					e.ref.Index = index
-					loc := e.ref.Items[index]
-					e.Goto(loc.Path, loc.Row, loc.Col)
+					e.GotoLSPLocation(e.ref.Items[index])
 					return nil
 				}
 			}
@@ -477,6 +477,10 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 		switch key.String() {
 		case "ctrl+n":
 			e.requestCompletion()
+			// if only one item, insert it directly
+			if e.completion.Active && len(e.completion.Items) == 1 {
+				e.applyCompletion()
+			}
 		case "ctrl+-":
 			e.JumpBack()
 		case "ctrl+shift+-", "ctrl+_":
@@ -515,13 +519,13 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 				return nil
 			}
 			loc := e.ref.Next()
-			e.Goto(loc.Path, loc.Row, loc.Col)
+			e.GotoLSPLocation(loc)
 		case "ctrl+shift+[", "ctrl+{":
 			if len(e.ref.Items) <= 1 {
 				return nil
 			}
 			loc := e.ref.Prev()
-			e.Goto(loc.Path, loc.Row, loc.Col)
+			e.GotoLSPLocation(loc)
 		case "ctrl+s":
 			if err := e.SaveFile(); err != nil {
 				e.message = err.Error()
@@ -980,11 +984,11 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 	}
 
 	cursorVisCol := v.Buf.ByteToVisualCol(v.Cursor, 4)
-	cursorX := textRect.X + cursorVisCol - v.ScrollCol
-	cursorY := 0 + v.Cursor.Row - v.ScrollRow
-	if textRect.Contains(kero.Point{X: cursorX, Y: cursorY}) {
+	if v.cursorVisible() {
 		fullLinePadded := padTab(string(v.Buf.Lines[v.Cursor.Row]), 4)
 		ch := ' '
+		cursorX := textRect.X + cursorVisCol - v.ScrollCol
+		cursorY := 0 + v.Cursor.Row - v.ScrollRow
 		if cursorVisCol < len(fullLinePadded) {
 			ch = rune(fullLinePadded[cursorVisCol])
 		}
@@ -1862,18 +1866,6 @@ func (e *Editor) CloseBuffer() {
 	e.message = ""
 }
 
-func (e *Editor) NextBuffer() {
-	if len(e.views) > 1 {
-		e.active = (e.active + 1) % len(e.views)
-	}
-}
-
-func (e *Editor) PrevBuffer() {
-	if len(e.views) > 1 {
-		e.active = (e.active - 1 + len(e.views)) % len(e.views)
-	}
-}
-
 func readLines(r io.Reader) ([][]byte, error) {
 	var lines [][]byte
 	reader := bufio.NewReader(r)
@@ -2179,15 +2171,14 @@ func (p *Palette) commandItems(_ *Editor, query string) []PaletteItem {
 		{"jump forward", "ctrl+shift+-", func(e *Editor) {
 			e.JumpForward()
 		}},
-		{"next buffer", "", func(e *Editor) {
-			e.NextBuffer()
-		}},
-		{"prev buffer", "", func(e *Editor) {
-			e.PrevBuffer()
-		}},
-		{"LSP: check", "", func(e *Editor) {
-			// e.diagnose()
-		}},
+		/*
+			{"next buffer", "", func(e *Editor) {
+				e.NextBuffer()
+			}},
+			{"prev buffer", "", func(e *Editor) {
+				e.PrevBuffer()
+			}},
+		*/
 		{"LSP: find references", "", func(e *Editor) {
 			e.FindReferences()
 		}},
@@ -2220,14 +2211,14 @@ func (p *Palette) commandItems(_ *Editor, query string) []PaletteItem {
 				return
 			}
 			loc := e.ref.Next()
-			e.Goto(loc.Path, loc.Row, loc.Col)
+			e.GotoLSPLocation(loc)
 		}},
 		{"prev reference", "ctrl+shift+[", func(e *Editor) {
 			if len(e.ref.Items) <= 1 {
 				return
 			}
 			loc := e.ref.Prev()
-			e.Goto(loc.Path, loc.Row, loc.Col)
+			e.GotoLSPLocation(loc)
 		}},
 	}
 
@@ -2669,13 +2660,13 @@ func (e *Editor) GotoDefinition() error {
 type ReferencesPanel struct {
 	Active    bool
 	Index     int // active item
-	Items     []Location
+	Items     []lsp.Location
 	ScrollRow int // vertical scrolling
 	Height    int // UI render cap
 	Header    string
 }
 
-func NewReferencesPanel(header string, items []Location) ReferencesPanel {
+func NewReferencesPanel(header string, items []lsp.Location) ReferencesPanel {
 	return ReferencesPanel{Active: true, Header: header, Items: items, Height: 10}
 }
 
@@ -2687,43 +2678,42 @@ func (r *ReferencesPanel) VisibleRows() int {
 	return min(len(r.Items), h)
 }
 
-func (r *ReferencesPanel) Next() Location {
+func (r *ReferencesPanel) showActiveItem() {
+	if r.Index < r.ScrollRow {
+		r.ScrollRow = r.Index
+	}
+	visibleRows := r.Height - 1
+	if visibleRows <= 0 {
+		visibleRows = 10 - 1
+	}
+	if r.Index > r.ScrollRow+visibleRows-1 {
+		r.ScrollRow = r.Index - visibleRows + 1
+	}
+}
+
+func (r *ReferencesPanel) Next() lsp.Location {
 	total := len(r.Items)
 	if total == 0 {
-		return Location{}
+		return lsp.Location{}
 	}
 	if total == 1 {
 		return r.Items[0]
 	}
 	r.Index = (r.Index + 1) % total
-
-	// Calculate scrolling offset to keep selected item inside dropdown viewport
-	visibleRows := r.VisibleRows()
-	scroll := 0
-	if r.Index >= visibleRows {
-		scroll = r.Index - visibleRows + 1
-	}
-	r.ScrollRow = scroll
+	r.showActiveItem()
 	return r.Items[r.Index]
 }
 
-func (r *ReferencesPanel) Prev() Location {
+func (r *ReferencesPanel) Prev() lsp.Location {
 	total := len(r.Items)
 	if total == 0 {
-		return Location{}
+		return lsp.Location{}
 	}
 	if total == 1 {
 		return r.Items[0]
 	}
 	r.Index = (r.Index - 1 + total) % total
-
-	// Calculate scrolling offset to keep selected item inside dropdown viewport
-	visibleRows := r.VisibleRows()
-	scroll := 0
-	if r.Index >= visibleRows {
-		scroll = r.Index - visibleRows + 1
-	}
-	r.ScrollRow = scroll
+	r.showActiveItem()
 	return r.Items[r.Index]
 }
 
@@ -2766,18 +2756,9 @@ func (e *Editor) FindReferences() error {
 		return nil
 	}
 
-	// Multiple references
-	locations := make([]Location, 0, len(locs))
-	for _, l := range locs {
-		locations = append(locations, Location{
-			Path: uriToPath(l.URI),
-			Row:  l.Range.Start.Line,
-			Col:  lsp.CharToByteOffset(buf.Lines[l.Range.Start.Line], l.Range.Start.Character),
-		})
-	}
 	start, end := buf.WordBounds(e.View().Cursor)
-	header := fmt.Sprintf("%d references for %q", len(locations), buf.TextRange(start, end))
-	e.ref = NewReferencesPanel(header, locations)
+	header := fmt.Sprintf("%d references for %q", len(locs), buf.TextRange(start, end))
+	e.ref = NewReferencesPanel(header, locs)
 	return nil
 }
 
@@ -2826,15 +2807,17 @@ func (e *Editor) drawReferences(f *kero.Frame, rect kero.Rect) {
 			itemStyle = itemStyle.Bold()
 		}
 
-		buf, err := getBuffer(item.Path)
+		path := uriToPath(item.URI)
+		buf, err := getBuffer(path)
 		if err != nil {
 			log.Print(err)
 			continue
 		}
 
-		line := string(buf.Lines[item.Row])
-		text := fmt.Sprintf("%s %s:%d:%d: %s", indicator, filepath.Base(item.Path), item.Row+1,
-			item.Col+1, line)
+		line := buf.Lines[item.Range.Start.Line]
+		col := lsp.CharToByteOffset(line, item.Range.Start.Character)
+		text := fmt.Sprintf("%s %s:%d:%d: %s", indicator, filepath.Base(path), item.Range.Start.Line+1,
+			col+1, line)
 		runes := []rune(text)
 
 		if len(runes) > rect.W {
@@ -3203,7 +3186,7 @@ func (e *Editor) Rename(newName string) error {
 		totalEdits += len(edits)
 		affectedFiles++
 
-		// TODO: consider to clamp the cursor, save the file after applying edits
+		// TODO: consider to save the file after applying edits
 		e.View().Cursor = e.Buf().Clamp(e.View().Cursor)
 	}
 
