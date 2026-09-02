@@ -18,9 +18,11 @@ Key bindings:
 - Ctrl+P command palette
 	- `/command` command picker
 	- `@symbol` symbol picker
+	- `#symbol` workspace symbol picker
 	- `:linenumber` goto line
 - Ctrl+Shift+P command picker
 - Ctrl+R symbol picker
+- Ctrl+Shift+R workspace symbol picker
 - Ctrl+Backspace delete to line start
 - Ctrl+K delete to line end
 - Ctrl+Enter insert newline below
@@ -53,6 +55,7 @@ Mouse motions:
 - mouse_left_press move cursor
 - mouse_left_drag expand selection
 - ctrl+mouse_left_release goto definition
+- alt+mouse_left_release find references
 
 Technical decisions:
 - using key ctrl+[, ctrl+d, ctrl+c is ok with Kitty protocol enabled

@@ -330,7 +330,7 @@ func (e *Editor) handleMouse(ctx *kero.Context, m kero.MouseEvent) error {
 		}
 	case kero.MouseWheelDown:
 		p := e.palette
-		if p.Active && paletteRect.Contains(kero.Point{X: m.X, Y: m.Y}) {
+		if p.Active && paletteRect.Contains(point) {
 			e.palette.Offset = min(p.Offset+1, len(p.Items)-p.VisibleRows())
 			return nil
 		}
@@ -348,7 +348,7 @@ func (e *Editor) handleMouse(ctx *kero.Context, m kero.MouseEvent) error {
 		switch m.Action {
 		case kero.MousePress:
 			if e.palette.Active {
-				if paletteRect.Contains(kero.Point{X: m.X, Y: m.Y}) {
+				if paletteRect.Contains(point) {
 					index := m.Y - paletteRect.Y - 1 + e.palette.Offset
 					if index < 0 || index >= len(e.palette.Items) {
 						return nil
@@ -358,7 +358,7 @@ func (e *Editor) handleMouse(ctx *kero.Context, m kero.MouseEvent) error {
 					action(e)
 					return nil
 				}
-				// close palette overlay when click outside
+				// close palette overlay when lost focus
 				e.palette.Close()
 			}
 
@@ -392,9 +392,13 @@ func (e *Editor) handleMouse(ctx *kero.Context, m kero.MouseEvent) error {
 
 		case kero.MouseRelease:
 			if textRect.Contains(point) {
-				// ctrl+mouse_left_release goto definition
-				if m.Mod == kero.ModCtrl {
+				switch m.Mod {
+				case kero.ModCtrl:
+					// ctrl+mouse_left_release goto definition
 					e.GotoDefinition()
+				case kero.ModAlt:
+					// alt+mouse_left_release find references
+					e.FindReferences()
 				}
 				return nil
 			}
@@ -2633,10 +2637,7 @@ func (e *Editor) GotoDefinition() error {
 
 	// Jump to the first resolved location
 	target := locs[0]
-	path := uriToPath(target.URI)
-	row := target.Range.Start.Line
-	col := lsp.CharToByteOffset(buf.Lines[row], target.Range.Start.Character)
-	e.Goto(path, row, col)
+	e.GotoLSPLocation(target)
 	return nil
 }
 
