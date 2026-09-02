@@ -209,29 +209,34 @@ func NewEditor(filePath string, row, col int) (*Editor, error) {
 		diagnostics: make(map[string][]lsp.Diagnostic),
 	}
 
-	// 1. Start gopls
-	client, err := lsp.StartClient("gopls", e.handleDiagnostics)
-	if err != nil {
-		return nil, fmt.Errorf("failed to start gopls: %w", err)
-	}
-	e.lspClient = client
-
-	// 2. Send Initialize request
-	workspace := FindWorkspaceDir(filePath)
-	client.SendRequest("initialize", lsp.InitializeParams{
-		ProcessID: os.Getpid(),
-		RootURI:   "file://" + workspace,
-	})
-	client.SendNotification("initialized", struct{}{})
-
-	// 3. prepare diagnostic
-	go e.StartDebouncer()
-
 	if err := e.OpenFile(filePath); err != nil {
 		return nil, err
 	}
 	e.View().Cursor = e.Buf().Clamp(Position{Row: row, Col: col})
 	return e, nil
+}
+
+func (e *Editor) startLSP(path string) error {
+	if e.lspClient != nil || !isGoFile(path) {
+		return nil
+	}
+
+	client, err := lsp.StartClient("gopls", e.handleDiagnostics)
+	if err != nil {
+		return fmt.Errorf("failed to start gopls: %w", err)
+	}
+	e.lspClient = client
+
+	workspace := FindWorkspaceDir(path)
+	client.SendRequest("initialize", lsp.InitializeParams{
+		ProcessID: os.Getpid(),
+		RootURI:   "file://" + workspace,
+	})
+	client.SendNotification("initialized", struct{}{})
+	e.changeChan = make(chan *Buffer, 100)
+	e.stopChan = make(chan struct{})
+	go e.StartDebouncer()
+	return nil
 }
 
 // View returns the currently focused View.
@@ -1787,6 +1792,9 @@ func (e *Editor) OpenFile(path string) error {
 		}
 		path = absPath
 	}
+	if err := e.startLSP(path); err != nil {
+		return err
+	}
 
 	// switch to existing buffer
 	for i, v := range e.views {
@@ -2122,7 +2130,6 @@ func (p *Palette) workspaceSymbolItems(e *Editor, query string) []PaletteItem {
 			Label:  sym.Name,
 			Detail: sym.Kind.String(),
 			Action: func(ed *Editor) {
-				// TODO
 				ed.GotoLSPLocation(sym.Location)
 			},
 		})
@@ -2440,7 +2447,10 @@ func (e *Editor) drawPalette(f *kero.Frame, rect kero.Rect) {
 
 func (e *Editor) requestCompletion() {
 	v := e.View()
-	if v.Buf != nil && v.Buf.Path != "" && v.Buf.Dirty {
+	if v == nil || v.Buf == nil || e.lspClient == nil || !isGoFile(v.Buf.Path) {
+		return
+	}
+	if v.Buf.Path != "" && v.Buf.Dirty {
 		// gopls completion must operate on the latest document content. The per-key
 		// didChange notifications are debounced, so trigger the completion request
 		// after syncing the current buffer text to the server.
@@ -2474,7 +2484,7 @@ func (e *Editor) applyCompletion() {
 	item := c.Items[c.Index]
 	switch {
 	case item.TextEdit != nil:
-		v.Cursor = v.Buf.applySingleEdit(*item.TextEdit)
+		v.Cursor = v.Buf.ApplyTextEdit(*item.TextEdit)
 	case item.InsertText != "":
 		v.Cursor = v.Buf.Insert(v.Cursor, item.InsertText)
 	case item.Label != "":
@@ -2816,6 +2826,9 @@ func pathToURI(path string) string {
 
 // Notify LSP when a buffer is opened
 func (e *Editor) NotifyBufferOpened(buf *Buffer) {
+	if e.lspClient == nil || buf == nil || !isGoFile(buf.Path) {
+		return
+	}
 	uri := pathToURI(buf.Path)
 	e.docVers[buf.Path] = 1
 
@@ -2835,6 +2848,9 @@ func (e *Editor) NotifyBufferOpened(buf *Buffer) {
 // for files under a few thousand lines.
 // gopls handles full updates rapidly without needing complex incremental edit diffing
 func (e *Editor) NotifyBufferChanged(buf *Buffer) {
+	if e.lspClient == nil || buf == nil || !isGoFile(buf.Path) {
+		return
+	}
 	uri := pathToURI(buf.Path)
 	e.docVers[buf.Path]++
 	version := e.docVers[buf.Path]
@@ -2870,9 +2886,6 @@ func (e *Editor) handleDiagnostics(uri string, diags []lsp.Diagnostic) {
 
 // StartDebouncer launches the background worker goroutine.
 func (e *Editor) StartDebouncer() {
-	e.changeChan = make(chan *Buffer, 100)
-	e.stopChan = make(chan struct{})
-
 	go func() {
 		var (
 			timer   *time.Timer
@@ -2912,7 +2925,9 @@ func (e *Editor) StartDebouncer() {
 
 // Close shuts down the background worker cleanly.
 func (e *Editor) Close() {
-	close(e.stopChan)
+	if e.stopChan != nil {
+		close(e.stopChan)
+	}
 	if e.lspClient != nil {
 		e.lspClient.Close()
 	}
@@ -3227,6 +3242,7 @@ func (e *Editor) Rename(newName string) error {
 		affectedFiles++
 
 		// TODO: consider to clamp the cursor, save the file after applying edits
+		e.View().Cursor = e.Buf().Clamp(e.View().Cursor)
 	}
 
 	// Clamp current view cursor in case active line shrank

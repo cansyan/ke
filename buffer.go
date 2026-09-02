@@ -830,13 +830,13 @@ func (b *Buffer) ApplyTextEdits(edits []lsp.TextEdit) {
 
 	// 2. Apply each edit from bottom to top
 	for _, edit := range edits {
-		b.applySingleEdit(edit)
+		b.ApplyTextEdit(edit)
 	}
 
 	b.Dirty = true
 }
 
-func (b *Buffer) applySingleEdit(edit lsp.TextEdit) Position {
+func (b *Buffer) ApplyTextEdit(edit lsp.TextEdit) Position {
 	startLine := edit.Range.Start.Line
 	endLine := edit.Range.End.Line
 
