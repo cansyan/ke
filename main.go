@@ -4,10 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"fmt"
-	"go/ast"
 	"go/format"
-	"go/parser"
-	"go/token"
 	"io"
 	"log"
 	"net/url"
@@ -382,6 +379,9 @@ func (e *Editor) handleMouse(ctx *kero.Context, m kero.MouseEvent) error {
 					// focus out
 					e.findBlur = true
 				}
+				if e.completion.Active {
+					e.completion.Active = false
+				}
 				return nil
 			}
 
@@ -441,10 +441,10 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 		return nil
 	}
 
-	var completing bool // mark whether showing completion on keystroke
-	defer func() {
-		e.completion.Active = completing
-	}()
+	// var completing bool // mark whether showing completion on keystroke
+	// defer func() {
+	// 	e.completion.Active = completing
+	// }()
 
 	v := e.View()
 	buf := e.Buf()
@@ -452,18 +452,7 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 	case kero.KeyRune:
 		switch key.String() {
 		case "ctrl+n":
-			start, end := buf.WordBounds(buf.PrevRunePos(v.Cursor))
-			word := buf.TextRange(start, end)
-			c := &e.completion
-			c.Refresh(buf.NewReader(), word)
-			if len(c.Items) == 1 {
-				// only 1 candidates, apply it early
-				cursor := buf.Delete(start, end)
-				v.Cursor = buf.Insert(cursor, c.Items[c.Index].Name)
-				e.markDirty()
-				return nil
-			}
-			completing = len(c.Items) > 0
+			e.requestCompletion()
 		case "ctrl+-":
 			e.JumpBack()
 		case "ctrl+shift+-", "ctrl+_":
@@ -570,17 +559,11 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 		v.Cursor = buf.Insert(v.Cursor, string([]rune{key.Rune}))
 		e.markDirty()
 		if e.completion.Active {
-			start, end := buf.WordBounds(buf.PrevRunePos(v.Cursor))
-			word := buf.TextRange(start, end)
-			e.completion.Refresh(buf.NewReader(), word)
-			completing = len(e.completion.Items) > 0
+			e.requestCompletion()
 		}
 	case kero.KeyEnter:
 		if e.completion.Active {
-			start, end := buf.WordBounds(buf.PrevRunePos(v.Cursor))
-			cursor := buf.Delete(start, end)
-			v.Cursor = buf.Insert(cursor, e.completion.Items[e.completion.Index].Name)
-			e.markDirty()
+			e.applyCompletion()
 			return nil
 		}
 
@@ -593,23 +576,27 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 			return nil
 		}
 
-		// compute indentation
-		getIndent := func(line []byte, col int) string {
+		// calculate indentation
+		indent := func(line []byte, col int) string {
 			if len(line) == 0 || col == 0 {
 				return ""
 			}
-			// get indentation before the column
+			if col > len(line) {
+				col = len(line)
+			}
+			// get indentation before the column, advancing through the prefix byte by byte.
+			prefix := line[:col]
 			var n int
-			for n <= len(line) {
-				r, size := utf8.DecodeRune(line[:col])
+			for n < len(prefix) {
+				r, size := utf8.DecodeRune(prefix[n:])
 				if !unicode.IsSpace(r) {
 					break
 				}
 				n += size
 			}
-			indent := string(line[:n])
+			indent := string(prefix[:n])
 			// indent on block start
-			if col == len(line) && line[col-1] == '{' {
+			if col == len(line) && len(line) > 0 && line[len(line)-1] == '{' {
 				indent += "\t"
 			}
 			return indent
@@ -619,7 +606,7 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 		case "ctrl+enter":
 			// insert newline below
 			line := buf.Lines[v.Cursor.Row]
-			indent := getIndent(line, len(line))
+			indent := indent(line, len(line))
 			p := Position{Row: v.Cursor.Row, Col: len(line)}
 			v.Cursor = buf.Insert(p, "\n"+indent)
 		case "shift+enter":
@@ -627,23 +614,20 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 			var prevIndent string
 			if v.Cursor.Row > 0 {
 				prevLine := buf.Lines[v.Cursor.Row-1]
-				prevIndent = getIndent(prevLine, len(prevLine))
+				prevIndent = indent(prevLine, len(prevLine))
 			}
 			buf.Insert(Position{Row: v.Cursor.Row, Col: 0}, "\n")
 			v.Cursor = buf.Insert(Position{Row: v.Cursor.Row, Col: 0}, prevIndent)
 		default:
 			// insert newline under cursor
 			line := buf.Lines[v.Cursor.Row]
-			indent := getIndent(line, v.Cursor.Col)
+			indent := indent(line, v.Cursor.Col)
 			v.Cursor = buf.Insert(v.Cursor, "\n"+string(indent))
 		}
 		e.markDirty()
 	case kero.KeyTab:
 		if e.completion.Active {
-			start, end := buf.WordBounds(buf.PrevRunePos(v.Cursor))
-			cursor := buf.Delete(start, end)
-			v.Cursor = buf.Insert(cursor, e.completion.Items[e.completion.Index].Name)
-			e.markDirty()
+			e.applyCompletion()
 			break
 		}
 
@@ -664,6 +648,9 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 	case kero.KeyBackspace:
 		if e.hasSelect() {
 			e.deleteSelect()
+			if e.completion.Active {
+				e.requestCompletion()
+			}
 			break
 		}
 		switch key.String() {
@@ -681,6 +668,9 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 			v.Cursor = buf.Delete(buf.PrevRunePos(v.Cursor), v.Cursor)
 		}
 		e.markDirty()
+		if e.completion.Active {
+			e.requestCompletion()
+		}
 	case kero.KeyDelete:
 		v.Cursor = buf.Delete(v.Cursor, buf.NextRunePos(v.Cursor))
 		e.markDirty()
@@ -738,7 +728,6 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 		default:
 			if e.completion.Active {
 				e.completion.Prev()
-				completing = true
 				return nil
 			}
 			v.moveUp()
@@ -760,7 +749,6 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 		default:
 			if e.completion.Active {
 				e.completion.Next()
-				completing = true
 				return nil
 			}
 			v.moveDown()
@@ -1597,7 +1585,7 @@ func (e *Editor) GotoLSPLocation(l lsp.Location) error {
 	}
 
 	row := l.Range.Start.Line
-	col := LSPCharToByteOffset(buf.Lines[row], l.Range.Start.Character)
+	col := lsp.CharToByteOffset(buf.Lines[row], l.Range.Start.Character)
 	return e.jumpTo(Location{Path: path, Row: row, Col: col})
 }
 
@@ -1614,7 +1602,7 @@ func (e *Editor) GotoPrevDiag() {
 	var prev lsp.Diagnostic
 	for _, d := range slices.Backward(diags) {
 		dRow := d.Range.Start.Line
-		dCol := LSPCharToByteOffset(v.Buf.Lines[dRow], d.Range.Start.Character)
+		dCol := lsp.CharToByteOffset(v.Buf.Lines[dRow], d.Range.Start.Character)
 		if dRow < v.Cursor.Row || (dRow == v.Cursor.Row && dCol < v.Cursor.Col) {
 			prev = d
 			break
@@ -1624,7 +1612,7 @@ func (e *Editor) GotoPrevDiag() {
 		prev = diags[len(diags)-1]
 	}
 	dRow := prev.Range.Start.Line
-	dCol := LSPCharToByteOffset(v.Buf.Lines[dRow], prev.Range.Start.Character)
+	dCol := lsp.CharToByteOffset(v.Buf.Lines[dRow], prev.Range.Start.Character)
 	e.Goto(v.Buf.Path, dRow, dCol)
 }
 
@@ -1641,7 +1629,7 @@ func (e *Editor) GotoNextDiag() {
 	var next lsp.Diagnostic
 	for _, d := range diags {
 		dRow := d.Range.Start.Line
-		dCol := LSPCharToByteOffset(v.Buf.Lines[dRow], d.Range.Start.Character)
+		dCol := lsp.CharToByteOffset(v.Buf.Lines[dRow], d.Range.Start.Character)
 		if dRow > v.Cursor.Row || (dRow == v.Cursor.Row && dCol > v.Cursor.Col) {
 			next = d
 			break
@@ -1651,7 +1639,7 @@ func (e *Editor) GotoNextDiag() {
 		next = diags[0]
 	}
 	dRow := next.Range.Start.Line
-	dCol := LSPCharToByteOffset(v.Buf.Lines[dRow], next.Range.Start.Character)
+	dCol := lsp.CharToByteOffset(v.Buf.Lines[dRow], next.Range.Start.Character)
 	e.Goto(v.Buf.Path, dRow, dCol)
 }
 
@@ -1787,106 +1775,6 @@ func trimToWidth(s string, width int) string {
 		return s
 	}
 	return string(runes[:width])
-}
-
-type SymbolPosition struct {
-	Name     string
-	Receiver string
-	Kind     string // "func", "method", "type", "struct", "var", "const"
-	token.Position
-}
-
-// combines receiver and symbol name
-func (s SymbolPosition) String() string {
-	if s.Receiver == "" {
-		return s.Name
-	}
-	return fmt.Sprintf("(%s).%s", s.Receiver, s.Name)
-}
-
-// ExtractSymbols collects all top-level symbols in the file.
-// It is in-memory and fast, and does not require a running LSP server.
-// TODO: kind of duplicates the lsp.Client.DocumentSymbols
-func ExtractSymbols(filename string, src any) []SymbolPosition {
-	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, filename, src, 0)
-	if err != nil && file == nil {
-		return nil
-	}
-
-	var results []SymbolPosition
-
-	for _, decl := range file.Decls {
-		switch d := decl.(type) {
-		case *ast.FuncDecl:
-			pos := fset.Position(d.Name.Pos())
-			kind := "Func"
-
-			// Extract receiver type if this function is a method
-			var recv string
-			if d.Recv != nil && len(d.Recv.List) > 0 {
-				kind = "Method"
-				recv = formatReceiver(d.Recv.List[0].Type)
-			}
-
-			results = append(results, SymbolPosition{
-				Name:     d.Name.Name,
-				Receiver: recv,
-				Kind:     kind,
-				Position: pos,
-			})
-
-		case *ast.GenDecl:
-			for _, spec := range d.Specs {
-				switch s := spec.(type) {
-				case *ast.TypeSpec:
-					pos := fset.Position(s.Name.Pos())
-					kind := "Type"
-					if _, ok := s.Type.(*ast.StructType); ok {
-						kind = "Struct"
-					} else if _, ok := s.Type.(*ast.InterfaceType); ok {
-						kind = "Interface"
-					}
-					results = append(results, SymbolPosition{
-						Name:     s.Name.Name,
-						Kind:     kind,
-						Position: pos,
-					})
-
-				case *ast.ValueSpec:
-					kind := "Var"
-					if d.Tok == token.CONST {
-						kind = "Const"
-					}
-					for _, name := range s.Names {
-						pos := fset.Position(name.Pos())
-						results = append(results, SymbolPosition{
-							Name:     name.Name,
-							Kind:     kind,
-							Position: pos,
-						})
-					}
-				}
-			}
-		}
-	}
-
-	return results
-}
-
-// formatReceiver recursively extracts the receiver string representation
-// handling pointer receivers (*Buffer) and value receivers (Buffer).
-func formatReceiver(expr ast.Expr) string {
-	switch t := expr.(type) {
-	case *ast.Ident:
-		return t.Name
-	case *ast.StarExpr:
-		return "*" + formatReceiver(t.X)
-	case *ast.IndexExpr: // Generic receiver: Buffer[T]
-		return fmt.Sprintf("%s[%s]", formatReceiver(t.X), formatReceiver(t.Index))
-	default:
-		return ""
-	}
 }
 
 // OpenFile loads a file into memory or focuses it if already loaded.
@@ -2169,7 +2057,7 @@ func (p *Palette) Refresh(e *Editor) {
 
 // Symbol Provider (@)
 func (p *Palette) symbolItems(e *Editor, query string) []PaletteItem {
-	if e.Buf() == nil {
+	if e.Buf() == nil || e.lspClient == nil {
 		return nil
 	}
 
@@ -2203,17 +2091,14 @@ func (p *Palette) symbolItems(e *Editor, query string) []PaletteItem {
 			}
 		}
 
+		path := e.Buf().Path
 		row := sym.Range.Start.Line
-		col := LSPCharToByteOffset(e.Buf().Lines[row], sym.Range.Start.Character)
+		col := lsp.CharToByteOffset(e.Buf().Lines[row], sym.Range.Start.Character)
 		items = append(items, PaletteItem{
 			Label:  sym.Name,
 			Detail: sym.Kind.String(),
 			Action: func(ed *Editor) {
-				ed.recordJump()
-				ed.View().Cursor = Position{
-					Row: row,
-					Col: col,
-				}
+				ed.Goto(path, row, col)
 			},
 		})
 	}
@@ -2221,7 +2106,7 @@ func (p *Palette) symbolItems(e *Editor, query string) []PaletteItem {
 }
 
 func (p *Palette) workspaceSymbolItems(e *Editor, query string) []PaletteItem {
-	if e.Buf() == nil {
+	if e.Buf() == nil || e.lspClient == nil {
 		return nil
 	}
 
@@ -2553,33 +2438,60 @@ func (e *Editor) drawPalette(f *kero.Frame, rect kero.Rect) {
 	}
 }
 
-type Completion struct {
-	Active bool
-	Index  int
-	Items  []SymbolPosition
+func (e *Editor) requestCompletion() {
+	v := e.View()
+	if v.Buf != nil && v.Buf.Path != "" && v.Buf.Dirty {
+		// gopls completion must operate on the latest document content. The per-key
+		// didChange notifications are debounced, so trigger the completion request
+		// after syncing the current buffer text to the server.
+		e.NotifyBufferChanged(v.Buf)
+	}
+
+	charOffset := lsp.CharFromByteOffset(v.Buf.Lines[v.Cursor.Row], v.Cursor.Col)
+	items, err := e.lspClient.Completion(pathToURI(v.Buf.Path), v.Cursor.Row, charOffset)
+	if err != nil {
+		e.completion.Items = nil
+		e.completion.Active = false
+		log.Print(err)
+		return
+	}
+	e.completion.Items = items
+	e.completion.Index = 0
+	e.completion.Active = len(items) > 0
 }
 
-func (c *Completion) Refresh(src any, query string) {
-	results := ExtractSymbols("", src)
-	if len(results) == 0 {
+func (e *Editor) applyCompletion() {
+	c := e.completion
+	if len(c.Items) == 0 || c.Index < 0 || c.Index >= len(c.Items) {
 		return
 	}
 
-	b := findQueryIgnoreCase(query)
-	items := make([]SymbolPosition, 0, len(results))
-	for _, s := range results {
-		if !b {
-			if strings.Contains(s.Name, query) {
-				items = append(items, s)
-			}
-		} else {
-			if strings.Contains(strings.ToLower(s.Name), strings.ToLower(query)) {
-				items = append(items, s)
-			}
-		}
+	v := e.View()
+	if v == nil || v.Buf == nil {
+		return
 	}
-	c.Items = items
-	c.Index = 0
+
+	item := c.Items[c.Index]
+	switch {
+	case item.TextEdit != nil:
+		v.Cursor = v.Buf.applySingleEdit(*item.TextEdit)
+	case item.InsertText != "":
+		v.Cursor = v.Buf.Insert(v.Cursor, item.InsertText)
+	case item.Label != "":
+		v.Cursor = v.Buf.Insert(v.Cursor, item.Label)
+	default:
+		e.completion.Active = false
+		return
+	}
+
+	e.markDirty()
+	e.completion.Active = false
+}
+
+type Completion struct {
+	Active bool
+	Index  int
+	Items  []lsp.CompletionItem
 }
 
 func (c *Completion) Next() {
@@ -2605,12 +2517,7 @@ func (e *Editor) drawCompletion(f *kero.Frame) {
 
 	c := e.completion
 	visibleRows := min(len(c.Items), 10)
-	var maxWidth int
-	for i := range c.Items {
-		if width := len([]rune(c.Items[i].String())); width > maxWidth {
-			maxWidth = width
-		}
-	}
+	maxWidth := 45
 
 	// Calculate scrolling offset to keep selected item inside dropdown viewport
 	offset := 0
@@ -2623,13 +2530,29 @@ func (e *Editor) drawCompletion(f *kero.Frame) {
 	y := e.View().Cursor.Row - e.View().ScrollRow
 	w := maxWidth + 3 // 2 for indicator, 1 for right padding
 	rect := kero.Rect{X: x, Y: y - visibleRows, W: w, H: visibleRows}
+	if rect.Y < 0 {
+		rect.Y = 0
+	}
 	f.Fill(rect, ' ', normal.Reverse())
 	for i := range visibleRows {
+		x := rect.X
 		y := rect.Y + i
+		item := c.Items[i+offset]
+		style := normal.Reverse()
+		prefix := " "
 		if i+offset == c.Index {
-			f.Write(rect.X, y, " >"+c.Items[i+offset].String(), normal.Reverse().Bold())
-		} else {
-			f.Write(rect.X, y, "  "+c.Items[i+offset].String(), normal.Reverse())
+			prefix = ">"
+			style = normal.Reverse().Bold()
+		}
+		label := prefix + c.Items[i+offset].Label
+		f.Write(rect.X, y, label, style)
+
+		// right side text
+		if item.Detail != "" && i+offset == c.Index {
+			x += runewidth.StringWidth(label)
+			remaining := rect.W - runewidth.StringWidth(label) - 3
+			dx := max(rect.Right()-runewidth.StringWidth(item.Detail), x+3)
+			f.Write(dx, y, runewidth.Truncate(item.Detail, remaining, ""), style)
 		}
 	}
 }
@@ -2683,7 +2606,7 @@ func (e *Editor) GotoDefinition() error {
 	}
 
 	lineBytes := buf.Lines[cursor.Row]
-	lspChar := ByteOffsetToLSPChar(lineBytes, cursor.Col)
+	lspChar := lsp.CharFromByteOffset(lineBytes, cursor.Col)
 	uri := pathToURI(buf.Path)
 
 	// Call gopls
@@ -2702,7 +2625,7 @@ func (e *Editor) GotoDefinition() error {
 	target := locs[0]
 	path := uriToPath(target.URI)
 	row := target.Range.Start.Line
-	col := LSPCharToByteOffset(buf.Lines[row], target.Range.Start.Character)
+	col := lsp.CharToByteOffset(buf.Lines[row], target.Range.Start.Character)
 	e.Goto(path, row, col)
 	return nil
 }
@@ -2792,7 +2715,7 @@ func (e *Editor) FindReferences() error {
 	}
 
 	lineBytes := buf.Lines[cursor.Row]
-	lspChar := ByteOffsetToLSPChar(lineBytes, cursor.Col)
+	lspChar := lsp.CharFromByteOffset(lineBytes, cursor.Col)
 	uri := pathToURI(buf.Path)
 
 	// Query gopls (include declaration = true)
@@ -2813,7 +2736,7 @@ func (e *Editor) FindReferences() error {
 		locations = append(locations, Location{
 			Path: uriToPath(l.URI),
 			Row:  l.Range.Start.Line,
-			Col:  LSPCharToByteOffset(buf.Lines[l.Range.Start.Line], l.Range.Start.Character),
+			Col:  lsp.CharToByteOffset(buf.Lines[l.Range.Start.Line], l.Range.Start.Character),
 		})
 	}
 	start, end := buf.WordBounds(e.View().Cursor)
@@ -2990,7 +2913,9 @@ func (e *Editor) StartDebouncer() {
 // Close shuts down the background worker cleanly.
 func (e *Editor) Close() {
 	close(e.stopChan)
-	e.lspClient.Close()
+	if e.lspClient != nil {
+		e.lspClient.Close()
+	}
 }
 
 // LineDiagnostic holds rendered positions bounded to a single line.
@@ -2999,41 +2924,6 @@ type LineDiagnostic struct {
 	EndCol   int // 0-based visual cell offset on line
 	Severity int // 1: Error, 2: Warning, 3: Info, 4: Hint
 	Message  string
-}
-
-// ConvertLSPCharToByteOffset converts UTF-16 code unit offset (LSP)
-// to byte index within a UTF-8 encoded line buffer.
-func LSPCharToByteOffset(line []byte, utf16Char int) int {
-	if utf16Char <= 0 {
-		return 0
-	}
-
-	byteIdx := 0
-	utf16Count := 0
-
-	for byteIdx < len(line) {
-		r, size := utf8.DecodeRune(line[byteIdx:])
-		if r == utf8.RuneError && size == 1 {
-			byteIdx++
-			utf16Count++
-			continue
-		}
-
-		// Runes >= U+10000 require surrogate pairs in UTF-16 (2 units)
-		needed := 1
-		if r >= 0x10000 {
-			needed = 2
-		}
-
-		if utf16Count+needed > utf16Char {
-			break
-		}
-
-		utf16Count += needed
-		byteIdx += size
-	}
-
-	return byteIdx
 }
 
 // ByteOffsetToVisualCol converts byte offset on a line to visual display cells (handling tabs).
@@ -3051,33 +2941,6 @@ func ByteOffsetToVisualCol(line []byte, byteOffset int, tabWidth int) int {
 		currByte += size
 	}
 	return col
-}
-
-// ByteOffsetToLSPChar converts byte offset on a line to UTF-16 code units for LSP.
-func ByteOffsetToLSPChar(line []byte, byteOffset int) int {
-	if byteOffset <= 0 {
-		return 0
-	}
-	utf16Count := 0
-	currByte := 0
-
-	for currByte < byteOffset && currByte < len(line) {
-		r, size := utf8.DecodeRune(line[currByte:])
-		if r == utf8.RuneError && size == 1 {
-			currByte++
-			utf16Count++
-			continue
-		}
-
-		// Runes >= U+10000 require surrogate pairs (2 units) in UTF-16
-		if r >= 0x10000 {
-			utf16Count += 2
-		} else {
-			utf16Count++
-		}
-		currByte += size
-	}
-	return utf16Count
 }
 
 // GetVisibleDiagnostics maps buffer diagnostics into visible viewport line & column ranges.
@@ -3125,13 +2988,13 @@ func (v *View) GetVisibleDiagnostics(diags []lsp.Diagnostic, tabWidth int) (map[
 			var startByte, endByte int
 
 			if r == diagStartRow {
-				startByte = LSPCharToByteOffset(lineBytes, d.Range.Start.Character)
+				startByte = lsp.CharToByteOffset(lineBytes, d.Range.Start.Character)
 			} else {
 				startByte = 0
 			}
 
 			if r == diagEndRow {
-				endByte = LSPCharToByteOffset(lineBytes, d.Range.End.Character)
+				endByte = lsp.CharToByteOffset(lineBytes, d.Range.End.Character)
 			} else {
 				endByte = len(lineBytes)
 			}
@@ -3310,7 +3173,7 @@ func (e *Editor) Rename(newName string) error {
 		return nil
 	}
 
-	lspChar := ByteOffsetToLSPChar(buf.Lines[cursor.Row], cursor.Col)
+	lspChar := lsp.CharFromByteOffset(buf.Lines[cursor.Row], cursor.Col)
 	uri := pathToURI(buf.Path)
 
 	e.message = "Renaming symbol..."

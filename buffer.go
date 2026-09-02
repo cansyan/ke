@@ -836,21 +836,21 @@ func (b *Buffer) ApplyTextEdits(edits []lsp.TextEdit) {
 	b.Dirty = true
 }
 
-func (b *Buffer) applySingleEdit(edit lsp.TextEdit) {
+func (b *Buffer) applySingleEdit(edit lsp.TextEdit) Position {
 	startLine := edit.Range.Start.Line
 	endLine := edit.Range.End.Line
 
 	if startLine >= len(b.Lines) {
-		return
+		return Position{}
 	}
 
 	// Convert UTF-16 character offsets to byte offsets
-	startByte := LSPCharToByteOffset(b.Lines[startLine], edit.Range.Start.Character)
+	startByte := lsp.CharToByteOffset(b.Lines[startLine], edit.Range.Start.Character)
 
 	if endLine >= len(b.Lines) {
 		endLine = len(b.Lines) - 1
 	}
-	endByte := LSPCharToByteOffset(b.Lines[endLine], edit.Range.End.Character)
+	endByte := lsp.CharToByteOffset(b.Lines[endLine], edit.Range.End.Character)
 
 	startPos := Position{
 		Row: startLine,
@@ -862,5 +862,5 @@ func (b *Buffer) applySingleEdit(edit lsp.TextEdit) {
 	}
 
 	// Delegate range replacement directly to Buffer
-	b.ReplaceRange(startPos, endPos, edit.NewText)
+	return b.ReplaceRange(startPos, endPos, edit.NewText)
 }

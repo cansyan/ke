@@ -13,6 +13,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 )
 
 type Client struct {
@@ -411,6 +412,68 @@ func (c *Client) FileSymbols(uri string) ([]DocumentSymbol, error) {
 	return c.DocumentSymbols(uri)
 }
 
+func (c *Client) Completion(uri string, line, char int) ([]CompletionItem, error) {
+	params := CompletionParams{
+		TextDocument: TextDocumentIdentifier{URI: uri},
+		Position:     Position{Line: line, Character: char},
+	}
+
+	respChan := make(chan []byte, 1)
+	id := c.SendRequest("textDocument/completion", params)
+
+	c.pendingMu.Lock()
+	if c.pending == nil {
+		c.pending = make(map[int64]chan []byte)
+	}
+	c.pending[id] = respChan
+	c.pendingMu.Unlock()
+
+	defer func() {
+		c.pendingMu.Lock()
+		delete(c.pending, id)
+		c.pendingMu.Unlock()
+	}()
+
+	select {
+	case data := <-respChan:
+		if len(data) == 0 || string(data) == "null" {
+			return nil, nil
+		}
+		return decodeCompletionItems(data)
+	case <-time.After(5 * time.Second):
+		return nil, fmt.Errorf("completion request timed out")
+	}
+}
+
+func (c *Client) GetCompletions(uri string, line, char int) ([]CompletionItem, error) {
+	return c.Completion(uri, line, char)
+}
+
+func decodeCompletionItems(data []byte) ([]CompletionItem, error) {
+	if len(data) == 0 || string(data) == "null" {
+		return nil, nil
+	}
+
+	var list CompletionList
+	if err := json.Unmarshal(data, &list); err == nil && len(list.Items) > 0 {
+		return list.Items, nil
+	}
+
+	var items []CompletionItem
+	if err := json.Unmarshal(data, &items); err == nil {
+		return items, nil
+	}
+
+	var wrapped struct {
+		Items []CompletionItem `json:"items"`
+	}
+	if err := json.Unmarshal(data, &wrapped); err == nil && len(wrapped.Items) > 0 {
+		return wrapped.Items, nil
+	}
+
+	return nil, fmt.Errorf("failed to parse completion response")
+}
+
 func (c *Client) WorkspaceSymbols(query string) ([]SymbolInformation, error) {
 	params := WorkspaceSymbolParams{Query: query}
 
@@ -528,4 +591,66 @@ func decodeWorkspaceSymbols(data []byte) ([]SymbolInformation, error) {
 	}
 
 	return nil, fmt.Errorf("failed to parse workspace symbols response")
+}
+
+// CharToByteOffset converts UTF-16 code unit offset
+// to byte index within a UTF-8 encoded line buffer.
+func CharToByteOffset(line []byte, utf16Char int) int {
+	if utf16Char <= 0 {
+		return 0
+	}
+
+	byteIdx := 0
+	utf16Count := 0
+
+	for byteIdx < len(line) {
+		r, size := utf8.DecodeRune(line[byteIdx:])
+		if r == utf8.RuneError && size == 1 {
+			byteIdx++
+			utf16Count++
+			continue
+		}
+
+		// Runes >= U+10000 require surrogate pairs in UTF-16 (2 units)
+		needed := 1
+		if r >= 0x10000 {
+			needed = 2
+		}
+
+		if utf16Count+needed > utf16Char {
+			break
+		}
+
+		utf16Count += needed
+		byteIdx += size
+	}
+
+	return byteIdx
+}
+
+// CharFromByteOffset converts byte offset on a line to UTF-16 code units for LSP.
+func CharFromByteOffset(line []byte, byteOffset int) int {
+	if byteOffset <= 0 {
+		return 0
+	}
+	utf16Count := 0
+	currByte := 0
+
+	for currByte < byteOffset && currByte < len(line) {
+		r, size := utf8.DecodeRune(line[currByte:])
+		if r == utf8.RuneError && size == 1 {
+			currByte++
+			utf16Count++
+			continue
+		}
+
+		// Runes >= U+10000 require surrogate pairs (2 units) in UTF-16
+		if r >= 0x10000 {
+			utf16Count += 2
+		} else {
+			utf16Count++
+		}
+		currByte += size
+	}
+	return utf16Count
 }

@@ -125,6 +125,38 @@ type DocumentSymbolParams struct {
 	TextDocument TextDocumentIdentifier `json:"textDocument"`
 }
 
+// CompletionParams contains parameters for textDocument/completion requests.
+type CompletionParams struct {
+	TextDocument TextDocumentIdentifier `json:"textDocument"`
+	Position     Position               `json:"position"`
+	Context      *CompletionContext     `json:"context,omitempty"`
+}
+
+// CompletionContext contains trigger information for completion requests.
+type CompletionContext struct {
+	TriggerKind      int    `json:"triggerKind"`
+	TriggerCharacter string `json:"triggerCharacter,omitempty"`
+}
+
+// CompletionItem is a single completion entry returned by the server.
+type CompletionItem struct {
+	Label            string    `json:"label"`
+	Kind             int       `json:"kind,omitempty"`
+	Detail           string    `json:"detail,omitempty"`
+	Documentation    any       `json:"documentation,omitempty"`
+	SortText         string    `json:"sortText,omitempty"`
+	FilterText       string    `json:"filterText,omitempty"`
+	InsertText       string    `json:"insertText,omitempty"`
+	InsertTextFormat int       `json:"insertTextFormat,omitempty"`
+	TextEdit         *TextEdit `json:"textEdit,omitempty"`
+}
+
+// CompletionList wraps completion entries and can be partial.
+type CompletionList struct {
+	IsIncomplete bool             `json:"isIncomplete"`
+	Items        []CompletionItem `json:"items"`
+}
+
 // WorkspaceSymbolParams contains parameters for workspace/symbol requests.
 type WorkspaceSymbolParams struct {
 	Query string `json:"query"`

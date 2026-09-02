@@ -203,6 +203,25 @@ func TestShiftTab_UnindentLineWithoutSelection(t *testing.T) {
 	}
 }
 
+func TestEnter_AutoIndentAfterBlockOpen(t *testing.T) {
+	buf := NewBuffer("", []byte("    {"))
+	v := &View{Buf: buf}
+	v.Cursor = Position{Row: 0, Col: len("    {")}
+	ed := &Editor{views: []*View{v}}
+
+	ctx := &kero.Context{Width: 80, Height: 24}
+	err := ed.Update(ctx, kero.KeyEvent{Key: kero.KeyEnter})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	got := string(bytes.Join(v.Buf.Lines, []byte{'\n'}))
+	want := "    {\n    \t"
+	if got != want {
+		t.Fatalf("after enter = %q, want %q", got, want)
+	}
+}
+
 func TestStartSelectLine(t *testing.T) {
 	buf := NewBuffer("", []byte("first line\nsecond line\nthird line"))
 	v := &View{Buf: buf}
