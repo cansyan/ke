@@ -56,9 +56,10 @@ Mouse motions:
 - mouse_left_drag expand selection
 - ctrl+mouse_left_release goto definition
 - alt+mouse_left_release find references
+- text area, command palette, reference panel, and file name are clickable
 
-Technical decisions:
+Notes:
 - using key ctrl+[, ctrl+d, ctrl+c is ok with Kitty protocol enabled
-- future key chords, Ctrl+K or Ctrl+X as leader key are good, but both taken. 
+- palette covers most of the commands, so key bindings are not that important
 - early version should keep things tiny, avoid duplicate selection, mutilple cursor, undo/redo
 - using / as command prefix is more convenient than > (shift+.)

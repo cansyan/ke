@@ -308,7 +308,7 @@ func (e *Editor) mouseToPosition(m kero.MouseEvent, textRect kero.Rect) Position
 }
 
 func (e *Editor) handleMouse(ctx *kero.Context, m kero.MouseEvent) error {
-	_, textRect, refRect, _, _ := LayoutWindow(ctx.Width, ctx.Height, len(e.Buf().Lines), e.ref.Active)
+	_, textRect, refRect, _, statusBar := LayoutWindow(ctx.Width, ctx.Height, len(e.Buf().Lines), e.ref.Active)
 	paletteRect := LayoutPalatte(ctx.Width, ctx.Height, e.palette.VisibleRows()+1)
 	point := kero.Point{X: m.X, Y: m.Y}
 	switch m.Button {
@@ -386,6 +386,21 @@ func (e *Editor) handleMouse(ctx *kero.Context, m kero.MouseEvent) error {
 				}
 				if e.completion.Active {
 					e.completion.Active = false
+				}
+				return nil
+			}
+
+			// click file name to switch buffer
+			if statusBar.Contains(point) {
+				var offset int
+				for _, v := range e.views {
+					name := filenameStatus(e, v)
+					width := runewidth.StringWidth(name)
+					if offset <= point.X && point.X < offset+width {
+						e.OpenFile(v.Buf.Path)
+						return nil
+					}
+					offset += width
 				}
 				return nil
 			}
@@ -567,6 +582,10 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 		}
 		v.Cursor = buf.Insert(v.Cursor, string([]rune{key.Rune}))
 		e.markDirty()
+
+		// LSP Completion requires latest buffer,
+		// so NotifyBufferChanged will be called and copys the whole buffer(not incremental update yet).
+		// For efficiency, do not trigger completion on every keystroke.
 		if e.completion.Active {
 			e.requestCompletion()
 		}
@@ -890,13 +909,27 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 			visPadded = visPadded[:textRect.W]
 		}
 
-		f.Write(textRect.X, y, visPadded, textStyle)
-
+		var diag *LineDiagnostic
 		if diags, ok := lineDiags[i]; ok && len(diags) > 0 {
-			d := diags[0]
+			diag = &diags[0]
+		}
+
+		// draw the line
+		var width int
+		for j, r := range visPadded {
+			charStyle := textStyle
+			if diag != nil && diag.StartCol <= j && j < diag.EndCol {
+				charStyle = textStyle.Underline()
+			}
+			f.Set(textRect.X+width, y, r, charStyle)
+			width += runewidth.RuneWidth(r)
+		}
+
+		// draw inline diagnostic message
+		if diag != nil {
 			red := kero.NewStyle().Foreground(kero.ColorRed)
-			dx := max(textRect.X+len(visPadded), fSize.Width-len(d.Message))
-			f.Write(dx, y, d.Message, red)
+			dx := max(textRect.X+runewidth.StringWidth(visPadded), fSize.Width-len(diag.Message))
+			f.Write(dx, y, diag.Message, red)
 		}
 
 		// highlight selection if any
@@ -960,35 +993,27 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 
 	// Draw status bar
 	if statusRect.H > 0 {
-		var names strings.Builder
-		for i, b := range e.views {
-			if i == e.active && len(e.views) > 1 {
-				names.WriteString("[")
-			}
-			name := "untitled"
-			if b.Buf.Path != "" {
-				name = filepath.Base(b.Buf.Path)
-			}
-			names.WriteString(name)
-			if b.Buf.Dirty {
-				names.WriteString("*")
-			}
-			if i == e.active && len(e.views) > 1 {
-				names.WriteString("]")
-			}
-			names.WriteString(" ")
-		}
-		status := fmt.Sprintf(" %s| Line %d, Col %d", names.String(), v.Cursor.Row+1, cursorVisCol+1)
-		if v.Selecting {
-			status = status + " | Selecting"
-		}
 		f.Fill(statusRect, ' ', statusStyle)
-		f.Write(statusRect.X, statusRect.Y, trimToWidth(status, ctx.Width), statusStyle)
+
+		var offset int
+		for i, v := range e.views {
+			name := filenameStatus(e, v)
+			style := statusStyle
+			if i == e.active && len(e.views) > 1 {
+				style = statusStyle.Bold()
+			}
+			f.Write(statusRect.X+offset, statusRect.Y, name, style)
+			offset += runewidth.StringWidth(name)
+		}
+
+		status := fmt.Sprintf("| Line %d, Col %d", v.Cursor.Row+1, cursorVisCol+1)
+		f.Write(statusRect.X+offset, statusRect.Y, trimToWidth(status, ctx.Width), statusStyle)
+		offset += runewidth.StringWidth(status)
 		if s := e.LastEvent(); s != "" {
 			f.Write(fSize.Width-runewidth.StringWidth(s), statusRect.Y, s, statusStyle)
 		}
+		// show diagnostic count, ignored warning
 		if diags, ok := e.diagnostics[e.Buf().Path]; ok {
-			// avoid showing diagnostic count when there is no error, only warning
 			var n int
 			for _, d := range diags {
 				if d.Severity == lsp.DiagnosticSeverityError {
@@ -996,15 +1021,14 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 				}
 			}
 			if n > 0 {
-				msg := fmt.Sprintf("%d diagnostic error", len(diags))
-				statusWidth := runewidth.StringWidth(status)
+				msg := fmt.Sprintf("%d error", n)
 				eventWidth := runewidth.StringWidth(e.LastEvent())
-				remainWidth := fSize.Width - statusWidth - eventWidth
+				remainWidth := fSize.Width - offset - eventWidth
 				if remainWidth > 0 {
-					f.Write(statusRect.X+statusWidth+1, statusRect.Y, trimToWidth("| "+msg, remainWidth), statusStyle.Background(kero.ColorRed))
+					// the style is identical to status bar, avoid distracting
+					f.Write(statusRect.X+offset+1, statusRect.Y, trimToWidth("| "+msg, remainWidth), statusStyle)
 				}
 			}
-
 		}
 	}
 
@@ -2554,7 +2578,8 @@ func (e *Editor) drawCompletion(f *kero.Frame) {
 		item := c.Items[i+offset]
 		style := normal.Reverse()
 		prefix := " "
-		if i+offset == c.Index {
+		// it is unnecessary to show indicator for only 1 item
+		if i+offset == c.Index && len(c.Items) > 1 {
 			prefix = ">"
 			style = normal.Reverse().Bold()
 		}
@@ -3055,70 +3080,6 @@ func (v *View) GetVisibleDiagnostics(diags []lsp.Diagnostic, tabWidth int) (map[
 	return gutterMap, underlineMap
 }
 
-/*
-func (v *View) Render(diags []lsp.Diagnostic) {
-	tabWidth := 4
-	gutterMap, underlineMap := v.GetVisibleDiagnostics(diags, tabWidth)
-
-	for vRow := 0; vRow < v.Height; vRow++ {
-		bufRow := v.ScrollRow + vRow
-		if bufRow >= len(v.Buf.Lines) {
-			break
-		}
-
-		// 1. Draw Gutter Symbol
-		gutterSymbol := " "
-		gutterStyle := NormalStyle
-
-		if sev, ok := gutterMap[vRow]; ok {
-			switch sev {
-			case 1: // Error
-				gutterSymbol = "E" // or "●"
-				gutterStyle = RedStyle
-			case 2: // Warning
-				gutterSymbol = "W" // or "▲"
-				gutterStyle = YellowStyle
-			case 3: // Info
-				gutterSymbol = "I"
-				gutterStyle = BlueStyle
-			}
-		}
-		DrawCell(0, vRow, gutterSymbol, gutterStyle)
-
-		// 2. Render Text Cells with Underline Styles
-		lineHighlights := underlineMap[vRow]
-		lineBytes := v.Buf.Lines[bufRow]
-
-		for vCol := 0; vCol < v.Width; vCol++ {
-			cellChar := GetViewportCellChar(lineBytes, v.ScrollCol+vCol)
-			cellStyle := NormalStyle
-
-			// Apply diagnostic underline/background styling
-			for _, hl := range lineHighlights {
-				if vCol >= hl.StartCol && vCol < hl.EndCol {
-					cellStyle = ApplyUnderline(cellStyle, hl.Severity)
-					break
-				}
-			}
-
-			// Render cell offset by gutter width
-			DrawCell(vCol+GutterWidth, vRow, cellChar, cellStyle)
-		}
-	}
-}
-
-func ApplyUnderline(baseStyle Style, severity int) Style {
-	switch severity {
-	case 1: // Error
-		return baseStyle.WithUnderline(true).WithUnderlineColor(Red)
-	case 2: // Warning
-		return baseStyle.WithUnderline(true).WithUnderlineColor(Yellow)
-	default:
-		return baseStyle.WithUnderline(true)
-	}
-}
-*/
-
 // uriToPath converts a file:// URI into a clean, platform-native file path.
 func uriToPath(uri string) string {
 	// If it's already a local filepath, clean and return it
@@ -3256,4 +3217,31 @@ func (e *Editor) Rename(newName string) error {
 
 	e.message = fmt.Sprintf("Renamed symbol: applied %d edits across %d file(s)", totalEdits, affectedFiles)
 	return nil
+}
+
+func filenameStatus(e *Editor, v *View) string {
+	if e == nil || v == nil {
+		return ""
+	}
+
+	var sb strings.Builder
+	if len(e.views) > 1 && e.views[e.active] == v {
+		sb.WriteByte('[')
+	} else {
+		sb.WriteByte(' ')
+	}
+	if v.Buf.Path != "" {
+		sb.WriteString(filepath.Base(v.Buf.Path))
+	} else {
+		sb.WriteString("untitled")
+	}
+	if v.Buf.Dirty {
+		sb.WriteByte('*')
+	}
+	if len(e.views) > 1 && e.views[e.active] == v {
+		sb.WriteByte(']')
+	} else {
+		sb.WriteByte(' ')
+	}
+	return sb.String()
 }
