@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"testing"
 
+	"github.com/cansyan/ke/lsp"
 	"github.com/cansyan/kero"
 )
 
@@ -319,5 +320,46 @@ func TestReplaceAll(t *testing.T) {
 	}
 	if ed.message != "replaced 2 matches" {
 		t.Fatalf("message = %q, want replacement count", ed.message)
+	}
+}
+
+func TestDrawCompletion_SmartPosition(t *testing.T) {
+	lines := make([]byte, 0)
+	for i := range 30 {
+		lines = append(lines, []byte("line "+string(rune('0'+i))+"\n")...)
+	}
+	buf := NewBuffer("", lines)
+	v := &View{Buf: buf, Cursor: Position{Row: 0, Col: 0}}
+	ed := &Editor{
+		views: []*View{v},
+		completion: Completion{
+			Active: true,
+			Items: []lsp.CompletionItem{
+				{Label: "item1"},
+				{Label: "item2"},
+				{Label: "item3"},
+			},
+		},
+	}
+
+	// 1. Cursor at top (Row 0): should draw below cursor (rows 1, 2, 3)
+	fTop := kero.NewFrame(80, 24)
+	ed.drawCompletion(&fTop)
+
+	// Verify that cell at row 1, gutterWidth has completion content (not empty)
+	// incicator is " > ", "gutterWidth(len(buf.Lines))-2" should be the x of arrow
+	cellRow1 := fTop.Cell(gutterWidth(len(buf.Lines))-2, 1)
+	if cellRow1.Ch != ' ' && cellRow1.Ch != '>' {
+		t.Fatalf("expected completion item rendered at row 1, got rune %q", cellRow1.Ch)
+	}
+
+	// 2. Cursor lower down (Row 10): space above = 10 >= visibleRows 3, should draw above cursor (rows 7, 8, 9)
+	v.Cursor.Row = 10
+	fAbove := kero.NewFrame(80, 24)
+	ed.drawCompletion(&fAbove)
+
+	cellRow7 := fAbove.Cell(gutterWidth(len(buf.Lines))-2, 7)
+	if cellRow7.Ch != ' ' && cellRow7.Ch != '>' {
+		t.Fatalf("expected completion item rendered at row 7, got rune %q", cellRow7.Ch)
 	}
 }

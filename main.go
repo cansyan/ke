@@ -590,9 +590,12 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 		// LSP Completion requires latest buffer,
 		// so NotifyBufferChanged will be called and copys the whole buffer(not incremental update yet).
 		// For efficiency, do not trigger completion on every keystroke.
-		if e.completion.Active {
+		if key.Rune == '.' {
+			e.requestCompletion()
+		} else if e.completion.Active {
 			e.requestCompletion()
 		}
+
 	case kero.KeyEnter:
 		if e.completion.Active {
 			e.applyCompletion()
@@ -707,6 +710,10 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 		v.Cursor = buf.Delete(v.Cursor, buf.NextRunePos(v.Cursor))
 		e.markDirty()
 	case kero.KeyLeft:
+		if e.completion.Active {
+			e.completion.Active = false
+		}
+
 		switch key.String() {
 		case "alt+left":
 			v.Cursor = buf.WordStart(v.Cursor)
@@ -728,6 +735,10 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 			v.moveLeft()
 		}
 	case kero.KeyRight:
+		if e.completion.Active {
+			e.completion.Active = false
+		}
+
 		switch key.String() {
 		case "alt+right":
 			v.Cursor = buf.WordEnd(v.Cursor)
@@ -795,10 +806,18 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 	case kero.KeyEnd:
 		v.Cursor = buf.LineEnd(v.Cursor)
 	case kero.KeyPgUp:
+		if e.completion.Active {
+			e.completion.Active = false
+		}
+
 		e.recordJump()
 		v.Cursor.Row -= v.Height
 		v.Cursor = buf.Clamp(v.Cursor)
 	case kero.KeyPgDown:
+		if e.completion.Active {
+			e.completion.Active = false
+		}
+
 		e.recordJump()
 		v.Cursor.Row += v.Height
 		v.Cursor = buf.Clamp(v.Cursor)
@@ -2542,36 +2561,55 @@ func (e *Editor) drawCompletion(f *kero.Frame) {
 		return
 	}
 
-	_, textRect, _, _, _ := LayoutWindow(f.Size().Width, f.Size().Height, len(e.Buf().Lines), e.ref.Active)
-
+	// Calculate scrolling offset to keep selected item inside dropdown viewport
 	c := e.completion
 	visibleRows := min(len(c.Items), 10)
-	maxWidth := 45
-
-	// Calculate scrolling offset to keep selected item inside dropdown viewport
 	offset := 0
 	if c.Index >= visibleRows {
 		offset = c.Index - visibleRows + 1
 	}
 
-	var normal kero.Style
-	x := textRect.X + e.Buf().ByteToVisualCol(e.View().Cursor, 4) - e.View().ScrollCol
-	y := e.View().Cursor.Row - e.View().ScrollRow
-	w := maxWidth + 3 // 2 for indicator, 1 for right padding
-	rect := kero.Rect{X: x, Y: y - visibleRows, W: w, H: visibleRows}
+	_, textRect, _, _, _ := LayoutWindow(f.Size().Width, f.Size().Height, len(e.Buf().Lines), e.ref.Active)
+	v := e.View()
+
+	indicator := " > "
+
+	// align the completion with current word
+	// cursorX := textRect.X + v.Buf.ByteToVisualCol(v.Cursor, 4) - v.ScrollCol
+	wordStart, _ := v.Buf.WordBounds(v.Cursor)
+	x := textRect.X + v.Buf.ByteToVisualCol(wordStart, 4) - v.ScrollCol
+	x -= runewidth.StringWidth(indicator) // minus prefix
+
+	cursorY := textRect.Y + (v.Cursor.Row - v.ScrollRow)
+	spaceAbove := cursorY - textRect.Y
+	spaceBelow := (textRect.Y + textRect.H) - (cursorY + 1)
+	var y int
+	if spaceAbove >= visibleRows {
+		y = cursorY - visibleRows
+	} else if spaceBelow >= visibleRows || spaceBelow >= spaceAbove {
+		y = cursorY + 1
+	} else {
+		y = cursorY - visibleRows
+	}
+
+	rect := kero.Rect{X: x, Y: y, W: 50, H: visibleRows}
 	if rect.Y < 0 {
 		rect.Y = 0
 	}
+	if rect.Y+rect.H > f.Size().Height {
+		rect.H = max(0, f.Size().Height-rect.Y)
+	}
+
+	var normal kero.Style
 	f.Fill(rect, ' ', normal.Reverse())
-	for i := range visibleRows {
+	for i := range rect.H {
 		x := rect.X
 		y := rect.Y + i
 		item := c.Items[i+offset]
 		style := normal.Reverse()
-		prefix := " "
-		// show indicator
+		prefix := "   "
 		if i+offset == c.Index && len(c.Items) > 1 {
-			prefix = ">"
+			prefix = indicator
 			style = normal.Reverse().Bold()
 		}
 		label := prefix + c.Items[i+offset].Label
