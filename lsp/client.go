@@ -23,15 +23,15 @@ type Client struct {
 	OnDiagnostics func(uri string, diags []Diagnostic)
 	mu            sync.Mutex
 
-	nextID    int64
+	nextID    atomic.Int64
 	pendingMu sync.Mutex
 	pending   map[int64]chan []byte
 }
 
 type notification struct {
-	JSONRPC string      `json:"jsonrpc"`
-	Method  string      `json:"method"`
-	Params  interface{} `json:"params"`
+	JSONRPC string `json:"jsonrpc"`
+	Method  string `json:"method"`
+	Params  any    `json:"params"`
 }
 
 // RawResponse maps incoming JSON-RPC response fields.
@@ -54,14 +54,14 @@ func (r *RawResponse) ExtractID() int64 {
 	return 0
 }
 
-func (c *Client) SendRequest(method string, params interface{}) int64 {
-	id := atomic.AddInt64(&c.nextID, 1)
+func (c *Client) SendRequest(method string, params any) int64 {
+	id := c.nextID.Add(1)
 
 	req := struct {
-		JSONRPC string      `json:"jsonrpc"`
-		ID      int64       `json:"id"`
-		Method  string      `json:"method"`
-		Params  interface{} `json:"params"`
+		JSONRPC string `json:"jsonrpc"`
+		ID      int64  `json:"id"`
+		Method  string `json:"method"`
+		Params  any    `json:"params"`
 	}{
 		JSONRPC: "2.0",
 		ID:      id,
@@ -106,19 +106,19 @@ func StartClient(goplsPath string, onDiagnostics func(string, []Diagnostic)) (*C
 	return c, nil
 }
 
-// func (c *Client) SendRequest(method string, params interface{}) int64 {
+// func (c *Client) SendRequest(method string, params any) int64 {
 // 	id := atomic.AddInt64(&c.reqID, 1)
 // 	msg := request{JSONRPC: "2.0", ID: id, Method: method, Params: params}
 // 	c.write(msg)
 // 	return id
 // }
 
-func (c *Client) SendNotification(method string, params interface{}) {
+func (c *Client) SendNotification(method string, params any) {
 	msg := notification{JSONRPC: "2.0", Method: method, Params: params}
 	c.write(msg)
 }
 
-func (c *Client) write(v interface{}) {
+func (c *Client) write(v any) {
 	data, _ := json.Marshal(v)
 	body := string(data)
 	header := fmt.Sprintf("Content-Length: %d\r\n\r\n", len(body))
@@ -144,8 +144,8 @@ func (c *Client) readLoop(r io.Reader) {
 			if line == "" {
 				break // End of headers
 			}
-			if strings.HasPrefix(line, "Content-Length:") {
-				lengthStr := strings.TrimSpace(strings.TrimPrefix(line, "Content-Length:"))
+			if after, ok := strings.CutPrefix(line, "Content-Length:"); ok {
+				lengthStr := strings.TrimSpace(after)
 				contentLength, _ = strconv.Atoi(lengthStr)
 			}
 		}

@@ -1796,7 +1796,7 @@ func (v *View) ShowCursorSmart() {
 
 	// If the jump is far outside the viewport (e.g. > 1 full viewport height), center it.
 	// Otherwise, just do standard minimal scrolling.
-	if dist > v.Height {
+	if dist > v.Height+v.Height/2 {
 		v.showCursorCenter()
 	} else {
 		v.showCursor()
@@ -2569,7 +2569,7 @@ func (e *Editor) drawCompletion(f *kero.Frame) {
 		item := c.Items[i+offset]
 		style := normal.Reverse()
 		prefix := " "
-		// it is unnecessary to show indicator for only 1 item
+		// show indicator
 		if i+offset == c.Index && len(c.Items) > 1 {
 			prefix = ">"
 			style = normal.Reverse().Bold()

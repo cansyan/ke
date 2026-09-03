@@ -18,7 +18,10 @@ There is no separate build system; use standard Go tooling.
 
 ## Coding Style & Naming Conventions
 
-Use idiomatic Go formatted with `gofmt`. Keep implementation in the root `main` package unless there is clear pressure for a subpackage. Prefer plain structs, small interfaces, explicit control flow, and readable code over clever abstractions. Exported API names should be short and descriptive.
+Use idiomatic Go formatted with `gofmt`.
+Keep implementation in the root `main` package unless there is clear pressure for a subpackage.
+Prefer plain structs, small interfaces, explicit control flow, and readable code over clever abstractions.
+Exported API names should be short and descriptive.
 
 ## Commit & Pull Request Guidelines
 
