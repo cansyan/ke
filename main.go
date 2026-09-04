@@ -235,7 +235,7 @@ func (e *Editor) startLSP(path string) error {
 	client.SendNotification("initialized", struct{}{})
 	e.changeChan = make(chan *Buffer, 100)
 	e.stopChan = make(chan struct{})
-	go e.StartDebouncer()
+	e.StartDebouncer()
 	return nil
 }
 
@@ -913,6 +913,13 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 		f.Write(gutterRect.X+1, y, gutterText, style)
 	}
 
+	// Fast-forward LineState from line 0 up to v.ScrollRow
+	// (Cheap single-pass check just tracking state transitions)
+	currentState := StateNormal
+	for i := 0; i < v.ScrollRow && i < len(v.Buf.Lines); i++ {
+		currentState = ScanLineState(v.Buf.Lines[i], currentState)
+	}
+
 	// 2. Draw Text Viewport
 	for i := range textRect.H {
 		lineIdx := v.ScrollRow + i
@@ -922,6 +929,12 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 
 		y := textRect.Y + i
 		line := v.Buf.Lines[lineIdx]
+		/*
+			Compute the highlight token on-the-fly is effecient for normal file.
+			Later, if performance becomes the bottleneck, then make it to async debouncer cache.
+		*/
+		var lineTokens []HighlightToken
+		lineTokens, currentState = HighlightGoLine(line, currentState, DefaultGoTheme())
 
 		var diag *LineDiagnostic
 		if diags, ok := lineDiags[i]; ok && len(diags) > 0 {
@@ -952,8 +965,15 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 		// Draw characters cell by cell based on visual column space
 		vCol := 0
 		byteIdx := 0
+		tokenIdx := 0
 		for byteIdx < len(line) {
+			// Advance token pointer if current byte position exceeds active token
+			for tokenIdx < len(lineTokens) && byteIdx >= lineTokens[tokenIdx].EndCol {
+				tokenIdx++
+			}
+
 			r, size := utf8.DecodeRune(line[byteIdx:])
+			currByte := byteIdx
 			byteIdx += size
 
 			runeWidth := 1
@@ -968,18 +988,28 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 			if screenX >= textRect.X && screenX < textRect.X+textRect.W {
 				charStyle := textStyle
 
-				// Diagnostic underline check
+				// 1. Apply Syntax Highlighting Style (if byte falls within current token)
+				if tokenIdx < len(lineTokens) {
+					tok := lineTokens[tokenIdx]
+					if currByte >= tok.StartCol && currByte < tok.EndCol {
+						charStyle = tok.Style
+					}
+				}
+
+				// 2. Override with Diagnostic Underline
 				if diag != nil && diag.StartCol <= vCol && vCol < diag.EndCol {
 					charStyle = charStyle.Underline()
 				}
 
-				// Selection highlight check
+				// 3. Override with Selection Style (highest priority)
 				if selStartVCol != -1 && vCol >= selStartVCol && vCol < selEndVCol {
 					charStyle = selectStyle
 				}
 
 				if r == '\t' {
-					f.Set(screenX, y, ' ', charStyle)
+					for i := range runeWidth {
+						f.Set(screenX+i, y, ' ', charStyle)
+					}
 				} else {
 					f.Set(screenX, y, r, charStyle)
 				}
@@ -1228,22 +1258,6 @@ func (e *Editor) paste() {
 
 	e.View().Cursor = e.Buf().Insert(e.View().Cursor, e.clipboard)
 	e.markDirty()
-}
-
-func padTab(s string, tabSize int) string {
-	var result strings.Builder
-	col := 0
-	for _, r := range s {
-		if r == '\t' {
-			spaces := tabSize - (col % tabSize)
-			result.WriteString(strings.Repeat(" ", spaces))
-			col += spaces
-		} else {
-			result.WriteRune(r)
-			col++
-		}
-	}
-	return result.String()
 }
 
 func (e *Editor) SaveFile() error {
@@ -2929,13 +2943,15 @@ func (e *Editor) StartDebouncer() {
 			case buf := <-e.changeChan:
 				lastBuf = buf
 
-				// Stop active timer if user typed another character
-				if timer != nil {
-					timer.Stop()
+				// In Go 1.23+, timer.Reset() or Stop() cleanly handles timer.C.
+				if timer == nil {
+					timer = time.NewTimer(150 * time.Millisecond)
+					timerCh = timer.C
+				} else {
+					// Stop active timer if user typed another character,
+					// 150ms debounce delay (optimal for instant feel without flooding)
+					timer.Reset(150 * time.Millisecond)
 				}
-				// 150ms debounce delay (optimal for instant feel without flooding)
-				timer = time.NewTimer(150 * time.Millisecond)
-				timerCh = timer.C
 
 			case <-timerCh:
 				if lastBuf != nil {
