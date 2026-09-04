@@ -890,7 +890,7 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 	tabWidth := 4
 	gutterMap, lineDiags := v.GetVisibleDiagnostics(e.diagnostics[e.Buf().Path], tabWidth)
 
-	// 1. Draw Gutter Area
+	// 1. Draw Gutter
 	for i := range gutterRect.H {
 		lineIdx := v.ScrollRow + i
 		y := gutterRect.Y + i
@@ -906,14 +906,14 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 		}
 
 		gutterText := fmt.Sprintf("%*d ", gutterRect.W-2, lineIdx+1)
+		style := gutterStyle
 		if lineIdx == v.Cursor.Row {
-			f.Write(gutterRect.X+1, y, gutterText, gutterActiveStyle)
-		} else {
-			f.Write(gutterRect.X+1, y, gutterText, gutterStyle)
+			style = gutterActiveStyle
 		}
+		f.Write(gutterRect.X+1, y, gutterText, style)
 	}
 
-	// 2. Draw Text Viewport Area
+	// 2. Draw Text Viewport
 	for i := range textRect.H {
 		lineIdx := v.ScrollRow + i
 		if lineIdx >= len(v.Buf.Lines) {
@@ -922,105 +922,112 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 
 		y := textRect.Y + i
 		line := v.Buf.Lines[lineIdx]
-		fullPadded := padTab(string(line), 4)
-		// visual part of the padded line
-		var visPadded string
-		if v.ScrollCol < len(fullPadded) {
-			visPadded = fullPadded[v.ScrollCol:]
-		}
-		if len(visPadded) > textRect.W {
-			visPadded = visPadded[:textRect.W]
-		}
 
 		var diag *LineDiagnostic
 		if diags, ok := lineDiags[i]; ok && len(diags) > 0 {
 			diag = &diags[0]
 		}
 
-		// draw the line
-		var width int
-		for j, r := range visPadded {
-			charStyle := textStyle
-			if diag != nil && diag.StartCol <= j && j < diag.EndCol {
-				charStyle = textStyle.Underline()
-			}
-			f.Set(textRect.X+width, y, r, charStyle)
-			width += runewidth.RuneWidth(r)
-		}
-
-		// draw inline diagnostic message
-		if diag != nil {
-			red := kero.NewStyle().Foreground(kero.ColorRed)
-			dx := max(textRect.X+runewidth.StringWidth(visPadded), fSize.Width-len(diag.Message))
-			f.Write(dx, y, diag.Message, red)
-		}
-
-		// highlight selection if any
+		// Calculate visual selection range for this line
+		selStartVCol, selEndVCol := -1, -1
 		if v.Selecting {
 			start, end := orderPos(v.SelAnchor, v.Cursor)
 			if lineIdx >= start.Row && lineIdx <= end.Row {
-				var selStartCol, selEndCol int
 				if start.Row == end.Row {
-					selStartCol = start.Col
-					selEndCol = end.Col
+					selStartVCol = v.Buf.VisualCol(lineIdx, start.Col, 4)
+					selEndVCol = v.Buf.VisualCol(lineIdx, end.Col, 4)
 				} else if lineIdx == start.Row {
-					selStartCol = start.Col
-					selEndCol = len(line)
+					selStartVCol = v.Buf.VisualCol(lineIdx, start.Col, 4)
+					selEndVCol = v.Buf.VisualCol(lineIdx, len(line), 4)
 				} else if lineIdx == end.Row {
-					selStartCol = 0
-					selEndCol = end.Col
+					selStartVCol = 0
+					selEndVCol = v.Buf.VisualCol(lineIdx, end.Col, 4)
 				} else {
-					selStartCol = 0
-					selEndCol = len(line)
-				}
-
-				visStartCol := ByteOffsetToVisualCol(line, selStartCol, 4)
-				visEndCol := ByteOffsetToVisualCol(line, selEndCol, 4)
-
-				startDisplay := max(0, min(visStartCol-v.ScrollCol, len(visPadded)))
-				endDisplay := max(0, min(visEndCol-v.ScrollCol, len(visPadded)))
-
-				for x := startDisplay; x < endDisplay; x++ {
-					ch := rune(visPadded[x])
-					f.Set(textRect.X+x, y, ch, selectStyle)
+					selStartVCol = 0
+					selEndVCol = v.Buf.VisualCol(lineIdx, len(line), 4)
 				}
 			}
 		}
 
-		// highlight finding match
-		if e.finding && e.findMatch && lineIdx == e.findMatchStart.Row && lineIdx == e.findMatchEnd.Row {
-			visStartCol := ByteOffsetToVisualCol(line, e.findMatchStart.Col, 4)
-			visEndCol := ByteOffsetToVisualCol(line, e.findMatchEnd.Col, 4)
+		// Draw characters cell by cell based on visual column space
+		vCol := 0
+		byteIdx := 0
+		for byteIdx < len(line) {
+			r, size := utf8.DecodeRune(line[byteIdx:])
+			byteIdx += size
 
-			startDisplay := max(0, min(visStartCol-e.View().ScrollCol, len(visPadded)))
-			endDisplay := max(0, min(visEndCol-e.View().ScrollCol, len(visPadded)))
+			runeWidth := 1
+			if r == '\t' {
+				runeWidth = tabWidth - (vCol % tabWidth)
+			} else {
+				runeWidth = runewidth.RuneWidth(r)
+			}
 
-			for x := startDisplay; x < endDisplay; x++ {
-				ch := rune(visPadded[x])
-				f.Set(textRect.X+x, y, ch, selectStyle)
+			// Render cell if it falls within viewport horizontal bounds
+			screenX := textRect.X + (vCol - v.ScrollCol)
+			if screenX >= textRect.X && screenX < textRect.X+textRect.W {
+				charStyle := textStyle
+
+				// Diagnostic underline check
+				if diag != nil && diag.StartCol <= vCol && vCol < diag.EndCol {
+					charStyle = charStyle.Underline()
+				}
+
+				// Selection highlight check
+				if selStartVCol != -1 && vCol >= selStartVCol && vCol < selEndVCol {
+					charStyle = selectStyle
+				}
+
+				if r == '\t' {
+					f.Set(screenX, y, ' ', charStyle)
+				} else {
+					f.Set(screenX, y, r, charStyle)
+				}
+			}
+
+			vCol += runeWidth
+			if vCol-v.ScrollCol >= textRect.W {
+				break // Clipped right of viewport
+			}
+		}
+
+		// Draw inline diagnostic message
+		if diag != nil {
+			red := kero.NewStyle().Foreground(kero.ColorRed)
+			dx := max(textRect.X+(vCol-v.ScrollCol), fSize.Width-runewidth.StringWidth(diag.Message))
+			if dx >= textRect.X && dx < fSize.Width {
+				f.Write(dx, y, diag.Message, red)
 			}
 		}
 	}
 
+	// 3. Draw Cursor
 	cursorVisCol := v.Buf.VisualCol(v.Cursor.Row, v.Cursor.Col, 4)
-	if v.cursorVisible() {
-		fullLinePadded := padTab(string(v.Buf.Lines[v.Cursor.Row]), 4)
+	cursorX := textRect.X + (cursorVisCol - v.ScrollCol)
+	cursorY := textRect.Y + (v.Cursor.Row - v.ScrollRow)
+
+	if cursorX >= textRect.X && cursorX < textRect.X+textRect.W &&
+		cursorY >= textRect.Y && cursorY < textRect.Y+textRect.H {
+
 		ch := ' '
-		cursorX := textRect.X + cursorVisCol - v.ScrollCol
-		cursorY := 0 + v.Cursor.Row - v.ScrollRow
-		if cursorVisCol < len(fullLinePadded) {
-			ch = rune(fullLinePadded[cursorVisCol])
+		if v.Cursor.Row < len(v.Buf.Lines) {
+			line := v.Buf.Lines[v.Cursor.Row]
+			if v.Cursor.Col < len(line) {
+				r, _ := utf8.DecodeRune(line[v.Cursor.Col:])
+				if r != '\t' {
+					ch = r
+				}
+			}
 		}
 		f.Set(cursorX, cursorY, ch, cursorStyle)
 	}
 
-	// Draw status bar
+	// 4. Status Bar & Panels
 	if statusRect.H > 0 {
 		f.Fill(statusRect, ' ', statusStyle)
-
 		var offset int
-		for i, v := range e.views {
-			name := filenameStatus(e, v)
+		for i, viewItem := range e.views {
+			name := filenameStatus(e, viewItem)
 			style := statusStyle
 			if i == e.active && len(e.views) > 1 {
 				style = statusStyle.Bold()
@@ -1031,28 +1038,6 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 
 		status := fmt.Sprintf("| Line %d, Col %d", v.Cursor.Row+1, cursorVisCol+1)
 		f.Write(statusRect.X+offset, statusRect.Y, trimToWidth(status, ctx.Width), statusStyle)
-		offset += runewidth.StringWidth(status)
-		if s := e.LastEvent(); s != "" {
-			f.Write(fSize.Width-runewidth.StringWidth(s), statusRect.Y, s, statusStyle)
-		}
-		// show diagnostic count, ignored warning
-		if diags, ok := e.diagnostics[e.Buf().Path]; ok {
-			var n int
-			for _, d := range diags {
-				if d.Severity == lsp.DiagnosticSeverityError {
-					n++
-				}
-			}
-			if n > 0 {
-				msg := fmt.Sprintf("%d error", n)
-				eventWidth := runewidth.StringWidth(e.LastEvent())
-				remainWidth := fSize.Width - offset - eventWidth
-				if remainWidth > 0 {
-					// the style is identical to status bar, avoid distracting
-					f.Write(statusRect.X+offset+1, statusRect.Y, trimToWidth("| "+msg, remainWidth), statusStyle)
-				}
-			}
-		}
 	}
 
 	if msgRect.H > 0 {
@@ -1067,21 +1052,20 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 			if e.message == "" {
 				e.message = "^S save | ^W close | ^Q quit | ^F find | ^P palette"
 			}
+			style := messageStyle
 			if strings.HasPrefix(e.message, "error:") || strings.HasPrefix(e.message, "warn:") {
-				messageStyle = messageStyle.Foreground(kero.ColorRed)
+				style = style.Foreground(kero.ColorRed)
 			}
-			f.Write(msgRect.X, msgRect.Y, trimToWidth(" "+e.message, ctx.Width), messageStyle)
+			f.Write(msgRect.X, msgRect.Y, trimToWidth(" "+e.message, ctx.Width), style)
 		}
 	}
 
 	if e.ref.Active {
 		e.drawReferences(f, bottomPanelRect)
 	}
-
 	if e.completion.Active {
 		e.drawCompletion(f)
 	}
-
 	if e.palette.Active {
 		e.drawPalette(f, LayoutPalatte(fSize.Width, fSize.Height, e.palette.VisibleRows()+1))
 	}
