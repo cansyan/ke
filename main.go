@@ -913,10 +913,12 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 		f.Write(gutterRect.X+1, y, gutterText, style)
 	}
 
-	// Fast-forward LineState from line 0 up to v.ScrollRow
+	// Fast-forward LineState from previous page to v.ScrollRow,
 	// (Cheap single-pass check just tracking state transitions)
+	// should works most of the time, except large block comments.
 	currentState := StateNormal
-	for i := 0; i < v.ScrollRow && i < len(v.Buf.Lines); i++ {
+	prevPage := max(0, v.ScrollRow-v.Height)
+	for i := prevPage; i < v.ScrollRow && i < len(v.Buf.Lines); i++ {
 		currentState = ScanLineState(v.Buf.Lines[i], currentState)
 	}
 

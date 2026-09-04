@@ -256,6 +256,12 @@ func ScanLineState(line []byte, startState LineState) LineState {
 			continue
 		}
 
+		// line comment
+		if i+1 < n && line[i] == '/' && line[i+1] == '/' {
+			state = StateNormal
+			break
+		}
+
 		// Fast check for start of block comment / raw string
 		if i+1 < n && line[i] == '/' && line[i+1] == '*' {
 			state = StateInBlockComment
