@@ -304,7 +304,7 @@ func (e *Editor) mouseToPosition(m kero.MouseEvent, textRect kero.Rect) Position
 	}
 
 	visualCol := m.X - textRect.X + e.View().ScrollCol
-	col := e.Buf().VisualToByteCol(row, visualCol, 4)
+	col := e.Buf().ByteCol(row, visualCol, 4)
 	return Position{Row: row, Col: col}
 }
 
@@ -974,8 +974,8 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 					selEndCol = len(line)
 				}
 
-				visStartCol := v.Buf.ByteToVisualCol(Position{Row: lineIdx, Col: selStartCol}, 4)
-				visEndCol := v.Buf.ByteToVisualCol(Position{Row: lineIdx, Col: selEndCol}, 4)
+				visStartCol := ByteOffsetToVisualCol(line, selStartCol, 4)
+				visEndCol := ByteOffsetToVisualCol(line, selEndCol, 4)
 
 				startDisplay := max(0, min(visStartCol-v.ScrollCol, len(visPadded)))
 				endDisplay := max(0, min(visEndCol-v.ScrollCol, len(visPadded)))
@@ -989,8 +989,8 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 
 		// highlight finding match
 		if e.finding && e.findMatch && lineIdx == e.findMatchStart.Row && lineIdx == e.findMatchEnd.Row {
-			visStartCol := e.Buf().ByteToVisualCol(Position{Row: lineIdx, Col: e.findMatchStart.Col}, 4)
-			visEndCol := e.Buf().ByteToVisualCol(Position{Row: lineIdx, Col: e.findMatchEnd.Col}, 4)
+			visStartCol := ByteOffsetToVisualCol(line, e.findMatchStart.Col, 4)
+			visEndCol := ByteOffsetToVisualCol(line, e.findMatchEnd.Col, 4)
 
 			startDisplay := max(0, min(visStartCol-e.View().ScrollCol, len(visPadded)))
 			endDisplay := max(0, min(visEndCol-e.View().ScrollCol, len(visPadded)))
@@ -1002,7 +1002,7 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 		}
 	}
 
-	cursorVisCol := v.Buf.ByteToVisualCol(v.Cursor, 4)
+	cursorVisCol := v.Buf.VisualCol(v.Cursor.Row, v.Cursor.Col, 4)
 	if v.cursorVisible() {
 		fullLinePadded := padTab(string(v.Buf.Lines[v.Cursor.Row]), 4)
 		ch := ' '
@@ -1587,8 +1587,8 @@ func (v *View) moveUp() {
 	if v.Cursor.Row == 0 {
 		return
 	}
-	vCol := v.Buf.ByteToVisualCol(v.Cursor, 4)
-	col := v.Buf.VisualToByteCol(v.Cursor.Row-1, vCol, 4)
+	vCol := v.Buf.VisualCol(v.Cursor.Row, v.Cursor.Col, 4)
+	col := v.Buf.ByteCol(v.Cursor.Row-1, vCol, 4)
 	v.Cursor = Position{Row: v.Cursor.Row - 1, Col: col}
 }
 
@@ -1596,8 +1596,8 @@ func (v *View) moveDown() {
 	if v.Cursor.Row >= len(v.Buf.Lines)-1 {
 		return
 	}
-	vCol := v.Buf.ByteToVisualCol(v.Cursor, 4)
-	col := v.Buf.VisualToByteCol(v.Cursor.Row+1, vCol, 4)
+	vCol := v.Buf.VisualCol(v.Cursor.Row, v.Cursor.Col, 4)
+	col := v.Buf.ByteCol(v.Cursor.Row+1, vCol, 4)
 	v.Cursor = Position{Row: v.Cursor.Row + 1, Col: col}
 }
 
@@ -1730,7 +1730,7 @@ func (v *View) showCursor() {
 		return
 	}
 
-	vCol := v.Buf.ByteToVisualCol(v.Cursor, 4)
+	vCol := v.Buf.VisualCol(v.Cursor.Row, v.Cursor.Col, 4)
 
 	// 1. Cursor is to the left of the viewport -> scroll LEFT
 	if vCol < v.ScrollCol {
@@ -1762,7 +1762,7 @@ func (v *View) showCursorCenter() {
 		return
 	}
 
-	vCol := v.Buf.ByteToVisualCol(v.Cursor, 4)
+	vCol := v.Buf.VisualCol(v.Cursor.Row, v.Cursor.Col, 4)
 
 	// 1. Cursor is to the left of the viewport -> scroll LEFT
 	if vCol < v.ScrollCol {
@@ -1793,7 +1793,7 @@ func (v *View) cursorVisible() bool {
 	}
 
 	// Horizontal check
-	vCol := v.Buf.ByteToVisualCol(v.Cursor, 4)
+	vCol := v.Buf.VisualCol(v.Cursor.Row, v.Cursor.Col, 4)
 	if vCol < v.ScrollCol || vCol >= v.ScrollCol+v.Width {
 		return false
 	}
@@ -2577,7 +2577,7 @@ func (e *Editor) drawCompletion(f *kero.Frame) {
 	// align the completion with current word
 	// cursorX := textRect.X + v.Buf.ByteToVisualCol(v.Cursor, 4) - v.ScrollCol
 	wordStart, _ := v.Buf.WordBounds(v.Cursor)
-	x := textRect.X + v.Buf.ByteToVisualCol(wordStart, 4) - v.ScrollCol
+	x := textRect.X + v.Buf.VisualCol(wordStart.Row, wordStart.Col, 4) - v.ScrollCol
 	x -= runewidth.StringWidth(indicator) // minus prefix
 
 	cursorY := textRect.Y + (v.Cursor.Row - v.ScrollRow)
@@ -2986,23 +2986,6 @@ type LineDiagnostic struct {
 	EndCol   int // 0-based visual cell offset on line
 	Severity int // 1: Error, 2: Warning, 3: Info, 4: Hint
 	Message  string
-}
-
-// ByteOffsetToVisualCol converts byte offset on a line to visual display cells (handling tabs).
-func ByteOffsetToVisualCol(line []byte, byteOffset int, tabWidth int) int {
-	col := 0
-	currByte := 0
-
-	for currByte < byteOffset && currByte < len(line) {
-		r, size := utf8.DecodeRune(line[currByte:])
-		if r == '\t' {
-			col += tabWidth - (col % tabWidth)
-		} else {
-			col++ // Assuming standard 1-cell width (use wcwidth for full CJK/Emoji support)
-		}
-		currByte += size
-	}
-	return col
 }
 
 // GetVisibleDiagnostics maps buffer diagnostics into visible viewport line & column ranges.

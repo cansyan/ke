@@ -9,18 +9,18 @@ import (
 )
 
 func TestDisplayColumn(t *testing.T) {
-	b := NewBuffer("", []byte("a\tbc"))
-	if got := b.ByteToVisualCol(Position{Col: 2}, 4); got != 4 {
-		t.Fatalf("ByteToVisualCol(Position{Row: 0, Col: 2}) = %+v, want col 4", got)
+	line := []byte("a\tbc")
+	if got := ByteOffsetToVisualCol(line, 2, 4); got != 4 {
+		t.Fatalf("ByteOffsetToVisualCol = %+v, want col 4", got)
 	}
-	if got := b.ByteToVisualCol(Position{Col: 3}, 4); got != 5 {
-		t.Fatalf("ByteToVisualCol(Position{Row: 0, Col: 3}) = %+v, want col 5", got)
+	if got := ByteOffsetToVisualCol(line, 3, 4); got != 5 {
+		t.Fatalf("ByteOffsetToVisualCol = %+v, want col 5", got)
 	}
-	if got := b.VisualToByteCol(0, 4, 4); got != 2 {
-		t.Fatalf("VisualToByteCol(Position{Col: 4}) = %+v, want col 2", got)
+	if got := VisualColToByteOffset(line, 4, 4); got != 2 {
+		t.Fatalf("VisualColToByteOffset = %+v, want col 2", got)
 	}
-	if got := b.VisualToByteCol(0, 5, 4); got != 3 {
-		t.Fatalf("VisualToByteCol(Position{Col: 5}) = %+v, want col 3", got)
+	if got := VisualColToByteOffset(line, 5, 4); got != 3 {
+		t.Fatalf("VisualColToByteOffset = %+v, want col 3", got)
 	}
 }
 
@@ -37,7 +37,7 @@ func TestEnsureCursorVisible_WithTabs(t *testing.T) {
 	// Move cursor to 'w' in "world" (byte offset 7: '\t', h, e, l, l, o, ' ')
 	v.Cursor.Col = 7
 	// display column 4 + 6 = 10
-	vCol := v.Buf.ByteToVisualCol(v.Cursor, 4)
+	vCol := v.Buf.VisualCol(v.Cursor.Row, v.Cursor.Col, 4)
 	v.showCursorCenter()
 	if v.ScrollCol != vCol-v.Width+1 {
 		t.Fatalf("expected colOffset = 4, got %d", v.ScrollCol)
