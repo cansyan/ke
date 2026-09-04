@@ -13,7 +13,6 @@ import (
 	"unicode/utf8"
 
 	"github.com/cansyan/ke/lsp"
-	"github.com/mattn/go-runewidth"
 )
 
 // Buffer holds raw text and file metadata (Shared between views).
@@ -586,126 +585,6 @@ func (b *Buffer) LineEnd(p Position) Position {
 		return p
 	}
 	return Position{Row: p.Row, Col: len(b.Lines[p.Row])}
-}
-
-/*
-// Convert (Row, Col Byte) -> Rune Index
-// Used when you need to know how many unicode characters precede the cursor.
-func (b *Buffer) ByteToRuneCol(pos Position) int {
-	line := b.Lines[pos.Row]
-	if pos.Col >= len(line) {
-		return utf8.RuneCount(line)
-	}
-	return utf8.RuneCount(line[:pos.Col])
-}
-
-// Convert (Row, Rune Index) -> Position (Byte Col)
-// Used when moving the cursor horizontally by 'N' runes (e.g., arrow keys).
-func (b *Buffer) RuneToByteCol(row int, runeCol int) Position {
-	line := b.Lines[row]
-	if len(line) == 0 || runeCol <= 0 {
-		return Position{Row: row, Col: 0}
-	}
-
-	byteIdx := 0
-	runesSeen := 0
-	for byteIdx < len(line) && runesSeen < runeCol {
-		_, size := utf8.DecodeRune(line[byteIdx:])
-		byteIdx += size
-		runesSeen++
-	}
-
-	return Position{Row: row, Col: byteIdx}
-}
-*/
-
-// Safe Slicing using byte offsets (O(1) operation)
-func (b *Buffer) Text(start, end Position) []byte {
-	// Fast zero-copy slicing using byte offsets directly
-	if start.Row == end.Row {
-		line := b.Lines[start.Row]
-		return line[start.Col:end.Col]
-	}
-	// Multi-line extraction logic...
-	return nil
-}
-
-// ByteToVisualCol converts a 0-indexed byte offset (col) on line p.Row
-// into a 0-indexed visual display column (terminal cell width).
-func (b *Buffer) ByteToVisualCol(p Position, tabWidth int) int {
-	if p.Row < 0 || p.Row >= len(b.Lines) {
-		return 0
-	}
-
-	line := b.Lines[p.Row]
-	if p.Col <= 0 {
-		return 0
-	}
-	if p.Col > len(line) {
-		p.Col = len(line)
-	}
-
-	visualCol := 0
-	byteIdx := 0
-
-	for byteIdx < p.Col {
-		r, size := utf8.DecodeRune(line[byteIdx:])
-		if r == utf8.RuneError && size == 1 {
-			// Skip invalid byte
-			byteIdx++
-			visualCol++
-			continue
-		}
-
-		if r == '\t' {
-			// Tab advances to the next tab stop
-			visualCol += tabWidth - (visualCol % tabWidth)
-		} else {
-			// Add terminal cell width (1 for standard ASCII, 2 for CJK/emojis, 0 for combining marks)
-			w := runewidth.RuneWidth(r)
-			if w > 0 {
-				visualCol += w
-			}
-		}
-
-		byteIdx += size
-	}
-
-	return visualCol
-}
-
-// VisualToByteCol converts a visual display column (terminal cell offset)
-// back to the closest 0-indexed byte offset on line row.
-func (b *Buffer) VisualToByteCol(row int, visualCol int, tabWidth int) int {
-	if row < 0 || row >= len(b.Lines) || visualCol <= 0 {
-		return 0
-	}
-
-	line := b.Lines[row]
-	vCol := 0
-	byteIdx := 0
-
-	for byteIdx < len(line) {
-		r, size := utf8.DecodeRune(line[byteIdx:])
-
-		var runeWidth int
-		if r == '\t' {
-			runeWidth = tabWidth - (vCol % tabWidth)
-		} else {
-			runeWidth = runewidth.RuneWidth(r)
-		}
-
-		// Stop if advancing past visualCol
-		if vCol+runeWidth > visualCol {
-			// Snap to whichever side is closer (or return current byteIdx)
-			break
-		}
-
-		vCol += runeWidth
-		byteIdx += size
-	}
-
-	return byteIdx
 }
 
 // BufferReader implements io.Reader over a Buffer.
