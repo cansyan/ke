@@ -2454,29 +2454,24 @@ func (e *Editor) drawPalette(f *kero.Frame, rect kero.Rect) {
 		lineY := rect.Y + i + 1 // plus 1 because of Input
 
 		// Selection cursor indicator
-		prefix := "  "
+		prefix := "   "
 		style := normal.Reverse()
 		if idx == p.Index {
-			prefix = " >"
+			prefix = " > "
 			style = normal.Reverse().Bold()
 		}
 
 		// Left side text: Prefix + Label
-		leftText := fmt.Sprintf("%s %s", prefix, item.Label)
-		leftRunes := []rune(leftText)
-
-		if len(leftRunes) > rect.W {
-			leftText = string(leftRunes[:rect.W])
-		}
+		leftText := runewidth.Truncate(prefix+item.Label, rect.W, "")
 		f.Write(rect.X, lineY, leftText, style)
+		x := rect.X + runewidth.StringWidth(leftText)
 
 		// Right side text: Detail (e.g. line number or keybinding hint)
 		if item.Detail != "" {
-			detailRunes := []rune(item.Detail)
-			detailX := rect.X + (rect.W - len(detailRunes) - 1)
+			detailX := rect.X + (rect.W - runewidth.StringWidth(item.Detail) - 1)
 
 			// Only render detail if it doesn't overlap left text
-			if detailX > len(leftRunes)+2 {
+			if detailX > x+2 {
 				f.Write(detailX, lineY, item.Detail, style)
 			}
 		}
@@ -2942,16 +2937,22 @@ func (e *Editor) StartDebouncer() {
 
 		for {
 			select {
-			case buf := <-e.changeChan:
+			case buf, ok := <-e.changeChan:
+				if !ok {
+					if timer != nil {
+						timer.Stop()
+					}
+					return
+				}
 				lastBuf = buf
 
-				// In Go 1.23+, timer.Reset() or Stop() cleanly handles timer.C.
 				if timer == nil {
 					timer = time.NewTimer(150 * time.Millisecond)
 					timerCh = timer.C
 				} else {
-					// Stop active timer if user typed another character,
+					// Reset active timer if user typed another character,
 					// 150ms debounce delay (optimal for instant feel without flooding)
+					// In Go 1.23+, timer.Reset() cleanly handles timer.C.
 					timer.Reset(150 * time.Millisecond)
 				}
 
@@ -2960,7 +2961,6 @@ func (e *Editor) StartDebouncer() {
 					e.NotifyBufferChanged(lastBuf)
 					lastBuf = nil
 				}
-				timerCh = nil
 
 			case <-e.stopChan:
 				if timer != nil {
