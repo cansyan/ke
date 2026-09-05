@@ -917,9 +917,12 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 	// (Cheap single-pass check just tracking state transitions)
 	// should works most of the time, except large block comments.
 	currentState := StateNormal
-	prevPage := max(0, v.ScrollRow-v.Height)
-	for i := prevPage; i < v.ScrollRow && i < len(v.Buf.Lines); i++ {
-		currentState = ScanLineState(v.Buf.Lines[i], currentState)
+	isGo := isGoFile(v.Buf.Path)
+	if isGo {
+		prevPage := max(0, v.ScrollRow-v.Height)
+		for i := prevPage; i < v.ScrollRow && i < len(v.Buf.Lines); i++ {
+			currentState = ScanLineState(v.Buf.Lines[i], currentState)
+		}
 	}
 
 	// 2. Draw Text Viewport
@@ -936,7 +939,9 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 			Later, if performance becomes the bottleneck, then make it to async debouncer cache.
 		*/
 		var lineTokens []HighlightToken
-		lineTokens, currentState = HighlightGoLine(line, currentState, DefaultGoTheme())
+		if isGo {
+			lineTokens, currentState = HighlightGoLine(line, currentState, DefaultGoTheme())
+		}
 
 		var diag *LineDiagnostic
 		if diags, ok := lineDiags[i]; ok && len(diags) > 0 {
