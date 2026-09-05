@@ -9,6 +9,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"unicode"
 	"unicode/utf8"
 
@@ -18,9 +19,11 @@ import (
 
 // Buffer holds raw text and file metadata (Shared between views).
 type Buffer struct {
-	Path  string
-	Lines [][]byte
-	Dirty bool
+	Path           string
+	Lines          [][]byte
+	Dirty          bool
+	Mu             sync.Mutex
+	LineHighlights map[int][]HighlightToken
 }
 
 func NewBuffer(path string, content []byte) *Buffer {

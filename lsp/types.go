@@ -1,8 +1,35 @@
 package lsp
 
 type InitializeParams struct {
-	ProcessID int    `json:"processId"`
-	RootURI   string `json:"rootUri"`
+	ProcessID             int                   `json:"processId"`
+	RootURI               string                `json:"rootUri"`
+	Capabilities          ClientCapabilities    `json:"capabilities"`
+	InitializationOptions InitializationOptions `json:"initializationOptions,omitempty"`
+}
+
+type InitializationOptions struct {
+	SemanticTokens bool `json:"ui.semanticTokens,omitempty"`
+}
+
+type ClientCapabilities struct {
+	TextDocument TextDocumentClientCapabilities `json:"textDocument,omitempty"`
+}
+
+type TextDocumentClientCapabilities struct {
+	SemanticTokens SemanticTokensClientCapabilities `json:"semanticTokens,omitempty"`
+}
+
+type SemanticTokensClientCapabilities struct {
+	Requests                SemanticTokensRequestsClientCapabilities `json:"requests,omitempty"`
+	TokenTypes              []string                                 `json:"tokenTypes,omitempty"`
+	TokenModifiers          []string                                 `json:"tokenModifiers,omitempty"`
+	Formats                 []string                                 `json:"formats,omitempty"`
+	OverlappingTokenSupport bool                                     `json:"overlappingTokenSupport,omitempty"`
+	MultilineTokenSupport   bool                                     `json:"multilineTokenSupport,omitempty"`
+}
+
+type SemanticTokensRequestsClientCapabilities struct {
+	Full bool `json:"full,omitempty"`
 }
 
 type DidOpenTextDocumentParams struct {
@@ -29,11 +56,6 @@ type VersionedTextDocumentIdentifier struct {
 type TextDocumentContentChangeEvent struct {
 	Text string `json:"text"`
 }
-
-// type PublishDiagnosticsParams struct {
-// 	URI         string       `json:"uri"`
-// 	Diagnostics []Diagnostic `json:"diagnostics"`
-// }
 
 type DidSaveTextDocumentParams struct {
 	TextDocument TextDocumentIdentifier `json:"textDocument"`
@@ -271,4 +293,64 @@ type SymbolInformation struct {
 	Deprecated    bool       `json:"deprecated,omitempty"`
 	Location      Location   `json:"location"`
 	ContainerName string     `json:"containerName,omitempty"`
+}
+
+type SemanticTokensParams struct {
+	TextDocument TextDocumentIdentifier `json:"textDocument"`
+}
+
+// SemanticTokens Legend describes the token types and modifiers supported/returned by the server.
+type SemanticTokensLegend struct {
+	TokenTypes     []string `json:"tokenTypes"`
+	TokenModifiers []string `json:"tokenModifiers"`
+}
+
+const (
+	// These are the tokens defined by LSP 3.18, but a client is
+	// free to send its own set; any tokens that the server emits
+	// that are not in this set are simply not encoded in the bitfield.
+	TokComment   = "comment"       // for a comment
+	TokFunction  = "function"      // for a function
+	TokKeyword   = "keyword"       // for a keyword
+	TokLabel     = "label"         // for a control label (LSP 3.18)
+	TokMacro     = "macro"         // for text/template tokens
+	TokMethod    = "method"        // for a method
+	TokNamespace = "namespace"     // for an imported package name
+	TokNumber    = "number"        // for a numeric literal
+	TokOperator  = "operator"      // for an operator
+	TokParameter = "parameter"     // for a parameter variable
+	TokProperty  = "property"      // for a struct field
+	TokString    = "string"        // for a string literal
+	TokType      = "type"          // for a type name (plus other uses)
+	TokTypeParam = "typeParameter" // for a type parameter
+	TokVariable  = "variable"      // for a var or const
+)
+
+// DefaultGoplsLegend is a slice of types gopls will return as its server capabilities.
+var DefaultGoplsLegend = []string{
+	TokNamespace,
+	TokType,
+	TokTypeParam,
+	TokParameter,
+	TokProperty,
+	TokVariable,
+	TokFunction,
+	TokMethod,
+	TokMacro,
+	TokKeyword,
+	TokComment,
+	TokString,
+	TokNumber,
+	TokOperator,
+	TokLabel,
+}
+
+type SemanticTokensOptions struct {
+	Legend SemanticTokensLegend `json:"legend"`
+	Full   bool                 `json:"full,omitempty"`
+}
+
+type SemanticTokens struct {
+	ResultID string   `json:"resultId,omitempty"`
+	Data     []uint32 `json:"data"` // Delta-encoded integers
 }

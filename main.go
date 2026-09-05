@@ -228,10 +228,27 @@ func (e *Editor) startLSP(path string) error {
 	e.lspClient = client
 
 	workspace := FindWorkspaceDir(path)
-	client.SendRequest("initialize", lsp.InitializeParams{
+	params := lsp.InitializeParams{
 		ProcessID: os.Getpid(),
 		RootURI:   "file://" + workspace,
-	})
+		Capabilities: lsp.ClientCapabilities{
+			TextDocument: lsp.TextDocumentClientCapabilities{
+				SemanticTokens: lsp.SemanticTokensClientCapabilities{
+					Requests: lsp.SemanticTokensRequestsClientCapabilities{
+						Full: true,
+					},
+					TokenTypes: lsp.DefaultGoplsLegend,
+					Formats:    []string{"relative"},
+				},
+			},
+		},
+		InitializationOptions: lsp.InitializationOptions{
+			SemanticTokens: true,
+		},
+	}
+	respChan := make(chan []byte, 1)
+	client.SendRequestWithChan("initialize", params, respChan)
+	<-respChan
 	client.SendNotification("initialized", struct{}{})
 	e.changeChan = make(chan *Buffer, 100)
 	e.stopChan = make(chan struct{})
@@ -590,9 +607,7 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 		// LSP Completion requires latest buffer,
 		// so NotifyBufferChanged will be called and copys the whole buffer(not incremental update yet).
 		// For efficiency, do not trigger completion on every keystroke.
-		if key.Rune == '.' {
-			e.requestCompletion()
-		} else if e.completion.Active {
+		if e.completion.Active {
 			e.requestCompletion()
 		}
 
@@ -876,8 +891,8 @@ func LayoutPalatte(totalWidth, totalHeight, paletteHeight int) kero.Rect {
 
 func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 	statusStyle := kero.NewStyle().Reverse()
-	gutterStyle := kero.NewStyle().Foreground(kero.ColorBlue).Dim()
-	gutterActiveStyle := kero.NewStyle().Foreground(kero.ColorBlue)
+	gutterActiveStyle := kero.NewStyle()
+	gutterStyle := gutterActiveStyle.Dim()
 	textStyle := kero.NewStyle()
 	cursorStyle := textStyle.Reverse().Foreground(kero.ColorRed)
 	selectStyle := textStyle.Reverse()
@@ -913,18 +928,6 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 		f.Write(gutterRect.X+1, y, gutterText, style)
 	}
 
-	// Fast-forward LineState from previous page to v.ScrollRow,
-	// (Cheap single-pass check just tracking state transitions)
-	// should works most of the time, except large block comments.
-	currentState := StateNormal
-	isGo := isGoFile(v.Buf.Path)
-	if isGo {
-		prevPage := max(0, v.ScrollRow-v.Height)
-		for i := prevPage; i < v.ScrollRow && i < len(v.Buf.Lines); i++ {
-			currentState = ScanLineState(v.Buf.Lines[i], currentState)
-		}
-	}
-
 	// 2. Draw Text Viewport
 	for i := range textRect.H {
 		lineIdx := v.ScrollRow + i
@@ -934,14 +937,7 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 
 		y := textRect.Y + i
 		line := v.Buf.Lines[lineIdx]
-		/*
-			Compute the highlight token on-the-fly is effecient for normal file.
-			Later, if performance becomes the bottleneck, then make it to async debouncer cache.
-		*/
-		var lineTokens []HighlightToken
-		if isGo {
-			lineTokens, currentState = HighlightGoLine(line, currentState, DefaultGoTheme())
-		}
+		highlights := v.Buf.LineHighlights[lineIdx]
 
 		var diag *LineDiagnostic
 		if diags, ok := lineDiags[i]; ok && len(diags) > 0 {
@@ -972,16 +968,8 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 		// Draw characters cell by cell based on visual column space
 		vCol := 0
 		byteIdx := 0
-		tokenIdx := 0
 		for byteIdx < len(line) {
-			// Advance token pointer if current byte position exceeds active token
-			for tokenIdx < len(lineTokens) && byteIdx >= lineTokens[tokenIdx].EndCol {
-				tokenIdx++
-			}
-
 			r, size := utf8.DecodeRune(line[byteIdx:])
-			currByte := byteIdx
-			byteIdx += size
 
 			runeWidth := 1
 			if r == '\t' {
@@ -995,11 +983,11 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 			if screenX >= textRect.X && screenX < textRect.X+textRect.W {
 				charStyle := textStyle
 
-				// 1. Apply Syntax Highlighting Style (if byte falls within current token)
-				if tokenIdx < len(lineTokens) {
-					tok := lineTokens[tokenIdx]
-					if currByte >= tok.StartCol && currByte < tok.EndCol {
-						charStyle = tok.Style
+				// 1. Apply Syntax Highlighting Style
+				for _, tok := range highlights {
+					if byteIdx >= tok.StartCol && byteIdx < tok.EndCol {
+						charStyle = GetTokenTypeStyle(tok.TokenType)
+						break
 					}
 				}
 
@@ -1022,6 +1010,7 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 				}
 			}
 
+			byteIdx += size
 			vCol += runeWidth
 			if vCol-v.ScrollCol >= textRect.W {
 				break // Clipped right of viewport
@@ -1856,6 +1845,7 @@ func (e *Editor) OpenFile(path string) error {
 	for i, v := range e.views {
 		if v.Buf.Path == path {
 			e.active = i
+			e.NotifyBufferOpened(v.Buf)
 			return nil
 		}
 	}
@@ -2888,6 +2878,11 @@ func (e *Editor) NotifyBufferOpened(buf *Buffer) {
 			Text:       content,
 		},
 	})
+
+	// gopls will only generate semantic tokens for files that are actively opened
+	// in the LSP session and fully parsed by its type checker
+	// TODO: Wait briefly
+	e.RefreshHighlights(buf)
 }
 
 // Notify LSP as the user edits (Call from your debouncer or OnContentChanged).
@@ -2913,6 +2908,10 @@ func (e *Editor) NotifyBufferChanged(buf *Buffer) {
 		ContentChanges: []lsp.TextDocumentContentChangeEvent{
 			{Text: content},
 		},
+	})
+
+	time.AfterFunc(time.Second, func() {
+		e.RefreshHighlights(buf)
 	})
 }
 

@@ -74,11 +74,51 @@ func (c *Client) SendRequest(method string, params any) int64 {
 		return 0
 	}
 
-	// Frame header + body
-	frame := fmt.Sprintf("Content-Length: %d\r\n\r\n%s", len(data), data)
-	c.stdin.Write([]byte(frame))
-
+	c.writeRaw(data)
 	return id
+}
+
+func (c *Client) SendRequestWithChan(method string, params any, respChan chan []byte) int64 {
+	id := c.nextID.Add(1)
+
+	c.pendingMu.Lock()
+	if c.pending == nil {
+		c.pending = make(map[int64]chan []byte)
+	}
+	c.pending[id] = respChan
+	c.pendingMu.Unlock()
+
+	req := struct {
+		JSONRPC string `json:"jsonrpc"`
+		ID      int64  `json:"id"`
+		Method  string `json:"method"`
+		Params  any    `json:"params"`
+	}{
+		JSONRPC: "2.0",
+		ID:      id,
+		Method:  method,
+		Params:  params,
+	}
+
+	data, err := json.Marshal(req)
+	if err != nil {
+		c.pendingMu.Lock()
+		delete(c.pending, id)
+		c.pendingMu.Unlock()
+		return 0
+	}
+
+	c.writeRaw(data)
+	return id
+}
+
+func (c *Client) writeRaw(data []byte) {
+	header := fmt.Sprintf("Content-Length: %d\r\n\r\n", len(data))
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.stdin.Write([]byte(header))
+	c.stdin.Write(data)
 }
 
 func StartClient(goplsPath string, onDiagnostics func(string, []Diagnostic)) (*Client, error) {
@@ -105,13 +145,6 @@ func StartClient(goplsPath string, onDiagnostics func(string, []Diagnostic)) (*C
 	go c.readLoop(bufio.NewReader(stdout))
 	return c, nil
 }
-
-// func (c *Client) SendRequest(method string, params any) int64 {
-// 	id := atomic.AddInt64(&c.reqID, 1)
-// 	msg := request{JSONRPC: "2.0", ID: id, Method: method, Params: params}
-// 	c.write(msg)
-// 	return id
-// }
 
 func (c *Client) SendNotification(method string, params any) {
 	msg := notification{JSONRPC: "2.0", Method: method, Params: params}
@@ -182,7 +215,7 @@ func (c *Client) dispatchIncomingMessage(body []byte) {
 
 		if exists {
 			if raw.Error != nil {
-				// Send JSON error or empty payload if request failed
+				log.Printf("LSP request %d error: code=%d message=%s", reqID, raw.Error.Code, raw.Error.Message)
 				ch <- nil
 			} else {
 				// Send raw JSON result payload back to the awaiting request caller
@@ -653,4 +686,35 @@ func CharFromByteOffset(line []byte, byteOffset int) int {
 		currByte += size
 	}
 	return utf16Count
+}
+
+func (c *Client) GetSemanticTokens(uri string) (*SemanticTokens, error) {
+	params := SemanticTokensParams{
+		TextDocument: TextDocumentIdentifier{URI: uri},
+	}
+
+	respChan := make(chan []byte, 1)
+	id := c.SendRequestWithChan("textDocument/semanticTokens/full", params, respChan)
+
+	defer func() {
+		c.pendingMu.Lock()
+		delete(c.pending, id)
+		c.pendingMu.Unlock()
+	}()
+
+	select {
+	case data := <-respChan:
+		if len(data) == 0 || string(data) == "null" {
+			return nil, nil
+		}
+
+		var tokens SemanticTokens
+		if err := json.Unmarshal(data, &tokens); err != nil {
+			return nil, fmt.Errorf("failed to parse semantic tokens: %w", err)
+		}
+		return &tokens, nil
+
+	case <-time.After(3 * time.Second):
+		return nil, fmt.Errorf("semantic tokens request timed out")
+	}
 }
