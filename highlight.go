@@ -6,31 +6,42 @@ import (
 	"github.com/cansyan/kero"
 )
 
-// HighlightToken defines a styled range within a single line (0-indexed byte offsets).
-type HighlightToken struct {
-	StartCol int        // Byte offset start (inclusive)
-	EndCol   int        // Byte offset end (exclusive)
-	Style    kero.Style // Theme style
+type TokenType int
+
+const (
+	TokKeyword TokenType = iota // package, func, var, go, return, etc.
+	TokType                     // int, string, struct, bool, error, etc.
+	TokString                   // "...", `...`, 'a'
+	TokComment                  // // comment or /* comment */
+	TokNumber                   // 123, 0x1F, 3.14
+	TokBuiltin                  // nil, true, false, iota, make, len
+)
+
+// Token defines a token range within a single line (0-indexed byte offsets).
+type Token struct {
+	StartCol int       // Byte offset start (inclusive)
+	EndCol   int       // Byte offset end (exclusive)
+	Type     TokenType // token type
 }
 
-// GoSyntaxTheme holds styles for language constructs.
-type GoSyntaxTheme struct {
-	Keyword kero.Style // package, func, var, go, return, etc.
-	Type    kero.Style // int, string, struct, bool, error, etc.
-	String  kero.Style // "...", `...`, 'a'
-	Comment kero.Style // // comment or /* comment */
-	Number  kero.Style // 123, 0x1F, 3.14
-	Builtin kero.Style // nil, true, false, iota, make, len
-}
-
-func DefaultGoTheme() GoSyntaxTheme {
-	return GoSyntaxTheme{
-		Keyword: kero.NewStyle().Foreground(kero.ColorMagenta).Bold(),
-		Type:    kero.NewStyle().Foreground(kero.ColorCyan),
-		String:  kero.NewStyle().Foreground(kero.ColorGreen),
-		Comment: kero.NewStyle().Dim(),
-		Number:  kero.NewStyle().Foreground(kero.ColorYellow),
-		Builtin: kero.NewStyle().Foreground(kero.ColorBlue),
+// TokenStyle returns the highlight style for the given token type
+func TokenStyle(t TokenType) kero.Style {
+	switch t {
+	case TokKeyword:
+		return kero.NewStyle().Foreground(kero.ColorMagenta)
+	case TokType:
+		return kero.NewStyle().Foreground(kero.ColorBlue)
+	case TokString:
+		return kero.NewStyle().Foreground(kero.ColorGreen)
+	case TokComment:
+		return kero.NewStyle().Dim()
+	case TokNumber:
+		return kero.NewStyle().Foreground(kero.ColorYellow)
+	case TokBuiltin:
+		return kero.NewStyle().Foreground(kero.ColorBlue)
+	// optional: cyan color for method, function
+	default:
+		return kero.NewStyle()
 	}
 }
 
@@ -61,20 +72,20 @@ const (
 	StateInRawString
 )
 
-// HighlightGoLine tokenizes a single line of bytes.
+// ParseToken tokenizes a single line of bytes.
 // Returns the slice of tokens and the ending state to pass to the next line.
-func HighlightGoLine(line []byte, startState LineState, theme GoSyntaxTheme) ([]HighlightToken, LineState) {
-	var tokens []HighlightToken
+func ParseToken(line []byte, startState LineState) ([]Token, LineState) {
+	var tokens []Token
 	i := 0
 	n := len(line)
 	state := startState
 
-	addToken := func(start, end int, style kero.Style) {
+	addToken := func(start, end int, tokType TokenType) {
 		if start < end {
-			tokens = append(tokens, HighlightToken{
+			tokens = append(tokens, Token{
 				StartCol: start,
 				EndCol:   end,
-				Style:    style,
+				Type:     tokType,
 			})
 		}
 	}
@@ -91,7 +102,7 @@ func HighlightGoLine(line []byte, startState LineState, theme GoSyntaxTheme) ([]
 				}
 				i++
 			}
-			addToken(start, i, theme.Comment)
+			addToken(start, i, TokComment)
 			continue
 		}
 
@@ -106,7 +117,7 @@ func HighlightGoLine(line []byte, startState LineState, theme GoSyntaxTheme) ([]
 				}
 				i++
 			}
-			addToken(start, i, theme.String)
+			addToken(start, i, TokString)
 			continue
 		}
 
@@ -118,7 +129,7 @@ func HighlightGoLine(line []byte, startState LineState, theme GoSyntaxTheme) ([]
 
 		// 3. Line Comments (// ...)
 		if i+1 < n && line[i] == '/' && line[i+1] == '/' {
-			addToken(i, n, theme.Comment)
+			addToken(i, n, TokComment)
 			i = n
 			break
 		}
@@ -136,7 +147,7 @@ func HighlightGoLine(line []byte, startState LineState, theme GoSyntaxTheme) ([]
 				}
 				i++
 			}
-			addToken(start, i, theme.Comment)
+			addToken(start, i, TokComment)
 			continue
 		}
 
@@ -156,7 +167,7 @@ func HighlightGoLine(line []byte, startState LineState, theme GoSyntaxTheme) ([]
 				}
 				i++
 			}
-			addToken(start, i, theme.String)
+			addToken(start, i, TokString)
 			continue
 		}
 
@@ -173,7 +184,7 @@ func HighlightGoLine(line []byte, startState LineState, theme GoSyntaxTheme) ([]
 				}
 				i++
 			}
-			addToken(start, i, theme.String)
+			addToken(start, i, TokString)
 			continue
 		}
 
@@ -183,7 +194,7 @@ func HighlightGoLine(line []byte, startState LineState, theme GoSyntaxTheme) ([]
 			for i < n && (isHexOrDigit(line[i]) || line[i] == '.' || line[i] == '_') {
 				i++
 			}
-			addToken(start, i, theme.Number)
+			addToken(start, i, TokNumber)
 			continue
 		}
 
@@ -196,11 +207,11 @@ func HighlightGoLine(line []byte, startState LineState, theme GoSyntaxTheme) ([]
 			word := string(line[start:i])
 
 			if token.IsKeyword(word) {
-				addToken(start, i, theme.Keyword)
+				addToken(start, i, TokKeyword)
 			} else if goTypes[word] {
-				addToken(start, i, theme.Type)
+				addToken(start, i, TokType)
 			} else if goBuiltins[word] {
-				addToken(start, i, theme.Builtin)
+				addToken(start, i, TokBuiltin)
 			}
 			continue
 		}
@@ -225,7 +236,7 @@ func isLetter(b byte) bool {
 	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z')
 }
 
-// ScanLineState updates currentState without allocating token slices.
+// ScanLineState updates line state without allocating token slices.
 func ScanLineState(line []byte, startState LineState) LineState {
 	state := startState
 	i := 0

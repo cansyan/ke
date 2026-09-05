@@ -590,9 +590,8 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 		// LSP Completion requires latest buffer,
 		// so NotifyBufferChanged will be called and copys the whole buffer(not incremental update yet).
 		// For efficiency, do not trigger completion on every keystroke.
-		if key.Rune == '.' {
-			e.requestCompletion()
-		} else if e.completion.Active {
+		// Optional, trigger on dot while not pasting, but must consider the comment case
+		if e.completion.Active {
 			e.requestCompletion()
 		}
 
@@ -876,8 +875,8 @@ func LayoutPalatte(totalWidth, totalHeight, paletteHeight int) kero.Rect {
 
 func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 	statusStyle := kero.NewStyle().Reverse()
-	gutterStyle := kero.NewStyle().Foreground(kero.ColorBlue).Dim()
-	gutterActiveStyle := kero.NewStyle().Foreground(kero.ColorBlue)
+	gutterActiveStyle := kero.NewStyle()
+	gutterStyle := gutterActiveStyle.Dim()
 	textStyle := kero.NewStyle()
 	cursorStyle := textStyle.Reverse().Foreground(kero.ColorRed)
 	selectStyle := textStyle.Reverse()
@@ -934,13 +933,11 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 
 		y := textRect.Y + i
 		line := v.Buf.Lines[lineIdx]
-		/*
-			Compute the highlight token on-the-fly is effecient for normal file.
-			Later, if performance becomes the bottleneck, then make it to async debouncer cache.
-		*/
-		var lineTokens []HighlightToken
+		var lineTokens []Token
 		if isGo {
-			lineTokens, currentState = HighlightGoLine(line, currentState, DefaultGoTheme())
+			// In viewport, parsing semantic token on-the-fly is simple and effecient,
+			// no background worker nor cache needed.
+			lineTokens, currentState = ParseToken(line, currentState)
 		}
 
 		var diag *LineDiagnostic
@@ -972,16 +969,8 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 		// Draw characters cell by cell based on visual column space
 		vCol := 0
 		byteIdx := 0
-		tokenIdx := 0
 		for byteIdx < len(line) {
-			// Advance token pointer if current byte position exceeds active token
-			for tokenIdx < len(lineTokens) && byteIdx >= lineTokens[tokenIdx].EndCol {
-				tokenIdx++
-			}
-
 			r, size := utf8.DecodeRune(line[byteIdx:])
-			currByte := byteIdx
-			byteIdx += size
 
 			runeWidth := 1
 			if r == '\t' {
@@ -996,10 +985,9 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 				charStyle := textStyle
 
 				// 1. Apply Syntax Highlighting Style (if byte falls within current token)
-				if tokenIdx < len(lineTokens) {
-					tok := lineTokens[tokenIdx]
-					if currByte >= tok.StartCol && currByte < tok.EndCol {
-						charStyle = tok.Style
+				for _, t := range lineTokens {
+					if byteIdx >= t.StartCol && byteIdx < t.EndCol {
+						charStyle = TokenStyle(t.Type)
 					}
 				}
 
@@ -1022,6 +1010,7 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 				}
 			}
 
+			byteIdx += size
 			vCol += runeWidth
 			if vCol-v.ScrollCol >= textRect.W {
 				break // Clipped right of viewport
