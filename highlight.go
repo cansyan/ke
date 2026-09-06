@@ -38,7 +38,7 @@ func TokenStyle(t TokenType) kero.Style {
 	case TokNumber:
 		return kero.NewStyle().Foreground(kero.ColorYellow)
 	case TokBuiltin:
-		return kero.NewStyle().Foreground(kero.ColorBlue)
+		return kero.NewStyle().Foreground(kero.ColorYellow)
 	// optional: cyan color for method, function
 	default:
 		return kero.NewStyle()
