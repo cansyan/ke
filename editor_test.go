@@ -280,25 +280,25 @@ func TestReplaceCurrentAndSkip(t *testing.T) {
 	}
 
 	ed.startFind()
-	ed.findInput.SetText("one")
+	ed.find.Input.SetText("one")
 	ed.updateFind(kero.KeyEvent{Key: kero.KeyEnter})
 	ed.updateFind(kero.KeyEvent{Key: kero.KeyRune, Rune: 'r', Mod: kero.ModCtrl})
-	ed.replaceInput.SetText("1")
+	ed.find.ReplaceInput.SetText("1")
 	ed.updateFind(kero.KeyEvent{Key: kero.KeyEnter})
 
 	if got := string(v.Buf.Lines[0]); got != "1 two one three one" {
 		t.Fatalf("after replace current = %q, want %q", got, "1 two one three one")
 	}
-	if !ed.findMatch || ed.findMatchStart.Col != 6 {
-		t.Fatalf("next match = (%+v, %+v, %v), want start at column 6", ed.findMatchStart, ed.findMatchEnd, ed.findMatch)
+	if !ed.find.Match || ed.find.MatchStart.Col != 6 {
+		t.Fatalf("next match = (%+v, %+v, %v), want start at column 6", ed.find.MatchStart, ed.find.MatchEnd, ed.find.Match)
 	}
 
 	ed.updateFind(kero.KeyEvent{Key: kero.KeyTab})
-	if !ed.findMatch {
+	if !ed.find.Match {
 		t.Fatal("expected skip to wrap to the first remaining match")
 	}
-	if ed.findMatchStart.Col != 16 {
-		t.Fatalf("skipped match start = %d, want 16", ed.findMatchStart.Col)
+	if ed.find.MatchStart.Col != 16 {
+		t.Fatalf("skipped match start = %d, want 16", ed.find.MatchStart.Col)
 	}
 }
 
@@ -309,9 +309,9 @@ func TestReplaceAll(t *testing.T) {
 		},
 	}
 	ed.startFind()
-	ed.findInput.SetText("cat")
+	ed.find.Input.SetText("cat")
 	ed.updateFind(kero.KeyEvent{Key: kero.KeyRune, Rune: 'r', Mod: kero.ModCtrl})
-	ed.replaceInput.SetText("fox")
+	ed.find.ReplaceInput.SetText("fox")
 	ctrlEnter := kero.KeyEvent{Key: kero.KeyEnter, Mod: kero.ModCtrl}
 	ed.updateFind(ctrlEnter)
 

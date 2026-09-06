@@ -155,15 +155,7 @@ type Editor struct {
 	saveAs    bool
 	saveInput TextInput
 
-	// find mode opens a find line at the message area
-	finding        bool
-	findBlur       bool
-	replacing      bool
-	findInput      TextInput
-	replaceInput   TextInput
-	findMatch      bool
-	findMatchStart Position
-	findMatchEnd   Position
+	find Find
 
 	palette Palette
 
@@ -172,9 +164,6 @@ type Editor struct {
 
 	// optional: record the time of last key, make it expire after a while
 	lastEvent kero.Event
-
-	// diags    []*scanner.Error
-	// diagChan chan []*scanner.Error
 
 	// reports whether the key comes from a paste action,
 	// to distinguish the manual KeyEnter or a pasted \n
@@ -380,9 +369,9 @@ func (e *Editor) handleMouse(ctx *kero.Context, m kero.MouseEvent) error {
 				if e.hasSelect() {
 					e.clearSelect()
 				}
-				if e.finding {
+				if e.find.Active {
 					// focus out
-					e.findBlur = true
+					e.find.Blur = true
 				}
 				if e.completion.Active {
 					e.completion.Active = false
@@ -410,7 +399,17 @@ func (e *Editor) handleMouse(ctx *kero.Context, m kero.MouseEvent) error {
 				switch m.Mod {
 				case kero.ModCtrl:
 					// ctrl+mouse_left_release goto definition
+					row := e.View().Cursor.Row
 					e.GotoDefinition()
+					// if clicking on the Definition, then find references
+					if e.View().Cursor.Row == row {
+						e.FindReferences()
+						if e.ref.Active && len(e.ref.Items) == 2 {
+							// just jump to the one and only reference
+							e.ref.Active = false
+							e.GotoLSPLocation(e.ref.Items[1])
+						}
+					}
 				case kero.ModAlt:
 					// alt+mouse_left_release find references
 					e.FindReferences()
@@ -453,7 +452,7 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 	if e.saveAs {
 		return e.updateSaveAs(key)
 	}
-	if e.finding && !e.findBlur {
+	if e.find.Active && !e.find.Blur {
 		return e.updateFind(key)
 	}
 	if e.palette.Active {
@@ -829,8 +828,8 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 			e.ref.Active = false
 			return nil
 		}
-		if e.finding {
-			e.finding = false
+		if e.find.Active {
+			e.find.Active = false
 			return nil
 		}
 		e.clearSelect()
@@ -887,7 +886,8 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 	gutterRect, textRect, bottomPanelRect, msgRect, statusRect := LayoutWindow(fSize.Width, fSize.Height, len(v.Buf.Lines), e.ref.Active)
 
 	tabWidth := 4
-	gutterMap, lineDiags := v.GetVisibleDiagnostics(e.diagnostics[e.Buf().Path], tabWidth)
+	fileDiags := e.diagnostics[e.Buf().Path]
+	gutterMap, lineDiags := v.GetVisibleDiagnostics(fileDiags, tabWidth)
 
 	// 1. Draw Gutter
 	for i := range gutterRect.H {
@@ -996,6 +996,11 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 					charStyle = charStyle.Underline()
 				}
 
+				// 3. Override with find match
+				if e.find.Active && lineIdx == e.find.MatchStart.Row && byteIdx >= e.find.MatchStart.Col && byteIdx < e.find.MatchEnd.Col {
+					charStyle = selectStyle
+				}
+
 				// 3. Override with Selection Style (highest priority)
 				if selStartVCol != -1 && vCol >= selStartVCol && vCol < selEndVCol {
 					charStyle = selectStyle
@@ -1063,6 +1068,9 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 		}
 
 		status := fmt.Sprintf("| Line %d, Col %d", v.Cursor.Row+1, cursorVisCol+1)
+		if len(fileDiags) > 0 {
+			status += fmt.Sprintf(" | %d error", len(fileDiags))
+		}
 		f.Write(statusRect.X+offset, statusRect.Y, trimToWidth(status, ctx.Width), statusStyle)
 	}
 
@@ -1070,7 +1078,7 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 		switch {
 		case e.saveAs:
 			e.drawSaveAs(f, msgRect)
-		case e.finding:
+		case e.find.Active:
 			e.drawFind(f, msgRect)
 		case e.renaming:
 			e.drawRename(f, msgRect)
@@ -1362,17 +1370,29 @@ func (e *Editor) drawSaveAs(f *kero.Frame, rect kero.Rect) {
 	e.saveInput.Draw(f, kero.Rect{X: inputX, Y: rect.Y, W: rect.W - inputX, H: 1}, style)
 }
 
+type Find struct {
+	Active bool
+	Blur   bool
+	Input  TextInput
+
+	Replacing    bool
+	ReplaceInput TextInput
+	Match        bool
+	MatchStart   Position
+	MatchEnd     Position
+}
+
 // startFind starts a Find prompt, and pre-fill with selection or last query, if any.
 func (e *Editor) startFind() {
-	e.finding = true
-	e.findBlur = false
-	e.replacing = false
+	e.find.Active = true
+	e.find.Blur = false
+	e.find.Replacing = false
 	if e.hasSelect() {
-		e.findInput.SetTextAndSelectAll(e.Buf().TextRange(e.View().SelAnchor, e.View().Cursor))
+		e.find.Input.SetTextAndSelectAll(e.Buf().TextRange(e.View().SelAnchor, e.View().Cursor))
 		return
 	}
-	if e.findInput.String() != "" {
-		e.findInput.SetTextAndSelectAll(e.findInput.String())
+	if e.find.Input.String() != "" {
+		e.find.Input.SetTextAndSelectAll(e.find.Input.String())
 	}
 }
 
@@ -1387,18 +1407,18 @@ func findQueryIgnoreCase(query string) bool {
 
 func (e *Editor) updateFind(ev kero.KeyEvent) error {
 	if ev.String() == "ctrl+r" {
-		e.replacing = !e.replacing
-		if e.replacing {
-			e.replaceInput.SetText("")
-			e.replaceInput.Placeholder = "replacement"
+		e.find.Replacing = !e.find.Replacing
+		if e.find.Replacing {
+			e.find.ReplaceInput.SetText("")
+			e.find.ReplaceInput.Placeholder = "replacement"
 		}
 		return nil
 	}
-	if e.replacing {
+	if e.find.Replacing {
 		switch ev.Key {
 		case kero.KeyEsc:
-			e.finding = false
-			e.replacing = false
+			e.find.Active = false
+			e.find.Replacing = false
 			return nil
 		case kero.KeyTab:
 			e.skipFindMatch()
@@ -1406,22 +1426,22 @@ func (e *Editor) updateFind(ev kero.KeyEvent) error {
 		case kero.KeyEnter:
 			if ev.Mod&kero.ModCtrl != 0 {
 				e.replaceAll()
-				e.finding = false
-				e.replacing = false
+				e.find.Active = false
+				e.find.Replacing = false
 				return nil
 			}
 			return e.replaceCurrent()
 		}
-		e.replaceInput.Update(ev)
+		e.find.ReplaceInput.Update(ev)
 		return nil
 	}
 
 	switch ev.Key {
 	case kero.KeyEsc:
-		e.finding = false
+		e.find.Active = false
 		return nil
 	case kero.KeyEnter:
-		query := e.findInput.String()
+		query := e.find.Input.String()
 		if query == "" {
 			return nil
 		}
@@ -1430,17 +1450,17 @@ func (e *Editor) updateFind(ev kero.KeyEvent) error {
 		if ev.Mod&kero.ModShift != 0 {
 			if ignoreCase {
 				if start, end, ok := e.Buf().FindPrevIgnoreCase(query, e.View().Cursor); ok {
-					e.findMatch = true
-					e.findMatchStart = start
-					e.findMatchEnd = end
+					e.find.Match = true
+					e.find.MatchStart = start
+					e.find.MatchEnd = end
 					e.View().Cursor = start
 					e.clearSelect()
 				}
 			} else {
 				if start, end, ok := e.Buf().FindPrev(query, e.View().Cursor); ok {
-					e.findMatch = true
-					e.findMatchStart = start
-					e.findMatchEnd = end
+					e.find.Match = true
+					e.find.MatchStart = start
+					e.find.MatchEnd = end
 					e.View().Cursor = start
 					e.clearSelect()
 				}
@@ -1451,18 +1471,18 @@ func (e *Editor) updateFind(ev kero.KeyEvent) error {
 		if ignoreCase {
 			start, end, ok := e.Buf().FindNextIgnoreCase(query, e.View().Cursor)
 			if ok {
-				e.findMatch = true
-				e.findMatchStart = start
-				e.findMatchEnd = end
+				e.find.Match = true
+				e.find.MatchStart = start
+				e.find.MatchEnd = end
 				e.View().Cursor = end
 				e.clearSelect()
 			}
 		} else {
 			start, end, ok := e.Buf().FindNext(query, e.View().Cursor)
 			if ok {
-				e.findMatch = true
-				e.findMatchStart = start
-				e.findMatchEnd = end
+				e.find.Match = true
+				e.find.MatchStart = start
+				e.find.MatchEnd = end
 				e.View().Cursor = end
 				e.clearSelect()
 			}
@@ -1470,8 +1490,8 @@ func (e *Editor) updateFind(ev kero.KeyEvent) error {
 		return nil
 	}
 
-	e.findMatch = false
-	e.findInput.Update(ev)
+	e.find.Match = false
+	e.find.Input.Update(ev)
 	// this tidy editor hasn't implemented Go Back/Forward,
 	// don't jump to the first match on typing
 	return nil
@@ -1485,26 +1505,26 @@ func (e *Editor) drawFind(f *kero.Frame, rect kero.Rect) {
 	if inputX >= rect.W {
 		return
 	}
-	if !e.replacing {
-		e.findInput.Draw(f, kero.Rect{X: inputX, Y: rect.Y, W: rect.W - inputX, H: 1}, normal)
+	if !e.find.Replacing {
+		e.find.Input.Draw(f, kero.Rect{X: inputX, Y: rect.Y, W: rect.W - inputX, H: 1}, normal)
 		return
 	}
-	e.findInput.Draw(f, kero.Rect{X: inputX, Y: rect.Y, W: rect.W - inputX, H: 1}, normal)
-	replaceX := inputX + len([]rune(e.findInput.String())) + 4
+	e.find.Input.Draw(f, kero.Rect{X: inputX, Y: rect.Y, W: rect.W - inputX, H: 1}, normal)
+	replaceX := inputX + len([]rune(e.find.Input.String())) + 4
 	if replaceX < rect.W {
 		f.Write(replaceX-4, rect.Y, " -> ", normal.Foreground(kero.ColorYellow))
-		e.replaceInput.Draw(f, kero.Rect{X: replaceX, Y: rect.Y, W: rect.W - replaceX, H: 1}, normal)
+		e.find.ReplaceInput.Draw(f, kero.Rect{X: replaceX, Y: rect.Y, W: rect.W - replaceX, H: 1}, normal)
 	}
 }
 
 func (e *Editor) skipFindMatch() {
-	query := e.findInput.String()
+	query := e.find.Input.String()
 	if query == "" {
 		return
 	}
 	from := e.View().Cursor
-	if e.findMatch {
-		from = e.findMatchEnd
+	if e.find.Match {
+		from = e.find.MatchEnd
 	}
 	ignoreCase := findQueryIgnoreCase(query)
 	var start, end Position
@@ -1515,33 +1535,33 @@ func (e *Editor) skipFindMatch() {
 		start, end, ok = e.Buf().FindNext(query, from)
 	}
 	if !ok {
-		e.findMatch = false
+		e.find.Match = false
 		return
 	}
-	e.findMatch = true
-	e.findMatchStart = start
-	e.findMatchEnd = end
+	e.find.Match = true
+	e.find.MatchStart = start
+	e.find.MatchEnd = end
 	e.View().Cursor = end
 	e.clearSelect()
 }
 
 func (e *Editor) replaceCurrent() error {
-	query := e.findInput.String()
+	query := e.find.Input.String()
 	if query == "" {
 		return nil
 	}
-	if !e.findMatch {
+	if !e.find.Match {
 		e.skipFindMatch()
 	}
-	if !e.findMatch {
+	if !e.find.Match {
 		return nil
 	}
 
-	replacedEnd := e.Buf().ReplaceRange(e.findMatchStart, e.findMatchEnd, e.replaceInput.String())
+	replacedEnd := e.Buf().ReplaceRange(e.find.MatchStart, e.find.MatchEnd, e.find.ReplaceInput.String())
 	e.markDirty()
 	e.View().Cursor = replacedEnd
-	e.findMatch = false
-	if e.replaceInput.String() == query && replacedEnd.Col < e.Buf().LineEnd(replacedEnd).Col {
+	e.find.Match = false
+	if e.find.ReplaceInput.String() == query && replacedEnd.Col < e.Buf().LineEnd(replacedEnd).Col {
 		replacedEnd.Col++
 		e.View().Cursor = replacedEnd
 	}
@@ -1550,21 +1570,21 @@ func (e *Editor) replaceCurrent() error {
 }
 
 func (e *Editor) replaceAll() error {
-	query := e.findInput.String()
+	query := e.find.Input.String()
 	if query == "" {
 		return nil
 	}
 	ignoreCase := findQueryIgnoreCase(query)
 	var count int
 	if ignoreCase {
-		count = e.Buf().ReplaceAllIgnoreCase(query, e.replaceInput.String())
+		count = e.Buf().ReplaceAllIgnoreCase(query, e.find.ReplaceInput.String())
 	} else {
-		count = e.Buf().ReplaceAll(query, e.replaceInput.String())
+		count = e.Buf().ReplaceAll(query, e.find.ReplaceInput.String())
 	}
 	if count > 0 {
 		e.markDirty()
 	}
-	e.findMatch = false
+	e.find.Match = false
 	e.message = fmt.Sprintf("replaced %d matches", count)
 	return nil
 }
