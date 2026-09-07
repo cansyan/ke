@@ -1053,7 +1053,7 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 		f.Set(cursorX, cursorY, ch, cursorStyle)
 	}
 
-	// 4. Status Bar & Panels
+	// 4. Status Bar
 	if statusRect.H > 0 {
 		f.Fill(statusRect, ' ', statusStyle)
 		var offset int
@@ -1071,7 +1071,13 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 		if len(fileDiags) > 0 {
 			status += fmt.Sprintf(" | %d error", len(fileDiags))
 		}
-		f.Write(statusRect.X+offset, statusRect.Y, trimToWidth(status, ctx.Width), statusStyle)
+		f.Write(statusRect.X+offset, statusRect.Y, status, statusStyle)
+		offset += runewidth.StringWidth(status)
+
+		event := e.LastEvent()
+		if x := ctx.Width - runewidth.StringWidth(event); x > statusRect.X+offset+2 {
+			f.Write(x, statusRect.Y, event, statusStyle)
+		}
 	}
 
 	if msgRect.H > 0 {
