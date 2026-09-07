@@ -190,12 +190,10 @@ func (b *Buffer) Delete(p1, p2 Position) Position {
 	}
 
 	// Multi-line deletion
-	startLinePrefix := append([]byte(nil), b.Lines[start.Row][:start.Col]...)
+	startLinePrefix := b.Lines[start.Row][:start.Col]
 	endLineSuffix := b.Lines[end.Row][end.Col:]
-
 	// Stitch start prefix and end suffix into one merged line
 	mergedLine := slices.Concat(startLinePrefix, endLineSuffix)
-
 	b.Lines[start.Row] = mergedLine
 	b.Lines = slices.Delete(b.Lines, start.Row+1, end.Row+1)
 	return start
