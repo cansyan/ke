@@ -536,9 +536,17 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 			return nil
 		case "ctrl+c":
 			e.copy()
+			err := ctx.CopyToClipboard(e.clipboard)
+			if err != nil {
+				log.Print(err)
+			}
 			return nil
 		case "ctrl+x":
 			e.cut()
+			err := ctx.CopyToClipboard(e.clipboard)
+			if err != nil {
+				log.Print(err)
+			}
 			return nil
 		case "ctrl+v":
 			e.paste()
@@ -2443,6 +2451,13 @@ func (p *Palette) fileItems(e *Editor, query string) []PaletteItem {
 	return items
 }
 
+// AlignRight returns the x coordinate required to right-align text within rectangle r,
+// applying the specified right padding.
+func AlignRight(r kero.Rect, s string, padding int) int {
+	x := r.Right() - runewidth.StringWidth(s) - padding
+	return max(0, x)
+}
+
 // drawPalette renders the input field and popup overlay menu above row y.
 func (e *Editor) drawPalette(f *kero.Frame, rect kero.Rect) {
 	if !e.palette.Active {
@@ -2488,8 +2503,7 @@ func (e *Editor) drawPalette(f *kero.Frame, rect kero.Rect) {
 
 		// Right side text: Detail (e.g. line number or keybinding hint)
 		if item.Detail != "" {
-			detailX := rect.X + (rect.W - runewidth.StringWidth(item.Detail) - 1)
-
+			detailX := AlignRight(rect, item.Detail, 1)
 			// Only render detail if it doesn't overlap left text
 			if detailX > x+2 {
 				f.Write(detailX, lineY, item.Detail, style)
@@ -2644,14 +2658,14 @@ func (e *Editor) drawCompletion(f *kero.Frame) {
 			style = normal.Reverse().Bold()
 		}
 		label := prefix + c.Items[i+offset].Label
-		f.Write(rect.X, y, label, style)
+		f.Write(x, y, label, style)
+		x += runewidth.StringWidth(label)
 
 		// right side text
 		if item.Detail != "" && i+offset == c.Index {
-			x += runewidth.StringWidth(label)
-			remaining := rect.W - runewidth.StringWidth(label) - 3
-			dx := max(rect.Right()-runewidth.StringWidth(item.Detail), x+3)
-			f.Write(dx, y, runewidth.Truncate(item.Detail, remaining, ""), style)
+			detailX := AlignRight(rect, item.Detail, 1)
+			detailX = max(x+3, detailX)
+			f.Write(detailX, y, runewidth.Truncate(item.Detail, rect.Right()-detailX, ""), style)
 		}
 	}
 }
