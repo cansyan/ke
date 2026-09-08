@@ -138,17 +138,48 @@ type CompletionContext struct {
 	TriggerCharacter string `json:"triggerCharacter,omitempty"`
 }
 
+// The kind of a completion entry.
+type CompletionItemKind uint32
+
+const (
+	TextCompletion          CompletionItemKind = 1
+	MethodCompletion        CompletionItemKind = 2
+	FunctionCompletion      CompletionItemKind = 3
+	ConstructorCompletion   CompletionItemKind = 4
+	FieldCompletion         CompletionItemKind = 5
+	VariableCompletion      CompletionItemKind = 6
+	ClassCompletion         CompletionItemKind = 7
+	InterfaceCompletion     CompletionItemKind = 8
+	ModuleCompletion        CompletionItemKind = 9
+	PropertyCompletion      CompletionItemKind = 10
+	UnitCompletion          CompletionItemKind = 11
+	ValueCompletion         CompletionItemKind = 12
+	EnumCompletion          CompletionItemKind = 13
+	KeywordCompletion       CompletionItemKind = 14
+	SnippetCompletion       CompletionItemKind = 15
+	ColorCompletion         CompletionItemKind = 16
+	FileCompletion          CompletionItemKind = 17
+	ReferenceCompletion     CompletionItemKind = 18
+	FolderCompletion        CompletionItemKind = 19
+	EnumMemberCompletion    CompletionItemKind = 20
+	ConstantCompletion      CompletionItemKind = 21
+	StructCompletion        CompletionItemKind = 22
+	EventCompletion         CompletionItemKind = 23
+	OperatorCompletion      CompletionItemKind = 24
+	TypeParameterCompletion CompletionItemKind = 25
+)
+
 // CompletionItem is a single completion entry returned by the server.
 type CompletionItem struct {
-	Label            string    `json:"label"`
-	Kind             int       `json:"kind,omitempty"`
-	Detail           string    `json:"detail,omitempty"`
-	Documentation    any       `json:"documentation,omitempty"`
-	SortText         string    `json:"sortText,omitempty"`
-	FilterText       string    `json:"filterText,omitempty"`
-	InsertText       string    `json:"insertText,omitempty"`
-	InsertTextFormat int       `json:"insertTextFormat,omitempty"`
-	TextEdit         *TextEdit `json:"textEdit,omitempty"`
+	Label            string             `json:"label"`
+	Kind             CompletionItemKind `json:"kind,omitempty"`
+	Detail           string             `json:"detail,omitempty"`
+	Documentation    any                `json:"documentation,omitempty"`
+	SortText         string             `json:"sortText,omitempty"`
+	FilterText       string             `json:"filterText,omitempty"`
+	InsertText       string             `json:"insertText,omitempty"`
+	InsertTextFormat int                `json:"insertTextFormat,omitempty"`
+	TextEdit         *TextEdit          `json:"textEdit,omitempty"`
 }
 
 // CompletionList wraps completion entries and can be partial.

@@ -2547,6 +2547,22 @@ func (e *Editor) applyCompletion() {
 		return
 	}
 
+	// append () for method, function
+	if item.Kind == lsp.MethodCompletion || item.Kind == lsp.FunctionCompletion {
+		lparen := strings.Index(item.Detail, "(")
+		rparen := strings.Index(item.Detail, ")")
+		if lparen > 0 && lparen < rparen {
+			if lparen+1 == rparen {
+				// no parameter
+				v.Cursor = v.Buf.Insert(v.Cursor, "()")
+			} else {
+				// need parameter, put cursor inside the parentheses
+				v.Buf.Insert(v.Cursor, "()")
+				v.Cursor.Col++
+			}
+		}
+	}
+
 	e.markDirty()
 	e.completion.Active = false
 }
