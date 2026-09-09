@@ -17,15 +17,15 @@ const (
 	TokBuiltin                  // nil, true, false, iota, make, len
 )
 
-// Token defines a token range within a single line (0-indexed byte offsets).
-type Token struct {
+// HLToken defines a highlight token range within a single line (0-indexed byte offsets).
+type HLToken struct {
 	StartCol int       // Byte offset start (inclusive)
 	EndCol   int       // Byte offset end (exclusive)
 	Type     TokenType // token type
 }
 
-// TokenStyle returns the highlight style for the given token type
-func TokenStyle(t TokenType) kero.Style {
+// HightlightStyle returns the highlight style for the given token type
+func HightlightStyle(t TokenType) kero.Style {
 	switch t {
 	case TokKeyword:
 		return kero.NewStyle().Foreground(kero.ColorMagenta)
@@ -72,17 +72,17 @@ const (
 	StateInRawString
 )
 
-// ParseToken tokenizes a single line of bytes.
+// HighlightToken tokenizes a single line of bytes.
 // Returns the slice of tokens and the ending state to pass to the next line.
-func ParseToken(line []byte, startState LineState) ([]Token, LineState) {
-	var tokens []Token
+func HighlightToken(line []byte, startState LineState) ([]HLToken, LineState) {
+	var tokens []HLToken
 	i := 0
 	n := len(line)
 	state := startState
 
 	addToken := func(start, end int, tokType TokenType) {
 		if start < end {
-			tokens = append(tokens, Token{
+			tokens = append(tokens, HLToken{
 				StartCol: start,
 				EndCol:   end,
 				Type:     tokType,
@@ -205,7 +205,6 @@ func ParseToken(line []byte, startState LineState) ([]Token, LineState) {
 				i++
 			}
 			word := string(line[start:i])
-
 			if token.IsKeyword(word) {
 				addToken(start, i, TokKeyword)
 			} else if goTypes[word] {

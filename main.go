@@ -285,15 +285,15 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 }
 
 // convert mouse (x, y) to Positon of Buffer
-func (e *Editor) mouseToPosition(m kero.MouseEvent, textRect kero.Rect) Position {
-	row := m.Y - textRect.Y + e.View().ScrollRow
-	if row >= len(e.Buf().Lines) {
+func mouseToPosition(v *View, textRect kero.Rect, m kero.MouseEvent) Position {
+	row := m.Y - textRect.Y + v.ScrollRow
+	if row >= len(v.Buf.Lines) {
 		// out of viewport
-		return e.View().Cursor
+		return v.Cursor
 	}
 
-	visualCol := m.X - textRect.X + e.View().ScrollCol
-	col := e.Buf().ByteCol(row, visualCol, 4)
+	visualCol := m.X - textRect.X + v.ScrollCol
+	col := v.Buf.ByteCol(row, visualCol, 4)
 	return Position{Row: row, Col: col}
 }
 
@@ -365,7 +365,7 @@ func (e *Editor) handleMouse(ctx *kero.Context, m kero.MouseEvent) error {
 			}
 
 			if textRect.Contains(point) {
-				e.View().Cursor = e.mouseToPosition(m, textRect)
+				e.View().Cursor = mouseToPosition(e.View(), textRect, m)
 				if e.hasSelect() {
 					e.clearSelect()
 				}
@@ -421,10 +421,10 @@ func (e *Editor) handleMouse(ctx *kero.Context, m kero.MouseEvent) error {
 				last.Button == kero.MouseLeft && last.Action == kero.MousePress {
 				// first drag sets selection anchor
 				e.View().Selecting = true
-				e.View().SelAnchor = e.mouseToPosition(last, textRect)
+				e.View().SelAnchor = mouseToPosition(e.View(), textRect, last)
 			}
 			// later drag expands selection
-			e.View().Cursor = e.mouseToPosition(m, textRect)
+			e.View().Cursor = mouseToPosition(e.View(), textRect, m)
 			e.View().ShowCursorSmart()
 		}
 	}
@@ -941,11 +941,11 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 
 		y := textRect.Y + i
 		line := v.Buf.Lines[lineIdx]
-		var lineTokens []Token
+		var lineTokens []HLToken
 		if isGo {
 			// In viewport, parsing semantic token on-the-fly is simple and effecient,
 			// no background worker nor cache needed.
-			lineTokens, currentState = ParseToken(line, currentState)
+			lineTokens, currentState = HighlightToken(line, currentState)
 		}
 
 		var diag *LineDiagnostic
@@ -995,7 +995,7 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 				// 1. Apply Syntax Highlighting Style (if byte falls within current token)
 				for _, t := range lineTokens {
 					if byteIdx >= t.StartCol && byteIdx < t.EndCol {
-						charStyle = TokenStyle(t.Type)
+						charStyle = HightlightStyle(t.Type)
 					}
 				}
 
@@ -2619,10 +2619,16 @@ func (e *Editor) drawCompletion(f *kero.Frame) {
 
 	indicator := " > "
 
-	// align the completion with current word
-	// cursorX := textRect.X + v.Buf.ByteToVisualCol(v.Cursor, 4) - v.ScrollCol
-	wordStart, _ := v.Buf.WordBounds(v.Cursor)
-	x := textRect.X + v.Buf.VisualCol(wordStart.Row, wordStart.Col, 4) - v.ScrollCol
+	// visual alignment
+	var vCol int
+	char, _ := utf8.DecodeLastRune(v.Buf.Lines[v.Cursor.Row][:v.Cursor.Col])
+	if char == '\t' || char == ' ' || char == '.' {
+		vCol = v.Buf.VisualCol(v.Cursor.Row, v.Cursor.Col, 4)
+	} else {
+		wordStart, _ := v.Buf.WordBounds(v.Cursor)
+		vCol = v.Buf.VisualCol(wordStart.Row, wordStart.Col, 4)
+	}
+	x := textRect.X + vCol - v.ScrollCol
 	x -= runewidth.StringWidth(indicator) // minus prefix
 
 	cursorY := textRect.Y + (v.Cursor.Row - v.ScrollRow)
