@@ -173,6 +173,8 @@ type Editor struct {
 
 	completion Completion
 
+	menu ContextMenu
+
 	renaming    bool
 	renameInput TextInput
 
@@ -301,7 +303,36 @@ func (e *Editor) handleMouse(ctx *kero.Context, m kero.MouseEvent) error {
 	_, textRect, refRect, _, statusBar := LayoutWindow(ctx.Width, ctx.Height, len(e.Buf().Lines), e.ref.Active)
 	paletteRect := LayoutPalatte(ctx.Width, ctx.Height, e.palette.VisibleRows()+1)
 	point := kero.Point{X: m.X, Y: m.Y}
+
+	if e.menu.Active {
+		menuRect := e.menu.Rect(ctx.Width, ctx.Height)
+		if menuRect.Contains(point) {
+			if m.Button == kero.MouseLeft && m.Action == kero.MousePress {
+				idx := m.Y - menuRect.Y
+				if idx >= 0 && idx < len(e.menu.Items) {
+					item := e.menu.Items[idx]
+					e.menu.Active = false
+					e.handleMenu(ctx, item)
+					return nil
+				}
+			}
+			return nil
+		}
+		// Once mouse clicking outside the menu, hide it
+		e.menu.Active = false
+	}
+
 	switch m.Button {
+	case kero.MouseRight:
+		if m.Action == kero.MousePress {
+			if textRect.Contains(point) {
+				if !e.hasSelect() {
+					e.View().Cursor = mouseToPosition(e.View(), textRect, m)
+				}
+			}
+			e.menu.Open(m.X, m.Y)
+			return nil
+		}
 	case kero.MouseWheelUp:
 		p := e.palette
 		if p.Active && paletteRect.Contains(point) {
@@ -448,6 +479,14 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 		e.View().SetSize(textRect.W, textRect.H)
 		e.View().ShowCursorSmart()
 	}()
+
+	if e.menu.Active {
+		if key.Key == kero.KeyEsc {
+			e.menu.Active = false
+			return nil
+		}
+		e.menu.Active = false
+	}
 
 	if e.saveAs {
 		return e.updateSaveAs(key)
@@ -1033,10 +1072,8 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 		// Draw inline diagnostic message
 		if diag != nil {
 			red := kero.NewStyle().Foreground(kero.ColorRed)
-			dx := max(textRect.X+(vCol-v.ScrollCol), fSize.Width-runewidth.StringWidth(diag.Message))
-			if dx >= textRect.X && dx < fSize.Width {
-				f.Write(dx, y, diag.Message, red)
-			}
+			dx := max(textRect.X+(vCol-v.ScrollCol)+2, AlignRight(textRect, diag.Message, 0))
+			f.Write(dx, y, diag.Message, red)
 		}
 	}
 
@@ -1116,6 +1153,9 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 	}
 	if e.palette.Active {
 		e.drawPalette(f, LayoutPalatte(fSize.Width, fSize.Height, e.palette.VisibleRows()+1))
+	}
+	if e.menu.Active {
+		e.drawMenu(f)
 	}
 }
 
@@ -2672,6 +2712,87 @@ func (e *Editor) drawCompletion(f *kero.Frame) {
 			detailX := AlignRight(rect, item.Detail, 1)
 			detailX = max(x+3, detailX)
 			f.Write(detailX, y, runewidth.Truncate(item.Detail, rect.Right()-detailX, ""), style)
+		}
+	}
+}
+
+type ContextMenu struct {
+	Active bool
+	X, Y   int
+	Items  []string
+}
+
+func (p *ContextMenu) Open(x, y int) {
+	p.Active = true
+	p.X = x
+	p.Y = y
+	p.Items = []string{"Copy", "Paste", "Definition", "References", "Rename"}
+}
+
+func (p *ContextMenu) Close() {
+	p.Active = false
+}
+
+func (p *ContextMenu) Rect(screenWidth, screenHeight int) kero.Rect {
+	maxW := 0
+	for _, item := range p.Items {
+		w := runewidth.StringWidth(item)
+		if w > maxW {
+			maxW = w
+		}
+	}
+	w := maxW + 4 // padding
+	h := len(p.Items)
+	x := p.X
+	y := p.Y
+	if x+w > screenWidth {
+		x = max(0, screenWidth-w)
+	}
+	if x < 0 {
+		x = 0
+	}
+	if y+h > screenHeight {
+		y = max(0, screenHeight-h)
+	}
+	if y < 0 {
+		y = 0
+	}
+	return kero.Rect{X: x, Y: y, W: w, H: h}
+}
+
+func (e *Editor) drawMenu(f *kero.Frame) {
+	if !e.menu.Active || len(e.menu.Items) == 0 {
+		return
+	}
+	rect := e.menu.Rect(f.Size().Width, f.Size().Height)
+	var normal kero.Style
+	f.Fill(rect, ' ', normal.Reverse())
+	for i, item := range e.menu.Items {
+		if i >= rect.H {
+			break
+		}
+		x := rect.X + 2 // padding
+		y := rect.Y + i
+		f.Write(x, y, item, normal.Bold().Reverse())
+	}
+}
+
+func (e *Editor) handleMenu(ctx *kero.Context, item string) {
+	switch item {
+	case "Copy":
+		e.copy()
+		if ctx != nil {
+			_ = ctx.CopyToClipboard(e.clipboard)
+		}
+	case "Paste":
+		e.paste()
+	case "Definition":
+		_ = e.GotoDefinition()
+	case "References":
+		_ = e.FindReferences()
+	case "Rename":
+		if isGoFile(e.Buf().Path) {
+			e.startRename()
 		}
 	}
 }

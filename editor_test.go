@@ -363,3 +363,77 @@ func TestDrawCompletion_SmartPosition(t *testing.T) {
 		t.Fatalf("expected completion item rendered at row 7, got rune %q", cellRow7.Ch)
 	}
 }
+
+func TestContextMenu(t *testing.T) {
+	buf := NewBuffer("test.go", []byte("hello world"))
+	v := &View{Buf: buf, Width: 80, Height: 24, Cursor: Position{Row: 0, Col: 0}}
+	v.Selecting = true
+	v.SelAnchor = Position{Row: 0, Col: 0}
+	v.Cursor = Position{Row: 0, Col: 5} // selected "hello"
+	ed := &Editor{views: []*View{v}}
+
+	ctx := &kero.Context{Width: 80, Height: 24}
+
+	// 1. Right click to open menu
+	mRight := kero.MouseEvent{Button: kero.MouseRight, Action: kero.MousePress, X: 10, Y: 5}
+	if err := ed.Update(ctx, mRight); err != nil {
+		t.Fatalf("unexpected error on right click: %v", err)
+	}
+
+	if !ed.menu.Active {
+		t.Fatalf("expected menu to be active after right click")
+	}
+
+	expectedItems := []string{"Copy", "Paste", "Definition", "References", "Rename"}
+	if len(ed.menu.Items) != len(expectedItems) {
+		t.Fatalf("expected %d items, got %d", len(expectedItems), len(ed.menu.Items))
+	}
+	for i, item := range ed.menu.Items {
+		if item != expectedItems[i] {
+			t.Errorf("item %d = %q, want %q", i, item, expectedItems[i])
+		}
+	}
+
+	// 2. Click inside menu on option "copy" (index 0 at Y=5)
+	mCopy := kero.MouseEvent{Button: kero.MouseLeft, Action: kero.MousePress, X: 11, Y: 5}
+	if err := ed.Update(ctx, mCopy); err != nil {
+		t.Fatalf("unexpected error on copy click: %v", err)
+	}
+	if ed.menu.Active {
+		t.Fatalf("expected menu to be hidden after selecting an item")
+	}
+	if ed.clipboard != "hello" {
+		t.Fatalf("expected clipboard to be %q, got %q", "hello", ed.clipboard)
+	}
+
+	// 3. Right click to open menu again
+	if err := ed.Update(ctx, mRight); err != nil {
+		t.Fatalf("unexpected error on right click: %v", err)
+	}
+	if !ed.menu.Active {
+		t.Fatalf("expected menu active")
+	}
+
+	// 4. Click outside menu (e.g. X=0, Y=0) should hide menu
+	mOutside := kero.MouseEvent{Button: kero.MouseLeft, Action: kero.MousePress, X: 0, Y: 0}
+	if err := ed.Update(ctx, mOutside); err != nil {
+		t.Fatalf("unexpected error on outside click: %v", err)
+	}
+	if ed.menu.Active {
+		t.Fatalf("expected menu to be hidden after clicking outside")
+	}
+
+	// 5. Test KeyEsc dismissal
+	if err := ed.Update(ctx, mRight); err != nil {
+		t.Fatalf("unexpected error on right click: %v", err)
+	}
+	if !ed.menu.Active {
+		t.Fatalf("expected menu to be active")
+	}
+	if err := ed.Update(ctx, kero.KeyEvent{Key: kero.KeyEsc}); err != nil {
+		t.Fatalf("unexpected error on KeyEsc: %v", err)
+	}
+	if ed.menu.Active {
+		t.Fatalf("expected menu to be hidden after KeyEsc")
+	}
+}
