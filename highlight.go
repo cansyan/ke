@@ -28,7 +28,7 @@ type HLToken struct {
 func HightlightStyle(t TokenType) kero.Style {
 	switch t {
 	case TokKeyword:
-		return kero.NewStyle().Foreground(kero.ColorMagenta)
+		return kero.NewStyle().Foreground(kero.ColorMagenta).Italic()
 	case TokType:
 		return kero.NewStyle().Foreground(kero.ColorBlue)
 	case TokString:
@@ -38,7 +38,7 @@ func HightlightStyle(t TokenType) kero.Style {
 	case TokNumber:
 		return kero.NewStyle().Foreground(kero.ColorYellow)
 	case TokBuiltin:
-		return kero.NewStyle().Foreground(kero.ColorYellow)
+		return kero.NewStyle().Foreground(kero.ColorYellow).Italic()
 	// optional: cyan color for method, function
 	default:
 		return kero.NewStyle()
