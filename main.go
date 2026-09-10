@@ -304,6 +304,13 @@ func (e *Editor) handleMouse(ctx *kero.Context, m kero.MouseEvent) error {
 	paletteRect := LayoutPalatte(ctx.Width, ctx.Height, e.palette.VisibleRows()+1)
 	point := kero.Point{X: m.X, Y: m.Y}
 
+	defer func() {
+		// References Panel lay on the buffer view
+		if e.ref.Active {
+			e.View().SetSize(textRect.W, textRect.H-bottomPanelH)
+		}
+	}()
+
 	if e.menu.Active {
 		menuRect := e.menu.Rect(ctx.Width, ctx.Height)
 		if menuRect.Contains(point) {
@@ -893,6 +900,8 @@ func gutterWidth(lines int) int {
 	return width + 2 // marker, line number, and separator
 }
 
+const bottomPanelH = 10
+
 // LayoutWindow splits a total available screen Rect into component Rects.
 func LayoutWindow(totalWidth, totalHeight, lineCount int, showBottomPanel bool) (gutterRect, textRect, bottomPanelRect, msgRect, statusRect kero.Rect) {
 	remaining := kero.Rect{W: totalWidth, H: totalHeight}
@@ -901,7 +910,7 @@ func LayoutWindow(totalWidth, totalHeight, lineCount int, showBottomPanel bool) 
 	if !showBottomPanel {
 		remaining, msgRect = kero.SplitHorizontal(remaining, remaining.H-1)
 	} else {
-		remaining, bottomPanelRect = kero.SplitHorizontal(remaining, remaining.H-10)
+		remaining, bottomPanelRect = kero.SplitHorizontal(remaining, remaining.H-bottomPanelH)
 	}
 
 	gutterWidth := gutterWidth(lineCount)
@@ -946,9 +955,14 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 			continue
 		}
 
-		if _, ok := gutterMap[i]; ok {
-			red := kero.NewStyle().Foreground(kero.ColorRed)
-			f.Set(gutterRect.X, y, 'x', red)
+		if s, ok := gutterMap[i]; ok {
+			label := 'x'
+			style := kero.NewStyle().Foreground(kero.ColorRed)
+			if s != lsp.DiagnosticSeverityError {
+				label = '!'
+				style = kero.NewStyle().Dim()
+			}
+			f.Set(gutterRect.X, y, label, style)
 		}
 
 		gutterText := fmt.Sprintf("%*d ", gutterRect.W-2, lineIdx+1)
@@ -1071,9 +1085,12 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 
 		// Draw inline diagnostic message
 		if diag != nil {
-			red := kero.NewStyle().Foreground(kero.ColorRed)
+			style := kero.NewStyle().Foreground(kero.ColorRed)
+			if diag.Severity != lsp.DiagnosticSeverityError {
+				style = kero.NewStyle().Dim()
+			}
 			dx := max(textRect.X+(vCol-v.ScrollCol)+2, AlignRight(textRect, diag.Message, 0))
-			f.Write(dx, y, diag.Message, red)
+			f.Write(dx, y, diag.Message, style)
 		}
 	}
 
@@ -1114,7 +1131,7 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 
 		status := fmt.Sprintf("| Line %d, Col %d", v.Cursor.Row+1, cursorVisCol+1)
 		if len(fileDiags) > 0 {
-			status += fmt.Sprintf(" | %d error", len(fileDiags))
+			status += fmt.Sprintf(" | %d diagnostic", len(fileDiags))
 		}
 		f.Write(statusRect.X+offset, statusRect.Y, status, statusStyle)
 		offset += runewidth.StringWidth(status)
@@ -1883,7 +1900,7 @@ func (v *View) ShowCursorSmart() {
 
 	// If the jump is far outside the viewport (e.g. > 1 full viewport height), center it.
 	// Otherwise, just do standard minimal scrolling.
-	if dist > v.Height+v.Height/2 {
+	if dist > v.Height+v.Height/3 {
 		v.showCursorCenter()
 	} else {
 		v.showCursor()
