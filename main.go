@@ -925,7 +925,7 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 	gutterStyle := gutterActiveStyle.Dim()
 	textStyle := kero.NewStyle()
 	cursorStyle := textStyle.Reverse().Foreground(kero.ColorRed)
-	selectStyle := kero.Style{Fg: kero.ColorBlack, Bg: kero.ColorYellow}
+	selectStyle := textStyle.Reverse()
 	messageStyle := kero.NewStyle()
 
 	v := e.View()
@@ -946,9 +946,14 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 			continue
 		}
 
-		if _, ok := gutterMap[i]; ok {
-			red := kero.NewStyle().Foreground(kero.ColorRed)
-			f.Set(gutterRect.X, y, 'x', red)
+		if s, ok := gutterMap[i]; ok {
+			label := 'x'
+			style := kero.NewStyle().Foreground(kero.ColorRed)
+			if s != lsp.DiagnosticSeverityError {
+				label = '!'
+				style = kero.NewStyle().Dim()
+			}
+			f.Set(gutterRect.X, y, label, style)
 		}
 
 		gutterText := fmt.Sprintf("%*d ", gutterRect.W-2, lineIdx+1)
@@ -1071,9 +1076,12 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 
 		// Draw inline diagnostic message
 		if diag != nil {
-			red := kero.NewStyle().Foreground(kero.ColorRed)
+			style := kero.NewStyle().Foreground(kero.ColorRed)
+			if diag.Severity != lsp.DiagnosticSeverityError {
+				style = kero.NewStyle().Dim()
+			}
 			dx := max(textRect.X+(vCol-v.ScrollCol)+2, AlignRight(textRect, diag.Message, 0))
-			f.Write(dx, y, diag.Message, red)
+			f.Write(dx, y, diag.Message, style)
 		}
 	}
 
@@ -1114,7 +1122,7 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 
 		status := fmt.Sprintf("| Line %d, Col %d", v.Cursor.Row+1, cursorVisCol+1)
 		if len(fileDiags) > 0 {
-			status += fmt.Sprintf(" | %d error", len(fileDiags))
+			status += fmt.Sprintf(" | %d diagnostic", len(fileDiags))
 		}
 		f.Write(statusRect.X+offset, statusRect.Y, status, statusStyle)
 		offset += runewidth.StringWidth(status)
@@ -1724,7 +1732,8 @@ func (e *Editor) GotoPrevDiag() {
 
 	v := e.View()
 	var prev lsp.Diagnostic
-	for _, d := range slices.Backward(diags) {
+	for i := len(diags) - 1; i >= 0; i-- {
+		d := diags[i]
 		dRow := d.Range.Start.Line
 		dCol := lsp.CharToByteOffset(v.Buf.Lines[dRow], d.Range.Start.Character)
 		if dRow < v.Cursor.Row || (dRow == v.Cursor.Row && dCol < v.Cursor.Col) {
@@ -1883,7 +1892,7 @@ func (v *View) ShowCursorSmart() {
 
 	// If the jump is far outside the viewport (e.g. > 1 full viewport height), center it.
 	// Otherwise, just do standard minimal scrolling.
-	if dist > v.Height+v.Height/2 {
+	if dist > v.Height+v.Height/3 {
 		v.showCursorCenter()
 	} else {
 		v.showCursor()
