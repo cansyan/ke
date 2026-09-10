@@ -925,7 +925,7 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 	gutterStyle := gutterActiveStyle.Dim()
 	textStyle := kero.NewStyle()
 	cursorStyle := textStyle.Reverse().Foreground(kero.ColorRed)
-	selectStyle := textStyle.Reverse()
+	selectStyle := kero.Style{Fg: kero.ColorBlack, Bg: kero.ColorYellow}
 	messageStyle := kero.NewStyle()
 
 	v := e.View()
@@ -2773,7 +2773,7 @@ func (e *Editor) drawMenu(f *kero.Frame) {
 		}
 		x := rect.X + 2 // padding
 		y := rect.Y + i
-		f.Write(x, y, item, normal.Bold().Reverse())
+		f.Write(x, y, item, normal.Reverse())
 	}
 }
 
