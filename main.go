@@ -304,14 +304,15 @@ func (e *Editor) handleMouse(ctx *kero.Context, m kero.MouseEvent) error {
 	paletteRect := LayoutPalatte(ctx.Width, ctx.Height, e.palette.VisibleRows()+1)
 	point := kero.Point{X: m.X, Y: m.Y}
 
-	defer func() {
-		// References Panel lay on the buffer view
-		if e.ref.Active {
-			e.View().SetSize(textRect.W, textRect.H-bottomPanelH)
-		}
-	}()
-
 	if e.menu.Active {
+		defer func() {
+			// resize buffer view when References Panel shows up
+			if e.ref.Active {
+				_, textRect, _, _, _ := LayoutWindow(ctx.Width, ctx.Height, len(e.Buf().Lines), e.ref.Active)
+				e.View().SetSize(textRect.W, textRect.H)
+			}
+		}()
+
 		menuRect := e.menu.Rect(ctx.Width, ctx.Height)
 		if menuRect.Contains(point) {
 			if m.Button == kero.MouseLeft && m.Action == kero.MousePress {
@@ -495,6 +496,7 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 		e.menu.Active = false
 	}
 
+	// switch focus
 	if e.saveAs {
 		return e.updateSaveAs(key)
 	}
@@ -509,11 +511,6 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 		e.updateRename(key)
 		return nil
 	}
-
-	// var completing bool // mark whether showing completion on keystroke
-	// defer func() {
-	// 	e.completion.Active = completing
-	// }()
 
 	v := e.View()
 	buf := e.Buf()
@@ -2758,7 +2755,7 @@ func (p *ContextMenu) Rect(screenWidth, screenHeight int) kero.Rect {
 			maxW = w
 		}
 	}
-	w := maxW + 4 // padding
+	w := maxW + 2 // padding
 	h := len(p.Items)
 	x := p.X
 	y := p.Y
@@ -2788,7 +2785,7 @@ func (e *Editor) drawMenu(f *kero.Frame) {
 		if i >= rect.H {
 			break
 		}
-		x := rect.X + 2 // padding
+		x := rect.X + 1 // padding
 		y := rect.Y + i
 		f.Write(x, y, item, normal.Bold().Reverse())
 	}
