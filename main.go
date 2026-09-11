@@ -927,12 +927,20 @@ func LayoutPalatte(totalWidth, totalHeight, paletteHeight int) kero.Rect {
 
 func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 	statusStyle := kero.NewStyle().Reverse()
-	gutterActiveStyle := kero.NewStyle()
-	gutterStyle := gutterActiveStyle.Dim()
+	gutterStyle := kero.NewStyle().Dim()
 	textStyle := kero.NewStyle()
 	cursorStyle := textStyle.Reverse().Foreground(kero.ColorRed)
-	selectStyle := textStyle.Reverse()
+	selectionBG := kero.ColorHex("#3E4451")
+	searchMatch := kero.Style{
+		Fg:   kero.ColorHex("#000000"), // Dark text for contrast against bright yellow
+		Bg:   kero.ColorHex("#E5C07B"), // One Dark Gold / Warm Amber
+		Attr: kero.AttrBold,
+	}
 	messageStyle := kero.NewStyle()
+	activeLineStyle := kero.Style{
+		Fg: kero.ColorDefault, // Preserve syntax / text foreground
+		Bg: kero.ColorHex("#161B22"),
+	}
 
 	v := e.View()
 	fSize := f.Size()
@@ -965,7 +973,7 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 		gutterText := fmt.Sprintf("%*d ", gutterRect.W-2, lineIdx+1)
 		style := gutterStyle
 		if lineIdx == v.Cursor.Row {
-			style = gutterActiveStyle
+			style = activeLineStyle
 		}
 		f.Write(gutterRect.X+1, y, gutterText, style)
 	}
@@ -1045,7 +1053,7 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 				// 1. Apply Syntax Highlighting Style (if byte falls within current token)
 				for _, t := range lineTokens {
 					if byteIdx >= t.StartCol && byteIdx < t.EndCol {
-						charStyle = HightlightStyle(t.Type)
+						charStyle = HightlightStyle(t.Type).Background(charStyle.Bg)
 					}
 				}
 
@@ -1056,12 +1064,12 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 
 				// 3. Override with find match
 				if e.find.Active && lineIdx == e.find.MatchStart.Row && byteIdx >= e.find.MatchStart.Col && byteIdx < e.find.MatchEnd.Col {
-					charStyle = selectStyle
+					charStyle = searchMatch
 				}
 
 				// 3. Override with Selection Style (highest priority)
 				if selStartVCol != -1 && vCol >= selStartVCol && vCol < selEndVCol {
-					charStyle = selectStyle
+					charStyle = charStyle.Background(selectionBG)
 				}
 
 				if r == '\t' {
