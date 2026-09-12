@@ -926,25 +926,34 @@ func LayoutPalatte(totalWidth, totalHeight, paletteHeight int) kero.Rect {
 }
 
 func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
-	statusStyle := kero.NewStyle().Reverse()
-	gutterStyle := kero.NewStyle().Dim()
-	textStyle := kero.NewStyle()
-	cursorStyle := textStyle.Reverse().Foreground(kero.ColorRed)
-	selectionBG := kero.ColorHex("#3E4451")
+	textStyle := kero.Style{
+		Fg: kero.ColorHex(Theme["foreground"]),
+		Bg: kero.ColorHex(Theme["background"]),
+	}
+	statusStyle := textStyle.Reverse()
+	gutterStyle := textStyle.Dim()
+	cursorStyle := kero.Style{
+		Fg: kero.ColorHex(Theme["cursorFg"]),
+		Bg: kero.ColorHex(Theme["cursorBg"]),
+	}
+	selectionBG := kero.ColorHex(Theme["selectionBg"])
 	searchMatch := kero.Style{
-		Fg:   kero.ColorHex("#000000"), // Dark text for contrast against bright yellow
-		Bg:   kero.ColorHex("#E5C07B"), // One Dark Gold / Warm Amber
+		Fg:   kero.ColorHex(Theme["searchFg"]),
+		Bg:   kero.ColorHex(Theme["searchBg"]),
 		Attr: kero.AttrBold,
 	}
-	messageStyle := kero.NewStyle()
+	messageStyle := textStyle
 	activeLineStyle := kero.Style{
-		Fg: kero.ColorDefault, // Preserve syntax / text foreground
-		Bg: kero.ColorHex("#161B22"),
+		Fg: textStyle.Fg,
+		Bg: kero.ColorHex(Theme["activeLineBg"]),
 	}
 
 	v := e.View()
 	fSize := f.Size()
 	gutterRect, textRect, bottomPanelRect, msgRect, statusRect := LayoutWindow(fSize.Width, fSize.Height, len(v.Buf.Lines), e.ref.Active)
+
+	// reset canvas style
+	f.Fill(kero.Rect{W: f.Size().Width, H: f.Size().Height}, ' ', textStyle)
 
 	tabWidth := 4
 	fileDiags := e.diagnostics[e.Buf().Path]
@@ -1053,7 +1062,7 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 				// 1. Apply Syntax Highlighting Style (if byte falls within current token)
 				for _, t := range lineTokens {
 					if byteIdx >= t.StartCol && byteIdx < t.EndCol {
-						charStyle = HightlightStyle(t.Type).Background(charStyle.Bg)
+						charStyle = HighlightStyle(t.Type).Background(charStyle.Bg)
 					}
 				}
 
@@ -1105,8 +1114,8 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 	cursorY := textRect.Y + (v.Cursor.Row - v.ScrollRow)
 
 	if cursorX >= textRect.X && cursorX < textRect.X+textRect.W &&
-		cursorY >= textRect.Y && cursorY < textRect.Y+textRect.H {
-
+		cursorY >= textRect.Y && cursorY < textRect.Y+textRect.H &&
+		!e.find.Active {
 		ch := ' '
 		if v.Cursor.Row < len(v.Buf.Lines) {
 			line := v.Buf.Lines[v.Cursor.Row]
@@ -2274,20 +2283,18 @@ func (p *Palette) commandItems(_ *Editor, query string) []PaletteItem {
 		action func(e *Editor)
 	}{
 		// use readable name for cmd, easy to search
+		{"color theme: Default", "", func(e *Editor) {
+			Theme = DefaultTheme
+		}},
+		{"color theme: Mariana", "", func(e *Editor) {
+			Theme = Mariana
+		}},
 		{"jump back", "ctrl+-", func(e *Editor) {
 			e.JumpBack()
 		}},
 		{"jump forward", "ctrl+shift+-", func(e *Editor) {
 			e.JumpForward()
 		}},
-		/*
-			{"next buffer", "", func(e *Editor) {
-				e.NextBuffer()
-			}},
-			{"prev buffer", "", func(e *Editor) {
-				e.PrevBuffer()
-			}},
-		*/
 		{"LSP: find references", "", func(e *Editor) {
 			e.FindReferences()
 		}},
@@ -2499,7 +2506,6 @@ func (p *Palette) fileItems(e *Editor, query string) []PaletteItem {
 					log.Print(err)
 					return
 				}
-				// ed.diagnose()
 			},
 		})
 
@@ -3408,8 +3414,11 @@ func (e *Editor) Rename(newName string) error {
 		totalEdits += len(edits)
 		affectedFiles++
 
-		// TODO: consider to save the file after applying edits
 		e.View().Cursor = e.Buf().Clamp(e.View().Cursor)
+		err = e.SaveFile()
+		if err != nil {
+			log.Print(err)
+		}
 	}
 
 	// Clamp current view cursor in case active line shrank

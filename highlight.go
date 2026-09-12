@@ -6,6 +6,40 @@ import (
 	"github.com/cansyan/kero"
 )
 
+var (
+	Theme = DefaultTheme
+
+	// default theme adapted to terminal
+	DefaultTheme = map[string]string{
+		"cursorFg":     "#000000", // black
+		"cursorBg":     "#fac863", // orange
+		"selectionBg":  "#4e5a65", // blue
+		"searchFg":     "#000000", // Dark text for contrast against bright yellow
+		"searchBg":     "#E5C07B", // One Dark Gold / Warm Amber
+		"activeLineBg": "#65737e", // blue
+	}
+
+	// Mariana theme
+	Mariana = map[string]string{
+		"foreground":   "#d8dee9", // white
+		"background":   "#303841", // blue
+		"cursorFg":     "#000000", // black
+		"cursorBg":     "#fac863", // orange
+		"selectionBg":  "#4e5a65", // blue
+		"searchFg":     "#000000", // Dark text for contrast against bright yellow
+		"searchBg":     "#E5C07B", // One Dark Gold / Warm Amber
+		"activeLineBg": "#65737e", // blue
+
+		// syntax highlight
+		"keyword": "#c594c5", // soft Purple
+		"type":    "#6598CA", // blue
+		"string":  "#99c794", // green
+		"comment": "#a7adba", // blue
+		"number":  "#fac863", // orange
+		"builtin": "#F97B58", // red
+	}
+)
+
 type TokenType int
 
 const (
@@ -24,23 +58,26 @@ type HLToken struct {
 	Type     TokenType // token type
 }
 
-// HightlightStyle returns the highlight style for the given token type
-func HightlightStyle(t TokenType) kero.Style {
+// HighlightStyle returns the highlight style for the given token type.
+func HighlightStyle(t TokenType) kero.Style {
 	switch t {
 	case TokKeyword:
-		return kero.Style{Fg: kero.ColorMagenta}.Italic()
+		return kero.Style{Fg: kero.ColorHex(Theme["keyword"])}.Italic()
 	case TokType:
-		return kero.Style{Fg: kero.ColorBlue}
+		return kero.Style{Fg: kero.ColorHex(Theme["type"])}
 	case TokString:
-		return kero.Style{Fg: kero.ColorGreen}
+		return kero.Style{Fg: kero.ColorHex(Theme["string"])}
 	case TokComment:
-		return kero.NewStyle().Dim()
+		return kero.Style{Fg: kero.ColorHex(Theme["comment"])}
 	case TokNumber:
-		return kero.Style{Fg: kero.ColorYellow}
+		return kero.Style{Fg: kero.ColorHex(Theme["number"])}
 	case TokBuiltin:
-		return kero.Style{Fg: kero.ColorYellow}.Italic()
+		return kero.Style{Fg: kero.ColorHex(Theme["builtin"])}.Italic()
 	default:
-		return kero.NewStyle()
+		return kero.Style{
+			Fg: kero.ColorHex(Theme["foreground"]),
+			Bg: kero.ColorHex(Theme["background"]),
+		}
 	}
 }
 

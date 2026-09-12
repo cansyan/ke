@@ -531,6 +531,10 @@ func (b *Buffer) WordStart(p Position) Position {
 
 // NextPos returns the Position after stepping one rune right, wrapping lines if needed.
 func (b *Buffer) NextRunePos(p Position) Position {
+	if p.Row < 0 || p.Row >= len(b.Lines) {
+		return p
+	}
+
 	line := b.Lines[p.Row]
 	if p.Col < len(line) {
 		_, size := utf8.DecodeRune(line[p.Col:])
@@ -544,10 +548,16 @@ func (b *Buffer) NextRunePos(p Position) Position {
 
 // PrevPos returns the Position after stepping one rune left, wrapping lines if needed.
 func (b *Buffer) PrevRunePos(p Position) Position {
+	if p.Row < 0 || p.Row >= len(b.Lines) {
+		return p
+	}
+
 	if p.Col > 0 {
 		_, size := utf8.DecodeLastRune(b.Lines[p.Row][:p.Col])
 		return Position{Row: p.Row, Col: p.Col - size}
 	}
+
+	// wrap to the end of previous line
 	if p.Row > 0 {
 		prevRow := p.Row - 1
 		return Position{Row: prevRow, Col: len(b.Lines[prevRow])}
