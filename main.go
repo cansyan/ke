@@ -2103,8 +2103,7 @@ func (e *Editor) recordJump() {
 // clamping positions, and updating the viewport.
 // It is used by JumpBack and JumpForward.
 func (e *Editor) jumpTo(target Location) error {
-	v := e.View()
-	if v == nil {
+	if e.View() == nil {
 		return nil
 	}
 
@@ -2115,20 +2114,15 @@ func (e *Editor) jumpTo(target Location) error {
 		}
 	}
 
-	buf := e.Buf()
-	if buf == nil {
-		return nil
-	}
-
+	v := e.View()
 	// 2. Safely clamp position to valid buffer bounds
-	v.Cursor = buf.Clamp(Position{Row: target.Row, Col: target.Col})
+	v.Cursor = v.Buf.Clamp(Position{Row: target.Row, Col: target.Col})
 
 	// 3. Clear active selection on jump to prevent state leakage
 	v.Selecting = false
 
 	// 4. Ensure view updates to show new cursor position
 	v.ShowCursorSmart()
-
 	return nil
 }
 
@@ -2578,13 +2572,15 @@ func (e *Editor) drawPalette(f *kero.Frame, rect kero.Rect, style kero.Style) {
 		itemStyle := style
 		if idx == p.Index {
 			prefix = " > "
-			itemStyle = itemStyle.Bold()
+			itemStyle = itemStyle.Bold().Underline()
 		}
+		x := rect.X
+		f.Write(rect.X, lineY, prefix, style)
+		x += runewidth.StringWidth(prefix)
 
-		// Left side text: Prefix + Label
-		leftText := runewidth.Truncate(prefix+item.Label, rect.W, "")
-		f.Write(rect.X, lineY, leftText, itemStyle)
-		x := rect.X + runewidth.StringWidth(leftText)
+		label := runewidth.Truncate(item.Label, rect.Right()-x, "")
+		f.Write(x, lineY, label, itemStyle)
+		x += runewidth.StringWidth(label)
 
 		// Right side text: Detail (e.g. line number or keybinding hint)
 		if item.Detail != "" {
