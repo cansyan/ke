@@ -930,7 +930,12 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 		Fg: kero.ColorHex(Theme["foreground"]),
 		Bg: kero.ColorHex(Theme["background"]),
 	}
-	statusStyle := textStyle.Reverse()
+	reverse := kero.Style{Fg: textStyle.Bg, Bg: textStyle.Fg}
+	if reverse.Bg == textStyle.Bg {
+		// flip the Attr for default theme
+		reverse = reverse.Reverse()
+	}
+	statusStyle := reverse
 	gutterStyle := textStyle.Dim()
 	cursorStyle := kero.Style{
 		Fg: kero.ColorHex(Theme["cursorFg"]),
@@ -1191,16 +1196,16 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 	}
 
 	if e.ref.Active {
-		e.drawReferences(f, bottomPanelRect)
+		e.drawReferences(f, bottomPanelRect, reverse)
 	}
 	if e.completion.Active {
-		e.drawCompletion(f)
+		e.drawCompletion(f, reverse)
 	}
 	if e.palette.Active {
-		e.drawPalette(f, LayoutPalatte(fSize.Width, fSize.Height, e.palette.VisibleRows()+1))
+		e.drawPalette(f, LayoutPalatte(fSize.Width, fSize.Height, e.palette.VisibleRows()+1), reverse)
 	}
 	if e.menu.Active {
-		e.drawMenu(f)
+		e.drawMenu(f, reverse)
 	}
 }
 
@@ -2467,9 +2472,8 @@ func (p *Palette) fileItems(e *Editor, query string) []PaletteItem {
 		}
 
 		bufIdx := i
-		bufPath := v.Buf.Path
 		items = append(items, PaletteItem{
-			Label:  filepath.Base(bufPath),
+			Label:  filepath.Base(v.Buf.Path),
 			Detail: "active",
 			Action: func(ed *Editor) {
 				ed.recordJump()
@@ -2513,7 +2517,7 @@ func (p *Palette) fileItems(e *Editor, query string) []PaletteItem {
 		}
 
 		items = append(items, PaletteItem{
-			Label: filepath.Base(absPath),
+			Label: path,
 			Action: func(ed *Editor) {
 				ed.recordJump()
 				if err := ed.OpenFile(absPath); err != nil {
@@ -2541,17 +2545,16 @@ func AlignRight(r kero.Rect, s string, padding int) int {
 }
 
 // drawPalette renders the input field and popup overlay menu above row y.
-func (e *Editor) drawPalette(f *kero.Frame, rect kero.Rect) {
+func (e *Editor) drawPalette(f *kero.Frame, rect kero.Rect, style kero.Style) {
 	if !e.palette.Active {
 		return
 	}
 
-	normal := kero.NewStyle()
 	p := &e.palette
 
 	// Fill background for dropdown overlay
-	f.Fill(rect, ' ', normal.Reverse())
-	p.Input.Draw(f, kero.Rect{X: rect.X + 1, Y: rect.Y, W: rect.W, H: 1}, normal.Reverse())
+	f.Fill(rect, ' ', style)
+	p.Input.Draw(f, kero.Rect{X: rect.X + 1, Y: rect.Y, W: rect.W, H: 1}, style)
 
 	// Calculate visible window bounds
 	total := len(p.Items)
@@ -2570,17 +2573,17 @@ func (e *Editor) drawPalette(f *kero.Frame, rect kero.Rect) {
 		item := p.Items[idx]
 		lineY := rect.Y + i + 1 // plus 1 because of Input
 
-		// Selection cursor indicator
+		// cursor indicator
 		prefix := "   "
-		style := normal.Reverse()
+		itemStyle := style
 		if idx == p.Index {
 			prefix = " > "
-			style = normal.Reverse().Bold()
+			itemStyle = itemStyle.Bold()
 		}
 
 		// Left side text: Prefix + Label
 		leftText := runewidth.Truncate(prefix+item.Label, rect.W, "")
-		f.Write(rect.X, lineY, leftText, style)
+		f.Write(rect.X, lineY, leftText, itemStyle)
 		x := rect.X + runewidth.StringWidth(leftText)
 
 		// Right side text: Detail (e.g. line number or keybinding hint)
@@ -2588,7 +2591,7 @@ func (e *Editor) drawPalette(f *kero.Frame, rect kero.Rect) {
 			detailX := AlignRight(rect, item.Detail, 1)
 			// Only render detail if it doesn't overlap left text
 			if detailX > x+2 {
-				f.Write(detailX, lineY, item.Detail, style)
+				f.Write(detailX, lineY, item.Detail, itemStyle)
 			}
 		}
 	}
@@ -2683,7 +2686,7 @@ func (c *Completion) Prev() {
 	c.Index = (c.Index - 1 + len(c.Items)) % len(c.Items)
 }
 
-func (e *Editor) drawCompletion(f *kero.Frame) {
+func (e *Editor) drawCompletion(f *kero.Frame, style kero.Style) {
 	if len(e.completion.Items) == 0 {
 		return
 	}
@@ -2733,27 +2736,26 @@ func (e *Editor) drawCompletion(f *kero.Frame) {
 		rect.H = max(0, f.Size().Height-rect.Y)
 	}
 
-	var normal kero.Style
-	f.Fill(rect, ' ', normal.Reverse())
+	f.Fill(rect, ' ', style)
 	for i := range rect.H {
 		x := rect.X
 		y := rect.Y + i
 		item := c.Items[i+offset]
-		style := normal.Reverse()
+		itemStyle := style
 		prefix := "   "
 		if i+offset == c.Index && len(c.Items) > 1 {
 			prefix = indicator
-			style = normal.Reverse().Bold()
+			itemStyle = itemStyle.Bold()
 		}
 		label := prefix + c.Items[i+offset].Label
-		f.Write(x, y, label, style)
+		f.Write(x, y, label, itemStyle)
 		x += runewidth.StringWidth(label)
 
 		// right side text
 		if item.Detail != "" && i+offset == c.Index {
 			detailX := AlignRight(rect, item.Detail, 1)
 			detailX = max(x+3, detailX)
-			f.Write(detailX, y, runewidth.Truncate(item.Detail, rect.Right()-detailX, ""), style)
+			f.Write(detailX, y, runewidth.Truncate(item.Detail, rect.Right()-detailX, ""), itemStyle)
 		}
 	}
 }
@@ -2802,20 +2804,19 @@ func (p *ContextMenu) Rect(screenWidth, screenHeight int) kero.Rect {
 	return kero.Rect{X: x, Y: y, W: w, H: h}
 }
 
-func (e *Editor) drawMenu(f *kero.Frame) {
+func (e *Editor) drawMenu(f *kero.Frame, style kero.Style) {
 	if !e.menu.Active || len(e.menu.Items) == 0 {
 		return
 	}
 	rect := e.menu.Rect(f.Size().Width, f.Size().Height)
-	var normal kero.Style
-	f.Fill(rect, ' ', normal.Reverse())
+	f.Fill(rect, ' ', style)
 	for i, item := range e.menu.Items {
 		if i >= rect.H {
 			break
 		}
 		x := rect.X + 1 // padding
 		y := rect.Y + i
-		f.Write(x, y, item, normal.Bold().Reverse())
+		f.Write(x, y, item, style.Bold())
 	}
 }
 
@@ -3015,12 +3016,11 @@ func (e *Editor) FindReferences() error {
 }
 
 // drawReferences renders a bottom overlay panel for LSP References.
-func (e *Editor) drawReferences(f *kero.Frame, rect kero.Rect) {
+func (e *Editor) drawReferences(f *kero.Frame, rect kero.Rect, style kero.Style) {
 	if !e.ref.Active || len(e.ref.Items) == 0 {
 		return
 	}
 
-	style := kero.NewStyle().Reverse()
 	f.Fill(rect, ' ', style)
 	f.Write(rect.X+1, rect.Y, e.ref.Header, style)
 

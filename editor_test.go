@@ -344,7 +344,7 @@ func TestDrawCompletion_SmartPosition(t *testing.T) {
 
 	// 1. Cursor at top (Row 0): should draw below cursor (rows 1, 2, 3)
 	fTop := kero.NewFrame(80, 24)
-	ed.drawCompletion(&fTop)
+	ed.drawCompletion(&fTop, kero.Style{})
 
 	// Verify that cell at row 1, gutterWidth has completion content (not empty)
 	// incicator is " > ", "gutterWidth(len(buf.Lines))-2" should be the x of arrow
@@ -356,7 +356,7 @@ func TestDrawCompletion_SmartPosition(t *testing.T) {
 	// 2. Cursor lower down (Row 10): space above = 10 >= visibleRows 3, should draw above cursor (rows 7, 8, 9)
 	v.Cursor.Row = 10
 	fAbove := kero.NewFrame(80, 24)
-	ed.drawCompletion(&fAbove)
+	ed.drawCompletion(&fAbove, kero.Style{})
 
 	cellRow7 := fAbove.Cell(gutterWidth(len(buf.Lines))-2, 7)
 	if cellRow7.Ch != ' ' && cellRow7.Ch != '>' {
