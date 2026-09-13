@@ -971,10 +971,10 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 
 		if s, ok := gutterMap[i]; ok {
 			label := 'x'
-			style := kero.NewStyle().Foreground(kero.ColorRed)
+			style := textStyle.Foreground(kero.ColorRed)
 			if s != lsp.DiagnosticSeverityError {
 				label = '!'
-				style = kero.NewStyle().Dim()
+				style = textStyle.Dim()
 			}
 			f.Set(gutterRect.X, y, label, style)
 		}
@@ -998,6 +998,9 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 			currentState = ScanLineState(v.Buf.Lines[i], currentState)
 		}
 	}
+
+	start, end := v.Buf.WordBounds(v.Cursor)
+	cursorWord := v.Buf.TextRange(start, end)
 
 	// 2. Draw Text Viewport
 	for i := range textRect.H {
@@ -1059,11 +1062,22 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 			if screenX >= textRect.X && screenX < textRect.X+textRect.W {
 				charStyle := textStyle
 
-				// 1. Apply Syntax Highlighting Style (if byte falls within current token)
+				// 1. Apply Syntax Highlighting Style
 				for _, t := range lineTokens {
-					if byteIdx >= t.StartCol && byteIdx < t.EndCol {
-						charStyle = HighlightStyle(t.Type).Background(charStyle.Bg)
+					if byteIdx < t.StartCol || byteIdx >= t.EndCol {
+						continue
 					}
+					charStyle = HighlightStyle(t.Type).Background(charStyle.Bg)
+
+					// underline the same appearance
+					if t.Type == TokKeyword {
+						break
+					}
+					tokenIdent := v.Buf.TextRange(Position{Row: lineIdx, Col: t.StartCol}, Position{Row: lineIdx, Col: t.EndCol})
+					if tokenIdent == cursorWord {
+						charStyle = charStyle.Underline()
+					}
+					break
 				}
 
 				// 2. Override with Diagnostic Underline
@@ -1099,9 +1113,9 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 
 		// Draw inline diagnostic message
 		if diag != nil {
-			style := kero.NewStyle().Foreground(kero.ColorRed)
+			style := textStyle.Foreground(kero.ColorRed)
 			if diag.Severity != lsp.DiagnosticSeverityError {
-				style = kero.NewStyle().Dim()
+				style = textStyle.Dim()
 			}
 			dx := max(textRect.X+(vCol-v.ScrollCol)+2, AlignRight(textRect, diag.Message, 0))
 			f.Write(dx, y, diag.Message, style)

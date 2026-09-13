@@ -7,7 +7,7 @@ import (
 )
 
 var (
-	Theme = DefaultTheme
+	Theme = Mariana
 
 	// default theme adapted to terminal
 	DefaultTheme = map[string]string{
@@ -49,6 +49,7 @@ const (
 	TokComment                  // // comment or /* comment */
 	TokNumber                   // 123, 0x1F, 3.14
 	TokBuiltin                  // nil, true, false, iota, make, len
+	TokIdent                    // identifier
 )
 
 // HLToken defines a highlight token range within a single line (0-indexed byte offsets).
@@ -247,6 +248,8 @@ func HighlightToken(line []byte, startState LineState) ([]HLToken, LineState) {
 				addToken(start, i, TokType)
 			} else if goBuiltins[word] {
 				addToken(start, i, TokBuiltin)
+			} else {
+				addToken(start, i, TokIdent)
 			}
 			continue
 		}
