@@ -7,16 +7,25 @@ import (
 )
 
 var (
-	Theme = Mariana
+	Theme = DarkTheme
 
-	// default theme adapted to terminal
-	DefaultTheme = map[string]string{
-		"cursorFg":     "#000000", // black
+	DarkTheme = map[string]string{
+		"foreground":   "#D4D4D4", // Soft off-white text
+		"background":   "#1E1E1E", // dark
+		"cursorFg":     "#1E1E1E", // dark
 		"cursorBg":     "#fac863", // orange
-		"selectionBg":  "#4e5a65", // blue
+		"selectionBg":  "#3E4451", // Slate grey selection (keeps original Fg)
+		"activeLineBg": "#282C34", // Slightly lighter charcoal tint
 		"searchFg":     "#000000", // Dark text for contrast against bright yellow
 		"searchBg":     "#E5C07B", // One Dark Gold / Warm Amber
-		"activeLineBg": "#65737e", // blue
+
+		// syntax highlight
+		"keyword": "#c594c5", // soft Purple
+		"type":    "#6598CA", // blue
+		"string":  "#99c794", // green
+		"comment": "#a7adba", // blue
+		"number":  "#fac863", // orange
+		"builtin": "#F97B58", // red
 	}
 
 	// Mariana theme
@@ -26,9 +35,9 @@ var (
 		"cursorFg":     "#000000", // black
 		"cursorBg":     "#fac863", // orange
 		"selectionBg":  "#4e5a65", // blue
+		"activeLineBg": "#65737e", // blue
 		"searchFg":     "#000000", // Dark text for contrast against bright yellow
 		"searchBg":     "#E5C07B", // One Dark Gold / Warm Amber
-		"activeLineBg": "#65737e", // blue
 
 		// syntax highlight
 		"keyword": "#c594c5", // soft Purple

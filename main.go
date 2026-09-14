@@ -1095,7 +1095,7 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 					charStyle = searchMatch
 				}
 
-				// 3. Override with Selection Style (highest priority)
+				// 4. Override with Selection Style (highest priority)
 				if selStartVCol != -1 && vCol >= selStartVCol && vCol < selEndVCol {
 					charStyle = charStyle.Background(selectionBG)
 				}
@@ -1131,10 +1131,7 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 	cursorVisCol := v.Buf.VisualCol(v.Cursor.Row, v.Cursor.Col, 4)
 	cursorX := textRect.X + (cursorVisCol - v.ScrollCol)
 	cursorY := textRect.Y + (v.Cursor.Row - v.ScrollRow)
-
-	if cursorX >= textRect.X && cursorX < textRect.X+textRect.W &&
-		cursorY >= textRect.Y && cursorY < textRect.Y+textRect.H &&
-		!e.find.Active {
+	if textRect.Contains(kero.Point{X: cursorX, Y: cursorY}) && !e.find.Active {
 		ch := ' '
 		if v.Cursor.Row < len(v.Buf.Lines) {
 			line := v.Buf.Lines[v.Cursor.Row]
@@ -2296,8 +2293,8 @@ func (p *Palette) commandItems(_ *Editor, query string) []PaletteItem {
 		action func(e *Editor)
 	}{
 		// use readable name for cmd, easy to search
-		{"color theme: Default", "", func(e *Editor) {
-			Theme = DefaultTheme
+		{"color theme: Dark", "", func(e *Editor) {
+			Theme = DarkTheme
 		}},
 		{"color theme: Mariana", "", func(e *Editor) {
 			Theme = Mariana
