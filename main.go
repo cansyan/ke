@@ -637,12 +637,29 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 		v.Cursor = buf.Insert(v.Cursor, string([]rune{key.Rune}))
 		e.markDirty()
 
-		// LSP Completion requires latest buffer,
-		// so NotifyBufferChanged will be called and copys the whole buffer(not incremental update yet).
+		// LSP Completion requires latest buffer, so NotifyBufferChanged will be called
+		// and copys the whole buffer(not incremental update yet).
 		// For efficiency, do not trigger completion on every keystroke.
 		// Optional, trigger on dot while not pasting, but must consider the comment case
 		if e.completion.Active {
 			e.requestCompletion()
+		} else if !e.pasting && key.Rune == '.' {
+			tokens, state := HighlightToken(buf.Lines[v.Cursor.Row], StateNormal)
+			if state != StateNormal {
+				break
+			}
+			targetCol := v.Cursor.Col - 2
+			if targetCol < 0 {
+				break
+			}
+			for _, t := range tokens {
+				if targetCol >= t.StartCol && targetCol < t.EndCol {
+					if t.Type == TokIdent {
+						e.requestCompletion()
+					}
+					break
+				}
+			}
 		}
 
 	case kero.KeyEnter:
@@ -756,6 +773,10 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 			e.requestCompletion()
 		}
 	case kero.KeyDelete:
+		if e.hasSelect() {
+			e.deleteSelect()
+			break
+		}
 		v.Cursor = buf.Delete(v.Cursor, buf.NextRunePos(v.Cursor))
 		e.markDirty()
 	case kero.KeyLeft:
@@ -936,7 +957,6 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 		reverse = reverse.Reverse()
 	}
 	statusStyle := reverse
-	gutterStyle := textStyle.Dim()
 	cursorStyle := kero.Style{
 		Fg: kero.ColorHex(Theme["cursorFg"]),
 		Bg: kero.ColorHex(Theme["cursorBg"]),
@@ -948,10 +968,6 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 		Attr: kero.AttrBold,
 	}
 	messageStyle := textStyle
-	activeLineStyle := kero.Style{
-		Fg: textStyle.Fg,
-		Bg: kero.ColorHex(Theme["activeLineBg"]),
-	}
 
 	v := e.View()
 	fSize := f.Size()
@@ -966,28 +982,28 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 
 	// 1. Draw Gutter
 	for i := range gutterRect.H {
+		style := textStyle
 		lineIdx := v.ScrollRow + i
 		y := gutterRect.Y + i
 
 		if lineIdx >= len(v.Buf.Lines) {
-			f.Write(gutterRect.X, y, "~", gutterStyle)
+			f.Write(gutterRect.X, y, "~", style.Dim())
 			continue
 		}
 
 		if s, ok := gutterMap[i]; ok {
-			label := 'x'
-			style := textStyle.Foreground(kero.ColorRed)
+			mark := 'x'
+			markStyle := style.Foreground(kero.ColorRed)
 			if s != lsp.DiagnosticSeverityError {
-				label = '!'
-				style = textStyle.Dim()
+				mark = '!'
+				markStyle = markStyle.Dim()
 			}
-			f.Set(gutterRect.X, y, label, style)
+			f.Set(gutterRect.X, y, mark, markStyle)
 		}
 
 		gutterText := fmt.Sprintf("%*d ", gutterRect.W-2, lineIdx+1)
-		style := gutterStyle
-		if lineIdx == v.Cursor.Row {
-			style = activeLineStyle
+		if lineIdx != v.Cursor.Row {
+			style = style.Dim()
 		}
 		f.Write(gutterRect.X+1, y, gutterText, style)
 	}
@@ -1131,7 +1147,7 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 	cursorVisCol := v.Buf.VisualCol(v.Cursor.Row, v.Cursor.Col, 4)
 	cursorX := textRect.X + (cursorVisCol - v.ScrollCol)
 	cursorY := textRect.Y + (v.Cursor.Row - v.ScrollRow)
-	if textRect.Contains(kero.Point{X: cursorX, Y: cursorY}) && !e.find.Active {
+	if textRect.Contains(kero.Point{X: cursorX, Y: cursorY}) && (!e.find.Active || e.find.Blur) {
 		ch := ' '
 		if v.Cursor.Row < len(v.Buf.Lines) {
 			line := v.Buf.Lines[v.Cursor.Row]
@@ -2294,7 +2310,7 @@ func (p *Palette) commandItems(_ *Editor, query string) []PaletteItem {
 	}{
 		// use readable name for cmd, easy to search
 		{"color theme: Dark", "", func(e *Editor) {
-			Theme = DarkTheme
+			Theme = Dark
 		}},
 		{"color theme: Mariana", "", func(e *Editor) {
 			Theme = Mariana
@@ -2351,8 +2367,7 @@ func (p *Palette) commandItems(_ *Editor, query string) []PaletteItem {
 	var items []PaletteItem
 	for _, c := range commands {
 		match := true
-		parts := strings.Fields(query)
-		for _, q := range parts {
+		for q := range strings.FieldsSeq(query) {
 			if !strings.Contains(strings.ToLower(c.cmd), strings.ToLower(q)) {
 				match = false
 				break

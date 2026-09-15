@@ -7,17 +7,16 @@ import (
 )
 
 var (
-	Theme = DarkTheme
+	Theme = Dark
 
-	DarkTheme = map[string]string{
-		"foreground":   "#D4D4D4", // Soft off-white text
-		"background":   "#1E1E1E", // dark
-		"cursorFg":     "#1E1E1E", // dark
-		"cursorBg":     "#fac863", // orange
-		"selectionBg":  "#3E4451", // Slate grey selection (keeps original Fg)
-		"activeLineBg": "#282C34", // Slightly lighter charcoal tint
-		"searchFg":     "#000000", // Dark text for contrast against bright yellow
-		"searchBg":     "#E5C07B", // One Dark Gold / Warm Amber
+	Dark = map[string]string{
+		"foreground":  "#D4D4D4", // Soft off-white text
+		"background":  "#292A2F", // dark
+		"cursorFg":    "#1E1E1E", // dark
+		"cursorBg":    "#fac863", // orange
+		"selectionBg": "#424453",
+		"searchFg":    "#000000", // Dark text for contrast against bright yellow
+		"searchBg":    "#E5C07B", // One Dark Gold / Warm Amber
 
 		// syntax highlight
 		"keyword": "#c594c5", // soft Purple
@@ -30,14 +29,13 @@ var (
 
 	// Mariana theme
 	Mariana = map[string]string{
-		"foreground":   "#d8dee9", // white
-		"background":   "#303841", // blue
-		"cursorFg":     "#000000", // black
-		"cursorBg":     "#fac863", // orange
-		"selectionBg":  "#4e5a65", // blue
-		"activeLineBg": "#65737e", // blue
-		"searchFg":     "#000000", // Dark text for contrast against bright yellow
-		"searchBg":     "#E5C07B", // One Dark Gold / Warm Amber
+		"foreground":  "#d8dee9", // white
+		"background":  "#303841", // blue
+		"cursorFg":    "#000000", // black
+		"cursorBg":    "#fac863", // orange
+		"selectionBg": "#4e5a65", // blue
+		"searchFg":    "#000000", // Dark text for contrast against bright yellow
+		"searchBg":    "#E5C07B", // One Dark Gold / Warm Amber
 
 		// syntax highlight
 		"keyword": "#c594c5", // soft Purple
