@@ -634,7 +634,7 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 		if e.hasSelect() {
 			e.deleteSelect()
 		}
-		v.Cursor = buf.Insert(v.Cursor, string([]rune{key.Rune}))
+		v.Cursor = buf.Insert(v.Cursor, string(key.Rune))
 		e.markDirty()
 
 		// LSP Completion requires latest buffer, so NotifyBufferChanged will be called
@@ -978,7 +978,7 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 
 	tabWidth := 4
 	fileDiags := e.diagnostics[e.Buf().Path]
-	gutterMap, lineDiags := v.GetVisibleDiagnostics(fileDiags, tabWidth)
+	lineDiags := v.Diagnostics(fileDiags, tabWidth)
 
 	// 1. Draw Gutter
 	for i := range gutterRect.H {
@@ -991,10 +991,10 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 			continue
 		}
 
-		if s, ok := gutterMap[i]; ok {
+		if diags, ok := lineDiags[lineIdx]; ok && len(diags) > 0 {
 			mark := 'x'
 			markStyle := style.Foreground(kero.ColorRed)
-			if s != lsp.DiagnosticSeverityError {
+			if diags[0].Severity != lsp.DiagnosticSeverityError {
 				mark = '!'
 				markStyle = markStyle.Dim()
 			}
@@ -1040,27 +1040,27 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 		}
 
 		var diag *LineDiagnostic
-		if diags, ok := lineDiags[i]; ok && len(diags) > 0 {
+		if diags, ok := lineDiags[lineIdx]; ok && len(diags) > 0 {
 			diag = &diags[0]
 		}
 
-		// Calculate visual selection range for this line
-		selStartVCol, selEndVCol := -1, -1
+		// Calculate selection range for this line
+		selStartCol, selEndCol := -1, -1
 		if v.Selecting {
 			start, end := orderPos(v.SelAnchor, v.Cursor)
 			if lineIdx >= start.Row && lineIdx <= end.Row {
 				if start.Row == end.Row {
-					selStartVCol = v.Buf.VisualCol(lineIdx, start.Col, 4)
-					selEndVCol = v.Buf.VisualCol(lineIdx, end.Col, 4)
+					selStartCol = start.Col
+					selEndCol = end.Col
 				} else if lineIdx == start.Row {
-					selStartVCol = v.Buf.VisualCol(lineIdx, start.Col, 4)
-					selEndVCol = v.Buf.VisualCol(lineIdx, len(line), 4)
+					selStartCol = start.Col
+					selEndCol = len(line)
 				} else if lineIdx == end.Row {
-					selStartVCol = 0
-					selEndVCol = v.Buf.VisualCol(lineIdx, end.Col, 4)
+					selStartCol = 0
+					selEndCol = end.Col
 				} else {
-					selStartVCol = 0
-					selEndVCol = v.Buf.VisualCol(lineIdx, len(line), 4)
+					selStartCol = 0
+					selEndCol = len(line)
 				}
 			}
 		}
@@ -1102,7 +1102,7 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 				}
 
 				// 2. Override with Diagnostic Underline
-				if diag != nil && diag.StartCol <= vCol && vCol < diag.EndCol {
+				if diag != nil && diag.StartCol <= byteIdx && byteIdx < diag.EndCol {
 					charStyle = charStyle.Underline()
 				}
 
@@ -1112,17 +1112,11 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 				}
 
 				// 4. Override with Selection Style (highest priority)
-				if selStartVCol != -1 && vCol >= selStartVCol && vCol < selEndVCol {
+				if selStartCol != -1 && byteIdx >= selStartCol && byteIdx < selEndCol {
 					charStyle = charStyle.Background(selectionBG)
 				}
 
-				if r == '\t' {
-					for i := range runeWidth {
-						f.Set(screenX+i, y, ' ', charStyle)
-					}
-				} else {
-					f.Set(screenX, y, r, charStyle)
-				}
+				f.Set(screenX, y, r, charStyle)
 			}
 
 			byteIdx += size
@@ -1136,7 +1130,7 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 		if diag != nil {
 			style := textStyle.Foreground(kero.ColorRed)
 			if diag.Severity != lsp.DiagnosticSeverityError {
-				style = textStyle.Dim()
+				style = style.Dim()
 			}
 			dx := max(textRect.X+(vCol-v.ScrollCol)+2, AlignRight(textRect, diag.Message, 0))
 			f.Write(dx, y, diag.Message, style)
@@ -1191,11 +1185,11 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 	if msgRect.H > 0 {
 		switch {
 		case e.saveAs:
-			e.drawSaveAs(f, msgRect)
+			e.drawSaveAs(f, msgRect, reverse)
 		case e.find.Active:
-			e.drawFind(f, msgRect)
+			e.drawFind(f, msgRect, reverse)
 		case e.renaming:
-			e.drawRename(f, msgRect)
+			e.drawRename(f, msgRect, reverse)
 		default:
 			if e.message == "" {
 				e.message = "^S save | ^W close | ^Q quit | ^F find | ^P palette"
@@ -1470,21 +1464,15 @@ func (e *Editor) finishSaveAs() error {
 	return nil
 }
 
-func (e *Editor) drawSaveAs(f *kero.Frame, rect kero.Rect) {
-	normal := kero.NewStyle().Foreground(kero.ColorYellow)
-	errorStyle := kero.NewStyle().Foreground(kero.ColorRed)
-	style := normal
-	if e.message == "filename required" {
-		style = errorStyle
-	}
-
+func (e *Editor) drawSaveAs(f *kero.Frame, rect kero.Rect, style kero.Style) {
 	prompt := " Save as: "
-	f.Write(rect.X, rect.Y, trimToWidth(prompt, rect.W), style)
-	inputX := len([]rune(prompt))
-	if inputX >= rect.W {
+	f.Fill(rect, ' ', style)
+	f.Write(rect.X, rect.Y, prompt, style)
+	x := rect.X + runewidth.StringWidth(prompt)
+	if x >= rect.Right() {
 		return
 	}
-	e.saveInput.Draw(f, kero.Rect{X: inputX, Y: rect.Y, W: rect.W - inputX, H: 1}, style)
+	e.saveInput.Draw(f, kero.Rect{X: x, Y: rect.Y, W: rect.Right() - x, H: 1}, style)
 }
 
 type Find struct {
@@ -1614,23 +1602,23 @@ func (e *Editor) updateFind(ev kero.KeyEvent) error {
 	return nil
 }
 
-func (e *Editor) drawFind(f *kero.Frame, rect kero.Rect) {
-	normal := kero.NewStyle()
+func (e *Editor) drawFind(f *kero.Frame, rect kero.Rect, style kero.Style) {
 	prompt := " Find: "
-	f.Write(rect.X, rect.Y, trimToWidth(prompt, rect.W), normal)
-	inputX := len([]rune(prompt))
+	f.Fill(rect, ' ', style)
+	f.Write(rect.X, rect.Y, prompt, style)
+	inputX := runewidth.StringWidth(prompt)
 	if inputX >= rect.W {
 		return
 	}
 	if !e.find.Replacing {
-		e.find.Input.Draw(f, kero.Rect{X: inputX, Y: rect.Y, W: rect.W - inputX, H: 1}, normal)
+		e.find.Input.Draw(f, kero.Rect{X: inputX, Y: rect.Y, W: rect.W - inputX, H: 1}, style)
 		return
 	}
-	e.find.Input.Draw(f, kero.Rect{X: inputX, Y: rect.Y, W: rect.W - inputX, H: 1}, normal)
-	replaceX := inputX + len([]rune(e.find.Input.String())) + 4
+	e.find.Input.Draw(f, kero.Rect{X: inputX, Y: rect.Y, W: rect.W - inputX, H: 1}, style)
+	replaceX := inputX + runewidth.StringWidth(e.find.Input.String()) + 4
 	if replaceX < rect.W {
-		f.Write(replaceX-4, rect.Y, " -> ", normal.Foreground(kero.ColorYellow))
-		e.find.ReplaceInput.Draw(f, kero.Rect{X: replaceX, Y: rect.Y, W: rect.W - replaceX, H: 1}, normal)
+		f.Write(replaceX-4, rect.Y, " -> ", style)
+		e.find.ReplaceInput.Draw(f, kero.Rect{X: replaceX, Y: rect.Y, W: rect.W - replaceX, H: 1}, style)
 	}
 }
 
@@ -2872,15 +2860,15 @@ func (e *Editor) updateRename(ev kero.KeyEvent) {
 	}
 }
 
-func (e *Editor) drawRename(f *kero.Frame, rect kero.Rect) {
-	normal := kero.NewStyle()
+func (e *Editor) drawRename(f *kero.Frame, rect kero.Rect, style kero.Style) {
 	prompt := " Rename: "
-	f.Write(rect.X, rect.Y, trimToWidth(prompt, rect.W), normal)
-	inputX := len([]rune(prompt))
-	if inputX >= rect.W {
+	f.Fill(rect, ' ', style)
+	f.Write(rect.X, rect.Y, prompt, style)
+	x := rect.X + runewidth.StringWidth(prompt)
+	if x >= rect.Right() {
 		return
 	}
-	e.renameInput.Draw(f, kero.Rect{X: inputX, Y: rect.Y, W: rect.W - inputX, H: rect.H}, normal)
+	e.renameInput.Draw(f, kero.Rect{X: x, Y: rect.Y, W: rect.Right() - x, H: rect.H}, style)
 }
 
 func (e *Editor) GotoDefinition() error {
@@ -3217,15 +3205,13 @@ type LineDiagnostic struct {
 	Message  string
 }
 
-// GetVisibleDiagnostics maps buffer diagnostics into visible viewport line & column ranges.
-func (v *View) GetVisibleDiagnostics(diags []lsp.Diagnostic, tabWidth int) (map[int]int, map[int][]LineDiagnostic) {
-	// Gutter indicators: viewportRow -> highest severity (1 is Error, 2 is Warning)
-	gutterMap := make(map[int]int)
-	// Text underlines: viewportRow -> list of column ranges
+// Diagnostics maps buffer diagnostics into visible viewport line & column ranges.
+func (v *View) Diagnostics(diags []lsp.Diagnostic, tabWidth int) map[int][]LineDiagnostic {
+	// Text underlines: line index -> list of column ranges
 	underlineMap := make(map[int][]LineDiagnostic)
 
 	if v.Buf == nil || len(diags) == 0 {
-		return gutterMap, underlineMap
+		return underlineMap
 	}
 
 	viewStartRow := v.ScrollRow
@@ -3238,18 +3224,6 @@ func (v *View) GetVisibleDiagnostics(diags []lsp.Diagnostic, tabWidth int) (map[
 		// Skip diagnostics completely outside visible viewport
 		if diagEndRow < viewStartRow || diagStartRow >= viewEndRow {
 			continue
-		}
-
-		// 1. Process Gutter Indicators for all affected lines in viewport
-		for r := diagStartRow; r <= diagEndRow; r++ {
-			if r >= viewStartRow && r < viewEndRow {
-				vRow := r - viewStartRow
-				existingSev, found := gutterMap[vRow]
-				// Higher priority to lower severity numbers (1 = Error)
-				if !found || d.Severity < existingSev {
-					gutterMap[vRow] = d.Severity
-				}
-			}
 		}
 
 		// 2. Process Underline Highlights line by line
@@ -3283,12 +3257,9 @@ func (v *View) GetVisibleDiagnostics(diags []lsp.Diagnostic, tabWidth int) (map[
 				}
 			}
 
-			startCol := ByteOffsetToVisualCol(lineBytes, startByte, tabWidth)
-			endCol := ByteOffsetToVisualCol(lineBytes, endByte, tabWidth)
-
 			// Map to viewport visual columns
-			vStartCol := startCol - v.ScrollCol
-			vEndCol := endCol - v.ScrollCol
+			vStartCol := ByteOffsetToVisualCol(lineBytes, startByte, tabWidth) - v.ScrollCol
+			vEndCol := ByteOffsetToVisualCol(lineBytes, endByte, tabWidth) - v.ScrollCol
 
 			// Clip to viewport horizontal boundaries
 			if vEndCol > 0 && vStartCol < v.Width {
@@ -3299,10 +3270,9 @@ func (v *View) GetVisibleDiagnostics(diags []lsp.Diagnostic, tabWidth int) (map[
 					vEndCol = v.Width
 				}
 
-				vRow := r - viewStartRow
-				underlineMap[vRow] = append(underlineMap[vRow], LineDiagnostic{
-					StartCol: vStartCol,
-					EndCol:   vEndCol,
+				underlineMap[r] = append(underlineMap[r], LineDiagnostic{
+					StartCol: startByte,
+					EndCol:   endByte,
 					Severity: d.Severity,
 					Message:  d.Message,
 				})
@@ -3310,7 +3280,7 @@ func (v *View) GetVisibleDiagnostics(diags []lsp.Diagnostic, tabWidth int) (map[
 		}
 	}
 
-	return gutterMap, underlineMap
+	return underlineMap
 }
 
 // uriToPath converts a file:// URI into a clean, platform-native file path.
