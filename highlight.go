@@ -10,7 +10,7 @@ var (
 	Theme = Dark
 
 	Dark = map[string]string{
-		"foreground":  "#D4D4D4", // Soft off-white text
+		"foreground":  "#D8DEE9", // white
 		"background":  "#292A2F", // dark
 		"cursorFg":    "#1E1E1E", // dark
 		"cursorBg":    "#fac863", // orange
@@ -29,7 +29,7 @@ var (
 
 	// Mariana theme
 	Mariana = map[string]string{
-		"foreground":  "#d8dee9", // white
+		"foreground":  "#D8DEE9", // white
 		"background":  "#303841", // blue
 		"cursorFg":    "#000000", // black
 		"cursorBg":    "#fac863", // orange

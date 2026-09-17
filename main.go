@@ -34,17 +34,17 @@ func parsePathArg(arg string) (path string, row, col int) {
 
 	path = parts[0]
 	if len(parts) > 1 {
-		var errRow error
-		row, errRow = strconv.Atoi(parts[1])
-		if errRow != nil || row < 1 {
+		var err error
+		row, err = strconv.Atoi(parts[1])
+		if err != nil || row < 1 {
 			return path, 0, 0
 		}
 	}
 
 	if len(parts) > 2 {
-		var errCol error
-		col, errCol = strconv.Atoi(parts[2])
-		if errCol != nil || col < 1 {
+		var err error
+		col, err = strconv.Atoi(parts[2])
+		if err != nil || col < 1 {
 			return path, row - 1, 0
 		}
 	}
@@ -1114,6 +1114,15 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 				// 4. Override with Selection Style (highest priority)
 				if selStartCol != -1 && byteIdx >= selStartCol && byteIdx < selEndCol {
 					charStyle = charStyle.Background(selectionBG)
+
+					// showing selected tab is useful for distinguishing spaces from tabs
+					if r == '\t' {
+						r = '→'
+						charStyle = charStyle.Dim()
+						for i := range runeWidth - 1 {
+							f.Set(screenX+1+i, y, ' ', charStyle)
+						}
+					}
 				}
 
 				f.Set(screenX, y, r, charStyle)
@@ -1124,6 +1133,11 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 			if vCol-v.ScrollCol >= textRect.W {
 				break // Clipped right of viewport
 			}
+		}
+
+		// showing selected newline is useful for seeing trailing whitespace
+		if selEndCol == len(line) {
+			f.Set(textRect.X+vCol, y, ' ', textStyle.Background(selectionBG))
 		}
 
 		// Draw inline diagnostic message
