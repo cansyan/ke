@@ -517,6 +517,14 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 	switch key.Key {
 	case kero.KeyRune:
 		switch key.String() {
+		case "ctrl+z":
+			if p, ok := buf.Undo(); ok {
+				v.Cursor = p
+			}
+		case "ctrl+shift+z":
+			if p, ok := buf.Redo(); ok {
+				v.Cursor = p
+			}
 		case "ctrl+n":
 			e.requestCompletion()
 			// if only one item, insert it directly

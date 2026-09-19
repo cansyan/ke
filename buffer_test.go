@@ -107,3 +107,27 @@ func TestBufferReader_TrailingNewline(t *testing.T) {
 		})
 	}
 }
+
+func TestBufferUndo(t *testing.T) {
+	b := NewBuffer("", nil)
+	var p Position
+	src := "hi"
+	p = b.Insert(p, src)
+	b.Insert(p, src) // the second edit should be merged
+	if len(b.Lines) == 0 {
+		t.Fatal("unexpected empty buffer")
+	}
+	// t.Logf("%+v, %d", b.records, b.recordIdx)
+
+	b.Undo()
+	if got := string(b.Lines[0]); got != "" {
+		t.Fatalf("want empty, got %q", got)
+	}
+	// t.Logf("%+v, %d", b.records, b.recordIdx)
+
+	b.Redo()
+	want := "hihi"
+	if got := string(b.Lines[0]); got != want {
+		t.Fatalf("want %q, got %q", want, got)
+	}
+}

@@ -9,6 +9,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"time"
 	"unicode"
 	"unicode/utf8"
 
@@ -21,6 +22,10 @@ type Buffer struct {
 	Path  string
 	Lines [][]byte
 	Dirty bool
+
+	// TODO: keep the last 10 records at most
+	records   []EditRecord
+	recordIdx int
 }
 
 func NewBuffer(path string, content []byte) *Buffer {
@@ -43,6 +48,7 @@ func (b *Buffer) Insert(p Position, text string) Position {
 	if p.Col > len(line) {
 		p.Col = len(line)
 	}
+	b.recordEdit(p, p, text)
 
 	prefix := line[:p.Col]
 	suffix := line[p.Col:]
@@ -71,7 +77,6 @@ func (b *Buffer) Insert(p Position, text string) Position {
 		Col: len(newLines[len(newLines)-1]) - len(suffix),
 	}
 }
-
 func (b *Buffer) ReplaceRange(start, end Position, newText string) Position {
 	// Boundary safety checks
 	if start.Row < 0 || start.Row >= len(b.Lines) {
@@ -81,7 +86,12 @@ func (b *Buffer) ReplaceRange(start, end Position, newText string) Position {
 		end.Row = len(b.Lines) - 1
 		end.Col = len(b.Lines[end.Row])
 	}
+	b.recordEdit(start, end, newText)
+	return b.replaceRange(start, end, newText)
+}
 
+// pure replace, without recording edits
+func (b *Buffer) replaceRange(start, end Position, newText string) Position {
 	// 1. Extract prefix before startCol and suffix after endCol
 	prefix := b.Lines[start.Row][:start.Col]
 	suffix := b.Lines[end.Row][end.Col:]
@@ -182,6 +192,8 @@ func (b *Buffer) Delete(p1, p2 Position) Position {
 	if start == end {
 		return start
 	}
+
+	b.recordEdit(p1, p2, "")
 
 	// Single-line deletion
 	if start.Row == end.Row {
@@ -831,4 +843,94 @@ func (b *Buffer) ApplyTextEdit(edit lsp.TextEdit) Position {
 
 	// Delegate range replacement directly to Buffer
 	return b.ReplaceRange(startPos, endPos, edit.NewText)
+}
+
+type EditRecord struct {
+	start   Position // the start of the range to delete
+	end     Position // the end of the range to delete
+	newText string
+	deleted string
+	t       time.Time
+}
+
+func (b *Buffer) recordEdit(start, end Position, newText string) {
+	start, end = orderPos(start, end)
+	e := EditRecord{
+		start:   start,
+		end:     end,
+		newText: newText,
+		t:       time.Now(),
+	}
+	if start != end {
+		e.deleted = b.TextRange(start, end)
+	}
+
+	// the one and only record
+	if len(b.records) == 0 || b.recordIdx < 0 {
+		b.records = []EditRecord{e}
+		b.recordIdx = 0
+		return
+	}
+
+	// join consecutive edits
+	last := b.records[b.recordIdx]
+	var lastP Position
+	lines := bytes.Split([]byte(last.newText), []byte{'\n'})
+	if len(lines) == 1 {
+		lastP.Row = last.start.Row
+		lastP.Col = last.start.Col + len(lines[0])
+	} else {
+		lastP.Row = last.start.Row + len(lines) - 1
+		lastP.Col = len(lines[len(lines)-1])
+	}
+	if lastP == e.start && time.Since(last.t) <= time.Second {
+		b.records[b.recordIdx] = EditRecord{
+			start:   last.start,
+			end:     last.end,
+			newText: last.newText + e.newText,
+			deleted: last.deleted + e.deleted,
+			t:       time.Now(),
+		}
+		b.records = b.records[:b.recordIdx+1]
+		return
+	}
+
+	b.records = append(b.records[:b.recordIdx+1], e)
+	b.recordIdx++
+}
+
+func (b *Buffer) Undo() (Position, bool) {
+	if b.recordIdx < 0 || b.recordIdx >= len(b.records) {
+		return Position{}, false
+	}
+
+	e := b.records[b.recordIdx]
+	b.recordIdx--
+
+	if e.newText == "" {
+		return b.Insert(e.start, e.deleted), true
+	}
+
+	start := e.start
+	var p Position
+	lines := bytes.Split([]byte(e.newText), []byte{'\n'})
+	if len(lines) == 1 {
+		p.Row = start.Row
+		p.Col = start.Col + len(lines[0])
+	} else {
+		p.Row = start.Row + len(lines) - 1
+		p.Col = len(lines[len(lines)-1])
+	}
+
+	return b.replaceRange(start, p, e.deleted), true
+}
+
+func (b *Buffer) Redo() (Position, bool) {
+	if b.recordIdx >= len(b.records)-1 {
+		return Position{}, false
+	}
+
+	e := b.records[b.recordIdx+1]
+	b.recordIdx++
+	return b.replaceRange(e.start, e.end, e.newText), true
 }
