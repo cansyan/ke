@@ -948,23 +948,23 @@ func LayoutPalatte(totalWidth, totalHeight, paletteHeight int) kero.Rect {
 
 func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 	textStyle := kero.Style{
-		Fg: kero.ColorHex(Theme["foreground"]),
-		Bg: kero.ColorHex(Theme["background"]),
+		Fg: kero.ColorHex(Theme["text"]["fg"]),
+		Bg: kero.ColorHex(Theme["text"]["bg"]),
 	}
 	reverse := kero.Style{Fg: textStyle.Bg, Bg: textStyle.Fg}
 	if reverse.Bg == textStyle.Bg {
 		// flip the Attr for default theme
 		reverse = reverse.Reverse()
 	}
-	statusStyle := reverse
+	statusStyle := kero.Style{Fg: kero.ColorHex(Theme["status"]["fg"]), Bg: kero.ColorHex(Theme["status"]["bg"])}
 	cursorStyle := kero.Style{
-		Fg: kero.ColorHex(Theme["cursorFg"]),
-		Bg: kero.ColorHex(Theme["cursorBg"]),
+		Fg: kero.ColorHex(Theme["cursor"]["fg"]),
+		Bg: kero.ColorHex(Theme["cursor"]["bg"]),
 	}
-	selectionBG := kero.ColorHex(Theme["selectionBg"])
+	selectionBG := kero.ColorHex(Theme["selection"]["bg"])
 	searchMatch := kero.Style{
-		Fg:   kero.ColorHex(Theme["searchFg"]),
-		Bg:   kero.ColorHex(Theme["searchBg"]),
+		Fg:   kero.ColorHex(Theme["search"]["fg"]),
+		Bg:   kero.ColorHex(Theme["search"]["bg"]),
 		Attr: kero.AttrBold,
 	}
 	messageStyle := textStyle
@@ -1091,7 +1091,7 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 					charStyle = HighlightStyle(t.Type).Background(charStyle.Bg)
 
 					// underline the same appearance
-					if t.Type == TokKeyword {
+					if !isWordChar(r) || t.Type == TokKeyword || t.Type == TokComment {
 						break
 					}
 					tokenIdent := v.Buf.TextRange(Position{Row: lineIdx, Col: t.StartCol}, Position{Row: lineIdx, Col: t.EndCol})
@@ -1135,7 +1135,7 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 			}
 		}
 
-		// showing selected newline is useful for seeing trailing whitespace
+		// show selected newline
 		if selEndCol == len(line) {
 			f.Set(textRect.X+vCol, y, ' ', textStyle.Background(selectionBG))
 		}

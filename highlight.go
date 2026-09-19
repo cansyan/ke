@@ -8,42 +8,36 @@ import (
 
 var (
 	Theme = Dark
-
-	Dark = map[string]string{
-		"foreground":  "#D8DEE9", // white
-		"background":  "#292A2F", // dark
-		"cursorFg":    "#1E1E1E", // dark
-		"cursorBg":    "#fac863", // orange
-		"selectionBg": "#424453",
-		"searchFg":    "#000000", // Dark text for contrast against bright yellow
-		"searchBg":    "#E5C07B", // One Dark Gold / Warm Amber
+	Dark  = map[string]map[string]string{
+		"text":      {"fg": "#D8DEE9", "bg": "#292A2F"}, // white, dark
+		"cursor":    {"fg": "#1E1E1E", "bg": "#fac863"}, // dark, orange
+		"status":    {"fg": "#292A2F", "bg": "#D8DEE9"}, // dark, white
+		"search":    {"fg": "#000000", "bg": "#E5C07B"}, // dark, yellow
+		"selection": {"bg": "#424453"},                  // blue
 
 		// syntax highlight
-		"keyword": "#c594c5", // soft Purple
-		"type":    "#6598CA", // blue
-		"string":  "#99c794", // green
-		"comment": "#a7adba", // blue
-		"number":  "#fac863", // orange
-		"builtin": "#F97B58", // red
+		"keyword": {"fg": "#c594c5"}, // soft Purple
+		"type":    {"fg": "#6598CA"}, // blue
+		"string":  {"fg": "#99c794"}, // green
+		"comment": {"fg": "#a7adba"}, // blue
+		"number":  {"fg": "#fac863"}, // orange
+		"builtin": {"fg": "#F97B58"}, // red
 	}
 
-	// Mariana theme
-	Mariana = map[string]string{
-		"foreground":  "#D8DEE9", // white
-		"background":  "#303841", // blue
-		"cursorFg":    "#000000", // black
-		"cursorBg":    "#fac863", // orange
-		"selectionBg": "#4e5a65", // blue
-		"searchFg":    "#000000", // Dark text for contrast against bright yellow
-		"searchBg":    "#E5C07B", // One Dark Gold / Warm Amber
+	Mariana = map[string]map[string]string{
+		"text":      {"fg": "#D8DEE9", "bg": "#303841"}, // white, blue
+		"cursor":    {"fg": "#000000", "bg": "#fac863"}, // black, orange
+		"status":    {"fg": "#303841", "bg": "#D8DEE9"}, // blue, white
+		"search":    {"fg": "#000000", "bg": "#E5C07B"}, // dark, yellow
+		"selection": {"bg": "#4e5a65"},                  // blue
 
 		// syntax highlight
-		"keyword": "#c594c5", // soft Purple
-		"type":    "#6598CA", // blue
-		"string":  "#99c794", // green
-		"comment": "#a7adba", // blue
-		"number":  "#fac863", // orange
-		"builtin": "#F97B58", // red
+		"keyword": {"fg": "#c594c5"}, // soft Purple
+		"type":    {"fg": "#6598CA"}, // blue
+		"string":  {"fg": "#99c794"}, // green
+		"comment": {"fg": "#a7adba"}, // blue
+		"number":  {"fg": "#fac863"}, // orange
+		"builtin": {"fg": "#F97B58"}, // red
 	}
 )
 
@@ -70,21 +64,21 @@ type HLToken struct {
 func HighlightStyle(t TokenType) kero.Style {
 	switch t {
 	case TokKeyword:
-		return kero.Style{Fg: kero.ColorHex(Theme["keyword"])}.Italic()
+		return kero.Style{Fg: kero.ColorHex(Theme["keyword"]["fg"])}.Italic()
 	case TokType:
-		return kero.Style{Fg: kero.ColorHex(Theme["type"])}
+		return kero.Style{Fg: kero.ColorHex(Theme["type"]["fg"])}
 	case TokString:
-		return kero.Style{Fg: kero.ColorHex(Theme["string"])}
+		return kero.Style{Fg: kero.ColorHex(Theme["string"]["fg"])}
 	case TokComment:
-		return kero.Style{Fg: kero.ColorHex(Theme["comment"])}
+		return kero.Style{Fg: kero.ColorHex(Theme["comment"]["fg"])}
 	case TokNumber:
-		return kero.Style{Fg: kero.ColorHex(Theme["number"])}
+		return kero.Style{Fg: kero.ColorHex(Theme["number"]["fg"])}
 	case TokBuiltin:
-		return kero.Style{Fg: kero.ColorHex(Theme["builtin"])}.Italic()
+		return kero.Style{Fg: kero.ColorHex(Theme["builtin"]["fg"])}.Italic()
 	default:
 		return kero.Style{
-			Fg: kero.ColorHex(Theme["foreground"]),
-			Bg: kero.ColorHex(Theme["background"]),
+			Fg: kero.ColorHex(Theme["global"]["fg"]),
+			Bg: kero.ColorHex(Theme["global"]["bg"]),
 		}
 	}
 }
