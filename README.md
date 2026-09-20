@@ -38,6 +38,8 @@ Key bindings:
 - Ctrl+N trigger completion
 	- Up/Down navigate
 	- Tab/Enter complete
+- Ctrl+Z undo
+- Ctrl+Shift+Z redo
 - Alt+Left move cursor to start of current/previous word
 - Alt+Right move cursor to end of current/next word
 - Alt+Backspace delete word backwards

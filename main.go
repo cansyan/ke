@@ -520,10 +520,12 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 		case "ctrl+z":
 			if p, ok := buf.Undo(); ok {
 				v.Cursor = p
+				e.markDirty()
 			}
 		case "ctrl+shift+z":
 			if p, ok := buf.Redo(); ok {
 				v.Cursor = p
+				e.markDirty()
 			}
 		case "ctrl+n":
 			e.requestCompletion()

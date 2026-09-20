@@ -23,7 +23,7 @@ type Buffer struct {
 	Lines [][]byte
 	Dirty bool
 
-	records   []EditRecord
+	records   []editRecord
 	recordIdx int
 }
 
@@ -844,17 +844,18 @@ func (b *Buffer) ApplyTextEdit(edit lsp.TextEdit) Position {
 	return b.ReplaceRange(startPos, endPos, edit.NewText)
 }
 
-type EditRecord struct {
-	start   Position // the start of the range to delete
+type editRecord struct {
+	start   Position
 	end     Position // the end of the range to delete
 	newText string
 	deleted string
 	t       time.Time
 }
 
+// record the new text applied on the [start, end) range
 func (b *Buffer) recordEdit(start, end Position, newText string) {
 	start, end = orderPos(start, end)
-	e := EditRecord{
+	e := editRecord{
 		start:   start,
 		end:     end,
 		newText: newText,
@@ -866,24 +867,24 @@ func (b *Buffer) recordEdit(start, end Position, newText string) {
 
 	// the one and only record
 	if len(b.records) == 0 || b.recordIdx < 0 {
-		b.records = []EditRecord{e}
+		b.records = []editRecord{e}
 		b.recordIdx = 0
 		return
 	}
 
 	// join consecutive edits
 	last := b.records[b.recordIdx]
-	var lastP Position
+	var tail Position
 	lines := bytes.Split([]byte(last.newText), []byte{'\n'})
 	if len(lines) == 1 {
-		lastP.Row = last.start.Row
-		lastP.Col = last.start.Col + len(lines[0])
+		tail.Row = last.start.Row
+		tail.Col = last.start.Col + len(lines[0])
 	} else {
-		lastP.Row = last.start.Row + len(lines) - 1
-		lastP.Col = len(lines[len(lines)-1])
+		tail.Row = last.start.Row + len(lines) - 1
+		tail.Col = len(lines[len(lines)-1])
 	}
-	if lastP == e.start && e.t.Sub(last.t) <= time.Second {
-		b.records[b.recordIdx] = EditRecord{
+	if tail == e.start && e.t.Sub(last.t) <= time.Second {
+		b.records[b.recordIdx] = editRecord{
 			start:   last.start,
 			end:     last.end,
 			newText: last.newText + e.newText,
