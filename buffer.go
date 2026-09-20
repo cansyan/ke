@@ -23,7 +23,6 @@ type Buffer struct {
 	Lines [][]byte
 	Dirty bool
 
-	// TODO: keep the last 10 records at most
 	records   []EditRecord
 	recordIdx int
 }
@@ -883,13 +882,13 @@ func (b *Buffer) recordEdit(start, end Position, newText string) {
 		lastP.Row = last.start.Row + len(lines) - 1
 		lastP.Col = len(lines[len(lines)-1])
 	}
-	if lastP == e.start && time.Since(last.t) <= time.Second {
+	if lastP == e.start && e.t.Sub(last.t) <= time.Second {
 		b.records[b.recordIdx] = EditRecord{
 			start:   last.start,
 			end:     last.end,
 			newText: last.newText + e.newText,
 			deleted: last.deleted + e.deleted,
-			t:       time.Now(),
+			t:       e.t,
 		}
 		b.records = b.records[:b.recordIdx+1]
 		return
@@ -897,6 +896,12 @@ func (b *Buffer) recordEdit(start, end Position, newText string) {
 
 	b.records = append(b.records[:b.recordIdx+1], e)
 	b.recordIdx++
+
+	// retain 10 records at most
+	if len(b.records) > 10 {
+		b.records = b.records[len(b.records)-10:]
+		b.recordIdx = len(b.records) - 1
+	}
 }
 
 func (b *Buffer) Undo() (Position, bool) {
