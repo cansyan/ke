@@ -903,13 +903,15 @@ func (b *Buffer) recordEdit(start, end Position, newText string) {
 
 	// discard stale records
 	records := b.records[:b.recordIdx+1]
-	// avoid unlimited slice
-	max := 2 ^ 4
-	if len(records) >= max {
-		dst := records[:max]
-		copy(dst, records[len(records)-max+1:])
-		records = dst
-	}
+	/*
+		// avoid unlimited slice
+		max := 2 ^ 4
+		if len(records) >= max {
+			dst := records[:max]
+			copy(dst, records[len(records)-max+1:])
+			records = dst
+		}
+	*/
 
 	b.records = append(records, e)
 	b.recordIdx = len(b.records) - 1
