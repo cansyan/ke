@@ -48,7 +48,12 @@ func (b *Buffer) Insert(p Position, text string) Position {
 		p.Col = len(line)
 	}
 	b.recordEdit(p, p, text)
+	return b.insert(p, text)
+}
 
+// pure insert, no recording edit
+func (b *Buffer) insert(p Position, text string) Position {
+	line := b.Lines[p.Row]
 	prefix := line[:p.Col]
 	suffix := line[p.Col:]
 	newLines := bytes.Split(slices.Concat(prefix, []byte(text), suffix), []byte{'\n'})
@@ -76,6 +81,7 @@ func (b *Buffer) Insert(p Position, text string) Position {
 		Col: len(newLines[len(newLines)-1]) - len(suffix),
 	}
 }
+
 func (b *Buffer) ReplaceRange(start, end Position, newText string) Position {
 	// Boundary safety checks
 	if start.Row < 0 || start.Row >= len(b.Lines) {
@@ -895,14 +901,18 @@ func (b *Buffer) recordEdit(start, end Position, newText string) {
 		return
 	}
 
-	b.records = append(b.records[:b.recordIdx+1], e)
-	b.recordIdx++
-
-	// retain 10 records at most
-	if len(b.records) > 10 {
-		b.records = b.records[len(b.records)-10:]
-		b.recordIdx = len(b.records) - 1
+	// discard stale records
+	records := b.records[:b.recordIdx+1]
+	// avoid unlimited slice
+	max := 2 ^ 4
+	if len(records) >= max {
+		dst := records[:max]
+		copy(dst, records[len(records)-max+1:])
+		records = dst
 	}
+
+	b.records = append(records, e)
+	b.recordIdx = len(b.records) - 1
 }
 
 func (b *Buffer) Undo() (Position, bool) {
@@ -914,7 +924,7 @@ func (b *Buffer) Undo() (Position, bool) {
 	b.recordIdx--
 
 	if e.newText == "" {
-		return b.Insert(e.start, e.deleted), true
+		return b.insert(e.start, e.deleted), true
 	}
 
 	start := e.start
@@ -927,7 +937,6 @@ func (b *Buffer) Undo() (Position, bool) {
 		p.Row = start.Row + len(lines) - 1
 		p.Col = len(lines[len(lines)-1])
 	}
-
 	return b.replaceRange(start, p, e.deleted), true
 }
 

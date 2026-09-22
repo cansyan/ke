@@ -113,20 +113,33 @@ func TestBufferUndo(t *testing.T) {
 	var p Position
 	src := "hi"
 	p = b.Insert(p, src)
-	b.Insert(p, src) // the second edit should be merged
-	if len(b.Lines) == 0 {
-		t.Fatal("unexpected empty buffer")
-	}
-	// t.Logf("%+v, %d", b.records, b.recordIdx)
+	p = b.Insert(p, src)
 
+	// the second edit should be merged to the first one
+	if len(b.Lines) == 0 || len(b.records) != 1 {
+		t.Fatalf("unexpected buffer length: %d", len(b.Lines))
+	}
+
+	// delete the line
+	b.Delete(Position{Row: 0, Col: 0}, p)
+
+	b.Undo()
 	b.Undo()
 	if got := string(b.Lines[0]); got != "" {
 		t.Fatalf("want empty, got %q", got)
 	}
 	// t.Logf("%+v, %d", b.records, b.recordIdx)
 
+	// redo insert
 	b.Redo()
 	want := "hihi"
+	if got := string(b.Lines[0]); got != want {
+		t.Fatalf("want %q, got %q", want, got)
+	}
+
+	// redo delete
+	b.Redo()
+	want = ""
 	if got := string(b.Lines[0]); got != want {
 		t.Fatalf("want %q, got %q", want, got)
 	}
