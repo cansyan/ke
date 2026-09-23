@@ -200,10 +200,11 @@ func NewEditor(filePath string, row, col int) (*Editor, error) {
 		diagnostics: make(map[string][]lsp.Diagnostic),
 	}
 
-	if err := e.OpenFile(filePath); err != nil {
+	v, err := e.OpenFile(filePath)
+	if err != nil {
 		return nil, err
 	}
-	e.View().Cursor = e.Buf().Clamp(Position{Row: row, Col: col})
+	v.Cursor = v.Buf.Clamp(Position{Row: row, Col: col})
 	return e, nil
 }
 
@@ -370,7 +371,7 @@ func (e *Editor) handleMouse(ctx *kero.Context, m kero.MouseEvent) error {
 		}
 
 		if textRect.Contains(point) {
-			e.View().ScrollRow = min(e.View().ScrollRow+1, len(e.Buf().Lines)-textRect.H)
+			e.View().ScrollRow = min(e.View().ScrollRow+1, max(0, len(e.Buf().Lines)-textRect.H))
 			return nil
 		}
 	case kero.MouseLeft:
@@ -435,6 +436,14 @@ func (e *Editor) handleMouse(ctx *kero.Context, m kero.MouseEvent) error {
 
 		case kero.MouseRelease:
 			if textRect.Contains(point) {
+				defer func() {
+					// resize buffer view if References Panel shows up
+					if e.ref.Active {
+						_, textRect, _, _, _ := LayoutWindow(ctx.Width, ctx.Height, len(e.Buf().Lines), e.ref.Active)
+						e.View().SetSize(textRect.W, textRect.H)
+					}
+				}()
+
 				switch m.Mod {
 				case kero.ModCtrl:
 					// ctrl+mouse_left_release goto definition
@@ -1764,7 +1773,6 @@ func (e *Editor) Goto(path string, row, col int) error {
 
 func (e *Editor) GotoLSPLocation(l lsp.Location) error {
 	e.recordJump()
-
 	v := e.View()
 	if v == nil {
 		return nil
@@ -1772,13 +1780,15 @@ func (e *Editor) GotoLSPLocation(l lsp.Location) error {
 
 	path := uriToPath(l.URI)
 	// 1. Switch buffer if needed (normalize paths in production if necessary)
-	if path != "" && path != e.Buf().Path {
-		if err := e.OpenFile(path); err != nil {
+	if path != "" && path != v.Buf.Path {
+		newV, err := e.OpenFile(path)
+		if err != nil {
 			return err
 		}
+		v = newV
 	}
 
-	buf := e.Buf()
+	buf := v.Buf
 	if buf == nil {
 		return nil
 	}
@@ -1958,7 +1968,7 @@ func (v *View) ShowCursorSmart() {
 
 	// If the jump is far outside the viewport (e.g. > 1 full viewport height), center it.
 	// Otherwise, just do standard minimal scrolling.
-	if dist > v.Height+v.Height/3 {
+	if dist > v.Height+v.Height/4 {
 		v.showCursorCenter()
 	} else {
 		v.showCursor()
@@ -1977,30 +1987,29 @@ func trimToWidth(s string, width int) string {
 }
 
 // OpenFile loads a file into memory or focuses it if already loaded.
-// TODO: consider return a Buffer pointer for further operations
-func (e *Editor) OpenFile(path string) error {
+func (e *Editor) OpenFile(path string) (*View, error) {
 	if path != "" {
 		absPath, err := filepath.Abs(path)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		path = absPath
 	}
 	if err := e.startLSP(path); err != nil {
-		return err
+		return nil, err
 	}
 
 	// switch to existing buffer
 	for i, v := range e.views {
 		if v.Buf.Path == path {
 			e.active = i
-			return nil
+			return v, nil
 		}
 	}
 
 	buf, err := BufferFromFile(path)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	newView := &View{Buf: buf}
@@ -2011,7 +2020,7 @@ func (e *Editor) OpenFile(path string) error {
 	e.views = append(e.views, newView)
 	e.active = len(e.views) - 1
 	e.NotifyBufferOpened(buf)
-	return nil
+	return newView, nil
 }
 
 // CloseBuffer closes the active buffer.
@@ -2128,18 +2137,20 @@ func (e *Editor) recordJump() {
 // clamping positions, and updating the viewport.
 // It is used by JumpBack and JumpForward.
 func (e *Editor) jumpTo(target Location) error {
-	if e.View() == nil {
+	v := e.View()
+	if v == nil {
 		return nil
 	}
 
 	// 1. Switch buffer if needed (normalize paths in production if necessary)
 	if target.Path != "" && target.Path != e.Buf().Path {
-		if err := e.OpenFile(target.Path); err != nil {
+		newV, err := e.OpenFile(target.Path)
+		if err != nil {
 			return err
 		}
+		v = newV
 	}
 
-	v := e.View()
 	// 2. Safely clamp position to valid buffer bounds
 	v.Cursor = v.Buf.Clamp(Position{Row: target.Row, Col: target.Col})
 
@@ -2538,7 +2549,7 @@ func (p *Palette) fileItems(e *Editor, query string) []PaletteItem {
 			Label: path,
 			Action: func(ed *Editor) {
 				ed.recordJump()
-				if err := ed.OpenFile(absPath); err != nil {
+				if _, err := ed.OpenFile(absPath); err != nil {
 					log.Print(err)
 					return
 				}
@@ -3415,22 +3426,21 @@ func (e *Editor) Rename(newName string) error {
 	// Apply edits across all files returned by gopls
 	for fileURI, edits := range editsPerFile {
 		filePath := uriToPath(fileURI)
-		err := e.OpenFile(filePath)
+		nv, err := e.OpenFile(filePath)
 		if err != nil {
 			continue
 		}
-		targetBuf := e.Buf()
 
 		// Apply edits in-memory
-		targetBuf.ApplyTextEdits(edits)
+		nv.Buf.ApplyTextEdits(edits)
 
 		// Notify LSP server of changed buffer content
-		e.NotifyBufferChanged(targetBuf)
+		e.NotifyBufferChanged(nv.Buf)
 
 		totalEdits += len(edits)
 		affectedFiles++
 
-		e.View().Cursor = e.Buf().Clamp(e.View().Cursor)
+		nv.Cursor = nv.Buf.Clamp(nv.Cursor)
 		err = e.SaveFile()
 		if err != nil {
 			log.Print(err)
@@ -3441,7 +3451,7 @@ func (e *Editor) Rename(newName string) error {
 	v.Cursor = buf.Clamp(v.Cursor)
 
 	// come back to the original buffer after renaming
-	if err := e.OpenFile(buf.Path); err != nil {
+	if _, err := e.OpenFile(buf.Path); err != nil {
 		return err
 	}
 
