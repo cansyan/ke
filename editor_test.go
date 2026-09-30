@@ -437,3 +437,32 @@ func TestContextMenu(t *testing.T) {
 		t.Fatalf("expected menu to be hidden after KeyEsc")
 	}
 }
+
+func TestAnimateScroll(t *testing.T) {
+	buf := NewBuffer("", []byte("line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10"))
+	v := &View{Buf: buf, Height: 4, Width: 10, Cursor: Position{Row: 8, Col: 0}}
+
+	// Initially ScrollRow = 0
+	v.showCursorCenter()
+	if !v.Animating {
+		t.Fatalf("expected view to be animating")
+	}
+	if v.TargetScrollRow != 6 { // max(8 - 4/2, 0) = 6
+		t.Fatalf("expected TargetScrollRow = 6, got %d", v.TargetScrollRow)
+	}
+
+	// Step animation until finished
+	steps := 0
+	for v.Animating && steps < 100 {
+		v.AnimateScroll()
+		steps++
+	}
+
+	if v.Animating {
+		t.Fatalf("animation did not complete within 100 steps")
+	}
+	if v.ScrollRow != 6 {
+		t.Fatalf("expected final ScrollRow = 6, got %d", v.ScrollRow)
+	}
+}
+

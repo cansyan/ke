@@ -129,10 +129,12 @@ type View struct {
 	Cursor Position
 
 	// Viewport
-	ScrollRow int // Topmost visible line index (0-based)
-	ScrollCol int // Leftmost visible visual column (0-based)
-	Width     int // Viewport width in terminal cells
-	Height    int // Viewport height in terminal rows
+	ScrollRow       int  // Topmost visible line index (0-based)
+	TargetScrollRow int  // Target line index for smooth scroll animation
+	Animating       bool // Whether vertical scroll animation is active
+	ScrollCol       int  // Leftmost visible visual column (0-based)
+	Width           int  // Viewport width in terminal cells
+	Height          int  // Viewport height in terminal rows
 
 	Selecting bool
 	SelAnchor Position // selection at [e.view().SelAnchor, e.pos)
@@ -267,7 +269,9 @@ func (e *Editor) LastEvent() string {
 func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 	switch ev := ev.(type) {
 	case kero.TickEvent:
-		log.Printf("view scrollRow: %d", e.View().ScrollRow)
+		for _, v := range e.views {
+			v.AnimateScroll()
+		}
 		return nil
 	case kero.ResizeEvent:
 		_, textRect, _, _, _ := LayoutWindow(ev.Width, ev.Height, len(e.Buf().Lines), e.ref.Active)
@@ -1860,6 +1864,8 @@ func isGoFile(path string) bool {
 // showCursor adjusts vertical and horizontal scrolling to ensure the cursor is within
 // the visible viewport.
 func (v *View) showCursor() {
+	v.Animating = false // Cancel any active smooth scroll animation
+
 	if v.Height <= 0 {
 		return
 	}
@@ -1903,43 +1909,40 @@ func (v *View) showCursor() {
 	}
 }
 
+// AnimateScroll advances ScrollRow towards TargetScrollRow by one easing step.
+func (v *View) AnimateScroll() {
+	if !v.Animating {
+		return
+	}
+
+	diff := v.TargetScrollRow - v.ScrollRow
+	if diff == 0 {
+		v.Animating = false
+		return
+	}
+
+	step := diff / 3
+	if step == 0 {
+		if diff > 0 {
+			step = 1
+		} else {
+			step = -1
+		}
+	}
+
+	v.ScrollRow += step
+
+	if (diff > 0 && v.ScrollRow >= v.TargetScrollRow) || (diff < 0 && v.ScrollRow <= v.TargetScrollRow) {
+		v.ScrollRow = v.TargetScrollRow
+		v.Animating = false
+	}
+}
+
 // showCursorCenter centers the cursor in the viewport both vertically and horizontally.
 func (v *View) showCursorCenter() {
-	// Center vertically, pacing the ScrollRow for animation
-	// v.ScrollRow = max(v.Cursor.Row-(v.Height/2), 0)
-	dst := max(v.Cursor.Row-(v.Height/2), 0)
-	go func() {
-		if v.ScrollRow == dst {
-			return
-		}
-		ticker := time.NewTicker(time.Second / 30) // e.g. 30 FPS for smoother animation
-		defer ticker.Stop()
-
-		for range ticker.C {
-			diff := dst - v.ScrollRow
-			if diff == 0 {
-				return
-			}
-
-			// Easing step: minimum move of 1 line in either direction
-			step := diff / 3
-			if step == 0 {
-				if diff > 0 {
-					step = 1
-				} else {
-					step = -1
-				}
-			}
-
-			v.ScrollRow += step
-
-			// Stop when target is reached or passed
-			if (diff > 0 && v.ScrollRow >= dst) || (diff < 0 && v.ScrollRow <= dst) {
-				v.ScrollRow = dst
-				return
-			}
-		}
-	}()
+	// Center vertically by setting the animation target
+	v.TargetScrollRow = max(v.Cursor.Row-(v.Height/2), 0)
+	v.Animating = (v.ScrollRow != v.TargetScrollRow)
 
 	// Center horizontally
 	if v.Width <= 0 {
