@@ -104,8 +104,8 @@ func main() {
 	}
 	defer e.Close()
 
-	// set FPS for refreshing diagnostic
-	p := kero.New(e, kero.WithAltScreen(true), kero.WithKitty(true), kero.WithFPS(3), kero.WithMouse(true))
+	// 30 FPS for smoother animation
+	p := kero.New(e, kero.WithAltScreen(true), kero.WithKitty(true), kero.WithFPS(30), kero.WithMouse(true))
 	if err := p.Run(); err != nil {
 		log.Print(err)
 	}
@@ -267,6 +267,7 @@ func (e *Editor) LastEvent() string {
 func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 	switch ev := ev.(type) {
 	case kero.TickEvent:
+		log.Printf("view scrollRow: %d", e.View().ScrollRow)
 		return nil
 	case kero.ResizeEvent:
 		_, textRect, _, _, _ := LayoutWindow(ev.Width, ev.Height, len(e.Buf().Lines), e.ref.Active)
@@ -1904,13 +1905,43 @@ func (v *View) showCursor() {
 
 // showCursorCenter centers the cursor in the viewport both vertically and horizontally.
 func (v *View) showCursorCenter() {
-	// Center vertically
-	v.ScrollRow = max(v.Cursor.Row-(v.Height/2), 0)
+	// Center vertically, pacing the ScrollRow for animation
+	// v.ScrollRow = max(v.Cursor.Row-(v.Height/2), 0)
+	dst := max(v.Cursor.Row-(v.Height/2), 0)
+	go func() {
+		if v.ScrollRow == dst {
+			return
+		}
+		ticker := time.NewTicker(time.Second / 30) // e.g. 30 FPS for smoother animation
+		defer ticker.Stop()
+
+		for range ticker.C {
+			diff := dst - v.ScrollRow
+			if diff == 0 {
+				return
+			}
+
+			// Easing step: minimum move of 1 line in either direction
+			step := diff / 3
+			if step == 0 {
+				if diff > 0 {
+					step = 1
+				} else {
+					step = -1
+				}
+			}
+
+			v.ScrollRow += step
+
+			// Stop when target is reached or passed
+			if (diff > 0 && v.ScrollRow >= dst) || (diff < 0 && v.ScrollRow <= dst) {
+				v.ScrollRow = dst
+				return
+			}
+		}
+	}()
 
 	// Center horizontally
-	// vCol := v.Buf.ByteToVisualCol(v.Cursor, tabWidth)
-	// v.ScrollCol = max(vCol-(v.Width/2), 0)
-
 	if v.Width <= 0 {
 		return
 	}
@@ -1968,7 +1999,7 @@ func (v *View) ShowCursorSmart() {
 
 	// If the jump is far outside the viewport (e.g. > 1 full viewport height), center it.
 	// Otherwise, just do standard minimal scrolling.
-	if dist > v.Height+v.Height/4 {
+	if dist > v.Height {
 		v.showCursorCenter()
 	} else {
 		v.showCursor()
