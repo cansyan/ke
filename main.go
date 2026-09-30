@@ -192,6 +192,8 @@ type Editor struct {
 	// Debouncer fields
 	changeChan chan *Buffer
 	stopChan   chan struct{}
+
+	redrawC chan struct{}
 }
 
 // NewEditor return a new editor.
@@ -200,6 +202,8 @@ func NewEditor(filePath string, row, col int) (*Editor, error) {
 	e := &Editor{
 		docVers:     make(map[string]int),
 		diagnostics: make(map[string][]lsp.Diagnostic),
+		redrawC:     make(chan struct{}, 1),
+		stopChan:    make(chan struct{}),
 	}
 
 	v, err := e.OpenFile(filePath)
@@ -228,7 +232,6 @@ func (e *Editor) startLSP(path string) error {
 	})
 	client.SendNotification("initialized", struct{}{})
 	e.changeChan = make(chan *Buffer, 100)
-	e.stopChan = make(chan struct{})
 	e.StartDebouncer()
 	return nil
 }
@@ -250,9 +253,26 @@ func (e *Editor) Buf() *Buffer {
 	return v.Buf
 }
 
+func (e *Editor) diagnosticsFor(path string) []lsp.Diagnostic {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return slices.Clone(e.diagnostics[path])
+}
+
 func (e *Editor) Init(ctx *kero.Context) error {
 	e.View().SetSize(ctx.Width, ctx.Height)
 	e.View().ShowCursorSmart()
+
+	go func() {
+		for {
+			select {
+			case <-e.stopChan:
+				return
+			case <-e.redrawC:
+				ctx.RequestFrame()
+			}
+		}
+	}()
 	return nil
 }
 
@@ -1013,7 +1033,7 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 	f.Fill(kero.Rect{W: f.Size().Width, H: f.Size().Height}, ' ', textStyle)
 
 	tabWidth := 4
-	fileDiags := e.diagnostics[e.Buf().Path]
+	fileDiags := e.diagnosticsFor(e.Buf().Path)
 	lineDiags := v.Diagnostics(fileDiags, tabWidth)
 
 	// 1. Draw Gutter
@@ -1816,10 +1836,7 @@ func (e *Editor) GotoLSPLocation(l lsp.Location) error {
 }
 
 func (e *Editor) GotoPrevDiag() {
-	diags, ok := e.diagnostics[e.Buf().Path]
-	if !ok {
-		return
-	}
+	diags := e.diagnosticsFor(e.Buf().Path)
 	if len(diags) == 0 {
 		return
 	}
@@ -1843,10 +1860,7 @@ func (e *Editor) GotoPrevDiag() {
 }
 
 func (e *Editor) GotoNextDiag() {
-	diags, ok := e.diagnostics[e.Buf().Path]
-	if !ok {
-		return
-	}
+	diags := e.diagnosticsFor(e.Buf().Path)
 	if len(diags) == 0 {
 		return
 	}
@@ -1933,7 +1947,7 @@ func (v *View) AnimateScroll() {
 		return
 	}
 
-	step := diff / 3
+	step := diff / 2
 	if step == 0 {
 		if diff > 0 {
 			step = 1
@@ -3209,17 +3223,15 @@ func (e *Editor) NotifyBufferChanged(buf *Buffer) {
 
 // Async callback triggered by readLoop when gopls pushes diagnostics
 func (e *Editor) handleDiagnostics(uri string, diags []lsp.Diagnostic) {
-	// Convert URI back to file path if needed
 	filePath := uriToPath(uri)
-
-	// Post event to TUI thread or protect map with a RWMutex
 	e.mu.Lock()
 	e.diagnostics[filePath] = diags
 	e.mu.Unlock()
 
-	// for _, d := range diags {
-	// 	log.Printf("%s:%d severity:%d %s", filePath, d.Range.Start.Line, d.Severity, d.Message)
-	// }
+	select {
+	case e.redrawC <- struct{}{}:
+	default:
+	}
 }
 
 // StartDebouncer launches the background worker goroutine.
