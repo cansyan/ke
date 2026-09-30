@@ -105,7 +105,7 @@ func main() {
 	defer e.Close()
 
 	// 30 FPS for smoother animation
-	p := kero.New(e, kero.WithAltScreen(true), kero.WithKitty(true), kero.WithFPS(30), kero.WithMouse(true))
+	p := kero.New(e, kero.WithAltScreen(true), kero.WithKitty(true), kero.WithFrameRate(30), kero.WithMouse(true))
 	if err := p.Run(); err != nil {
 		log.Print(err)
 	}
@@ -266,19 +266,26 @@ func (e *Editor) LastEvent() string {
 	return fmt.Sprintf("%T", e.lastEvent)
 }
 
+func (e *Editor) isAnimating() bool {
+	for _, v := range e.views {
+		if v.Animating {
+			return true
+		}
+	}
+	return false
+}
+
 func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 	switch ev := ev.(type) {
-	case kero.TickEvent:
+	case kero.FrameEvent:
 		for _, v := range e.views {
 			v.AnimateScroll()
 		}
-		return nil
 	case kero.ResizeEvent:
 		_, textRect, _, _, _ := LayoutWindow(ev.Width, ev.Height, len(e.Buf().Lines), e.ref.Active)
 		for _, v := range e.views {
 			v.SetSize(textRect.W, textRect.H)
 		}
-		return nil
 	case kero.PasteStartEvent:
 		e.pasting = true
 	case kero.PasteEndEvent:
@@ -289,6 +296,11 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 		e.handleKey(ctx, ev)
 	}
 	e.lastEvent = ev
+
+	if e.isAnimating() {
+		ctx.RequestFrame()
+	}
+
 	return nil
 }
 
