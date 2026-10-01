@@ -3,7 +3,7 @@ module github.com/cansyan/ke
 go 1.25.6
 
 require (
-	github.com/cansyan/kero v0.0.0-20260911103808-cbc1889e1ffb
+	github.com/cansyan/kero v0.0.0-20261001104106-c42c7ae7762a
 	github.com/mattn/go-runewidth v0.0.28
 )
 
