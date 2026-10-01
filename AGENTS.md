@@ -7,7 +7,7 @@ Important symbols in file `main.go`:
 - structure `Editor` implements the editor
 - method `Editor.Init` runs once after the terminal is ready
 - method `Editor.Update` receives events and update app state
-- method `Editor.View` draws the current state
+- method `Editor.Draw` draws the current state
 
 ## Build, Test, and Development Commands
 

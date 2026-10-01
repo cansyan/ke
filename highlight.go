@@ -77,8 +77,8 @@ func HighlightStyle(t TokenType) kero.Style {
 		return kero.Style{Fg: kero.ColorHex(Theme["builtin"]["fg"])}.Italic()
 	default:
 		return kero.Style{
-			Fg: kero.ColorHex(Theme["global"]["fg"]),
-			Bg: kero.ColorHex(Theme["global"]["bg"]),
+			Fg: kero.ColorHex(Theme["text"]["fg"]),
+			Bg: kero.ColorHex(Theme["text"]["bg"]),
 		}
 	}
 }
