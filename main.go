@@ -2020,9 +2020,11 @@ func (v *View) ShowCursorSmart() {
 	}
 
 	// Check vertical jump distance
-	dist := v.Cursor.Row - v.ScrollRow
-	if dist < 0 {
-		dist = -dist
+	var dist int
+	if v.Cursor.Row >= v.ScrollRow {
+		dist = v.Cursor.Row - v.ScrollRow
+	} else {
+		dist = v.ScrollRow + v.Height - 1 - v.Cursor.Row
 	}
 
 	// If the jump is far outside the viewport (e.g. > 1 full viewport height), center it.
