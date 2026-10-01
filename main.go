@@ -2501,6 +2501,20 @@ func (p *Palette) VisibleRows() int {
 	return min(len(p.Items), p.MaxRows)
 }
 
+// adjust scrolling offset to keep selected item visible
+func (p *Palette) showActiveItem() {
+	if p.Index < p.Offset {
+		p.Offset = p.Index
+	}
+	visibleRows := min(len(p.Items), p.MaxRows)
+	if visibleRows <= 0 {
+		visibleRows = 10 - 1
+	}
+	if p.Index > p.Offset+visibleRows-1 {
+		p.Offset = p.Index - visibleRows + 1
+	}
+}
+
 func (e *Editor) updatePalette(ev kero.KeyEvent) {
 	switch ev.String() {
 	case "esc":
@@ -2512,25 +2526,14 @@ func (e *Editor) updatePalette(ev kero.KeyEvent) {
 		}
 		e.palette.Index = (e.palette.Index + 1) % total
 		// Calculate scrolling offset to keep selected item inside dropdown viewport
-		visibleRows := e.palette.VisibleRows()
-		offset := 0
-		if e.palette.Index >= visibleRows {
-			offset = e.palette.Index - visibleRows + 1
-		}
-		e.palette.Offset = offset
+		e.palette.showActiveItem()
 	case "up", "ctrl+p":
 		total := len(e.palette.Items)
 		if total == 0 {
 			return
 		}
 		e.palette.Index = (e.palette.Index - 1 + total) % total
-		// Calculate scrolling offset to keep selected item inside dropdown viewport
-		visibleRows := e.palette.VisibleRows()
-		offset := 0
-		if e.palette.Index >= visibleRows {
-			offset = e.palette.Index - visibleRows + 1
-		}
-		e.palette.Offset = offset
+		e.palette.showActiveItem()
 	case "enter":
 		if len(e.palette.Items) > 0 && e.palette.Index < len(e.palette.Items) {
 			action := e.palette.Items[e.palette.Index].Action
