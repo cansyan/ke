@@ -104,8 +104,7 @@ func main() {
 	}
 	defer e.Close()
 
-	// 30 FPS for smoother animation
-	p := kero.New(e, kero.WithAltScreen(true), kero.WithKitty(true), kero.WithFrameRate(30), kero.WithMouse(true))
+	p := kero.New(e, kero.WithAltScreen(true), kero.WithKitty(true), kero.WithMouse(true))
 	if err := p.Run(); err != nil {
 		log.Print(err)
 	}
@@ -269,7 +268,7 @@ func (e *Editor) Init(ctx *kero.Context) error {
 			case <-e.stopChan:
 				return
 			case <-e.redrawC:
-				ctx.RequestFrame()
+				ctx.RequestFrame(30)
 			}
 		}
 	}()
@@ -318,7 +317,7 @@ func (e *Editor) Update(ctx *kero.Context, ev kero.Event) error {
 	e.lastEvent = ev
 
 	if e.isAnimating() {
-		ctx.RequestFrame()
+		ctx.RequestFrame(60)
 	}
 
 	return nil
@@ -2501,10 +2500,10 @@ func (p *Palette) VisibleRows() int {
 }
 
 func (e *Editor) updatePalette(ev kero.KeyEvent) {
-	switch ev.Key {
-	case kero.KeyEsc:
+	switch ev.String() {
+	case "esc":
 		e.palette.Close()
-	case kero.KeyDown:
+	case "down", "ctrl+n":
 		total := len(e.palette.Items)
 		if total == 0 {
 			return
@@ -2517,7 +2516,7 @@ func (e *Editor) updatePalette(ev kero.KeyEvent) {
 			offset = e.palette.Index - visibleRows + 1
 		}
 		e.palette.Offset = offset
-	case kero.KeyUp:
+	case "up", "ctrl+p":
 		total := len(e.palette.Items)
 		if total == 0 {
 			return
@@ -2530,7 +2529,7 @@ func (e *Editor) updatePalette(ev kero.KeyEvent) {
 			offset = e.palette.Index - visibleRows + 1
 		}
 		e.palette.Offset = offset
-	case kero.KeyEnter:
+	case "enter":
 		if len(e.palette.Items) > 0 && e.palette.Index < len(e.palette.Items) {
 			action := e.palette.Items[e.palette.Index].Action
 			e.palette.Close()
