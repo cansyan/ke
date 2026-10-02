@@ -1,5 +1,5 @@
-github.com/cansyan/kero v0.0.0-20261001104106-c42c7ae7762a h1:3KDUsituCSsGKbrmM1IF7XqeaZogkN4+Qc2u6eFu0MU=
-github.com/cansyan/kero v0.0.0-20261001104106-c42c7ae7762a/go.mod h1:gfZBG/U8QMGdJ3VtA0Y2X2CKH5j0b0nhYK95u1NoGBA=
+github.com/cansyan/kero v0.0.0-20261002025018-90258684aa2e h1:ygx1LT7S/GAQbIwT4jNc268C1FYqpz0FRKgxS/15NV0=
+github.com/cansyan/kero v0.0.0-20261002025018-90258684aa2e/go.mod h1:gfZBG/U8QMGdJ3VtA0Y2X2CKH5j0b0nhYK95u1NoGBA=
 github.com/clipperhouse/uax29/v2 v2.2.0 h1:ChwIKnQN3kcZteTXMgb1wztSgaU+ZemkgWdohwgs8tY=
 github.com/clipperhouse/uax29/v2 v2.2.0/go.mod h1:EFJ2TJMRUaplDxHKj1qAEhCtQPW2tJSwu5BF98AuoVM=
 github.com/mattn/go-runewidth v0.0.28 h1:rPyg2ybwEKPebvpzVWe1gKBkH8EQFkxO4Y0hjBeLaBU=
