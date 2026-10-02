@@ -250,8 +250,10 @@ func (e *Editor) Buf() *Buffer {
 }
 
 func (e *Editor) Init(ctx *kero.Context) error {
-	e.View().SetSize(ctx.Width, ctx.Height)
-	e.View().ShowCursorSmart()
+	v := e.View()
+	_, textRect, _, _, _ := LayoutWindow(ctx.Width, ctx.Height, len(v.Buf.Lines), false)
+	v.SetSize(textRect.W, textRect.H)
+	v.showCursor()
 	e.kctx = ctx
 	return nil
 }
@@ -651,6 +653,15 @@ func (e *Editor) handleKey(ctx *kero.Context, key kero.KeyEvent) error {
 				return nil
 			}
 			v.Cursor = buf.Delete(v.Cursor, buf.LineEnd(v.Cursor))
+			e.markDirty()
+			return nil
+		case "ctrl+shift+k":
+			if e.hasSelect() {
+				e.deleteSelect()
+				return nil
+			}
+			// delete whole line
+			v.Cursor = buf.Delete(Position{Row: v.Cursor.Row}, Position{Row: v.Cursor.Row + 1})
 			e.markDirty()
 			return nil
 		case "ctrl+a":

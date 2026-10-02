@@ -25,6 +25,7 @@ Key bindings:
 - Ctrl+Shift+R workspace symbol picker
 - Ctrl+Backspace delete to line start
 - Ctrl+K delete to line end
+- Ctrl+Shift+K delete whole line
 - Ctrl+Enter insert newline below
 - Shift+Enter insert newline above
 - Ctrl+A or Home move cursor to line start
