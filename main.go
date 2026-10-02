@@ -14,7 +14,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -186,13 +185,12 @@ type Editor struct {
 
 	// Diagnostics storage for UI rendering: filePath -> diagnostics list
 	diagnostics map[string][]lsp.Diagnostic
-	mu          sync.RWMutex
 
 	// Debouncer fields
 	changeChan chan *Buffer
 	stopChan   chan struct{}
 
-	redrawC chan struct{}
+	kctx *kero.Context
 }
 
 // NewEditor return a new editor.
@@ -201,7 +199,6 @@ func NewEditor(filePath string, row, col int) (*Editor, error) {
 	e := &Editor{
 		docVers:     make(map[string]int),
 		diagnostics: make(map[string][]lsp.Diagnostic),
-		redrawC:     make(chan struct{}, 1),
 		stopChan:    make(chan struct{}),
 	}
 
@@ -252,26 +249,10 @@ func (e *Editor) Buf() *Buffer {
 	return v.Buf
 }
 
-func (e *Editor) diagnosticsFor(path string) []lsp.Diagnostic {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
-	return slices.Clone(e.diagnostics[path])
-}
-
 func (e *Editor) Init(ctx *kero.Context) error {
 	e.View().SetSize(ctx.Width, ctx.Height)
 	e.View().ShowCursorSmart()
-
-	go func() {
-		for {
-			select {
-			case <-e.stopChan:
-				return
-			case <-e.redrawC:
-				ctx.RequestFrame(30)
-			}
-		}
-	}()
+	e.kctx = ctx
 	return nil
 }
 
@@ -1032,7 +1013,7 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 	f.Fill(kero.Rect{W: f.Size().Width, H: f.Size().Height}, ' ', textStyle)
 
 	tabWidth := 4
-	fileDiags := e.diagnosticsFor(e.Buf().Path)
+	fileDiags := e.diagnostics[e.Buf().Path]
 	lineDiags := v.Diagnostics(fileDiags, tabWidth)
 
 	// 1. Draw Gutter
@@ -1835,7 +1816,7 @@ func (e *Editor) GotoLSPLocation(l lsp.Location) error {
 }
 
 func (e *Editor) GotoPrevDiag() {
-	diags := e.diagnosticsFor(e.Buf().Path)
+	diags := e.diagnostics[e.Buf().Path]
 	if len(diags) == 0 {
 		return
 	}
@@ -1859,7 +1840,7 @@ func (e *Editor) GotoPrevDiag() {
 }
 
 func (e *Editor) GotoNextDiag() {
-	diags := e.diagnosticsFor(e.Buf().Path)
+	diags := e.diagnostics[e.Buf().Path]
 	if len(diags) == 0 {
 		return
 	}
@@ -3227,15 +3208,11 @@ func (e *Editor) NotifyBufferChanged(buf *Buffer) {
 
 // Async callback triggered by readLoop when gopls pushes diagnostics
 func (e *Editor) handleDiagnostics(uri string, diags []lsp.Diagnostic) {
-	filePath := uriToPath(uri)
-	e.mu.Lock()
-	e.diagnostics[filePath] = diags
-	e.mu.Unlock()
-
-	select {
-	case e.redrawC <- struct{}{}:
-	default:
-	}
+	e.kctx.Post(func(ctx *kero.Context) {
+		filePath := uriToPath(uri)
+		// will run on event loop, no need to lock.
+		e.diagnostics[filePath] = diags
+	})
 }
 
 // StartDebouncer launches the background worker goroutine.
