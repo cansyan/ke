@@ -321,7 +321,7 @@ func mouseToPosition(v *View, textRect kero.Rect, m kero.MouseEvent) Position {
 
 func (e *Editor) handleMouse(ctx *kero.Context, m kero.MouseEvent) error {
 	_, textRect, refRect, _, statusBar := LayoutWindow(ctx.Width, ctx.Height, len(e.Buf().Lines), e.ref.Active)
-	paletteRect := LayoutPalatte(ctx.Width, ctx.Height, e.palette.VisibleRows()+1)
+	paletteRect := LayoutPalette(ctx.Width, ctx.Height, e.palette.VisibleRows()+1)
 	point := kero.Point{X: m.X, Y: m.Y}
 
 	if e.menu.Active {
@@ -968,11 +968,12 @@ func gutterWidth(lines int) int {
 const bottomPanelH = 10
 
 // LayoutWindow splits a total available screen Rect into component Rects.
-func LayoutWindow(totalWidth, totalHeight, lineCount int, showBottomPanel bool) (gutterRect, textRect, bottomPanelRect, msgRect, statusRect kero.Rect) {
+func LayoutWindow(totalWidth, totalHeight, lineCount int, bottomPanel bool) (gutterRect, textRect, bottomPanelRect, msgRect, statusRect kero.Rect) {
 	remaining := kero.Rect{W: totalWidth, H: totalHeight}
 
 	remaining, statusRect = kero.SplitHorizontal(remaining, remaining.H-1)
-	if !showBottomPanel {
+	// bottom panel covers message bar
+	if !bottomPanel {
 		remaining, msgRect = kero.SplitHorizontal(remaining, remaining.H-1)
 	} else {
 		remaining, bottomPanelRect = kero.SplitHorizontal(remaining, remaining.H-bottomPanelH)
@@ -984,12 +985,17 @@ func LayoutWindow(totalWidth, totalHeight, lineCount int, showBottomPanel bool) 
 	return gutterRect, textRect, bottomPanelRect, msgRect, statusRect
 }
 
-func LayoutPalatte(totalWidth, totalHeight, paletteHeight int) kero.Rect {
-	rect := kero.Rect{X: (totalWidth - 60) / 2, Y: 2, W: 60, H: paletteHeight}
+func LayoutPalette(totalWidth, totalHeight, paletteHeight int) kero.Rect {
+	rect := kero.Rect{Y: 2, W: 60}
+	rect.X = (totalWidth - 60) / 2
 	if rect.X <= 0 {
 		rect.X = totalWidth / 4
 		rect.W = totalWidth / 2
 	}
+	if paletteHeight > totalHeight-rect.Y {
+		paletteHeight = totalHeight - rect.Y
+	}
+	rect.H = paletteHeight
 	return rect
 }
 
@@ -999,10 +1005,6 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 		Bg: kero.ColorHex(Theme["text"]["bg"]),
 	}
 	reverse := kero.Style{Fg: textStyle.Bg, Bg: textStyle.Fg}
-	if reverse.Bg == textStyle.Bg {
-		// flip the Attr for default theme
-		reverse = reverse.Reverse()
-	}
 	statusStyle := kero.Style{Fg: kero.ColorHex(Theme["status"]["fg"]), Bg: kero.ColorHex(Theme["status"]["bg"])}
 	cursorStyle := kero.Style{
 		Fg: kero.ColorHex(Theme["cursor"]["fg"]),
@@ -1153,12 +1155,7 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 					charStyle = charStyle.Underline()
 				}
 
-				// 3. Override with find match
-				if e.find.Active && lineIdx == e.find.MatchStart.Row && byteIdx >= e.find.MatchStart.Col && byteIdx < e.find.MatchEnd.Col {
-					charStyle = searchMatch
-				}
-
-				// 4. Override with Selection Style (highest priority)
+				// 3. Override with Selection Style
 				if selStartCol != -1 && byteIdx >= selStartCol && byteIdx < selEndCol {
 					charStyle = charStyle.Background(selectionBG)
 
@@ -1170,6 +1167,11 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 							f.Set(screenX+1+i, y, ' ', charStyle)
 						}
 					}
+				}
+
+				// 4. Override with find match
+				if e.find.Active && lineIdx == e.find.MatchStart.Row && byteIdx >= e.find.MatchStart.Col && byteIdx < e.find.MatchEnd.Col {
+					charStyle = searchMatch
 				}
 
 				f.Set(screenX, y, r, charStyle)
@@ -1270,7 +1272,7 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 		e.drawCompletion(f, reverse)
 	}
 	if e.palette.Active {
-		e.drawPalette(f, LayoutPalatte(fSize.Width, fSize.Height, e.palette.VisibleRows()+1), reverse)
+		e.drawPalette(f, LayoutPalette(fSize.Width, fSize.Height, e.palette.VisibleRows()+1), reverse)
 	}
 	if e.menu.Active {
 		e.drawMenu(f, reverse)
@@ -1278,15 +1280,16 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 }
 
 func (e *Editor) selectLine() {
-	if !e.View().Selecting {
-		e.View().Selecting = true
-		e.View().SelAnchor = Position{Row: e.View().Cursor.Row, Col: 0}
+	v := e.View()
+	if !v.Selecting {
+		v.Selecting = true
+		v.SelAnchor = Position{Row: v.Cursor.Row, Col: 0}
 	}
-	if e.View().Cursor.Row < len(e.Buf().Lines)-1 {
-		e.View().Cursor.Row++
-		e.View().Cursor.Col = 0
+	if v.Cursor.Row < len(e.Buf().Lines)-1 {
+		v.Cursor.Row++
+		v.Cursor.Col = 0
 	} else {
-		e.View().Cursor = e.Buf().LineEnd(e.View().Cursor)
+		v.Cursor = e.Buf().LineEnd(v.Cursor)
 	}
 }
 
@@ -1295,7 +1298,8 @@ func isWordChar(r rune) bool {
 }
 
 func (e *Editor) hasSelect() bool {
-	return e.View().Selecting && e.View().SelAnchor != e.View().Cursor
+	v := e.View()
+	return v.Selecting && v.SelAnchor != v.Cursor
 }
 
 func (e *Editor) clearSelect() {
@@ -1303,13 +1307,14 @@ func (e *Editor) clearSelect() {
 }
 
 func (e *Editor) copy() {
+	v := e.View()
 	if e.hasSelect() {
-		e.clipboard = e.Buf().TextRange(e.View().SelAnchor, e.View().Cursor)
+		e.clipboard = v.Buf.TextRange(v.SelAnchor, v.Cursor)
 		e.clipIsLine = false
 		return
 	}
 	// copy entire current line, remember it's a line copy
-	e.clipboard = string(e.Buf().Lines[e.View().Cursor.Row])
+	e.clipboard = string(v.Buf.Lines[v.Cursor.Row])
 	e.clipIsLine = true
 }
 
@@ -1318,7 +1323,8 @@ func (e *Editor) indentSelect() {
 		return
 	}
 
-	start, end := orderPos(e.View().SelAnchor, e.View().Cursor)
+	v := e.View()
+	start, end := orderPos(v.SelAnchor, v.Cursor)
 	if start.Row == end.Row {
 		return
 	}
@@ -1327,13 +1333,13 @@ func (e *Editor) indentSelect() {
 		lastRow = end.Row - 1
 	}
 	for r := start.Row; r <= lastRow; r++ {
-		e.Buf().Insert(Position{Row: r, Col: 0}, "\t")
+		v.Buf.Insert(Position{Row: r, Col: 0}, "\t")
 	}
-	if start.Row <= e.View().SelAnchor.Row && e.View().SelAnchor.Row <= lastRow {
-		e.View().SelAnchor.Col++
+	if start.Row <= v.SelAnchor.Row && v.SelAnchor.Row <= lastRow {
+		v.SelAnchor.Col++
 	}
-	if start.Row <= e.View().Cursor.Row && e.View().Cursor.Row <= lastRow {
-		e.View().Cursor.Col++
+	if start.Row <= v.Cursor.Row && v.Cursor.Row <= lastRow {
+		v.Cursor.Col++
 	}
 	e.markDirty()
 }
@@ -1554,7 +1560,12 @@ func (e *Editor) startFind() {
 	e.find.Blur = false
 	e.find.Replacing = false
 	if e.hasSelect() {
-		e.find.Input.SetTextAndSelectAll(e.Buf().TextRange(e.View().SelAnchor, e.View().Cursor))
+		start, end := orderPos(e.View().SelAnchor, e.View().Cursor)
+		query := e.Buf().TextRange(start, end)
+		e.find.Input.SetTextAndSelectAll(query)
+		e.find.Match = true
+		e.find.MatchStart = start
+		e.find.MatchEnd = end
 		return
 	}
 	if e.find.Input.String() != "" {
@@ -1607,59 +1618,13 @@ func (e *Editor) updateFind(ev kero.KeyEvent) error {
 		e.find.Active = false
 		return nil
 	case kero.KeyEnter:
-		query := e.find.Input.String()
-		if query == "" {
-			return nil
-		}
-		ignoreCase := findQueryIgnoreCase(query)
-
-		if ev.Mod&kero.ModShift != 0 {
-			if ignoreCase {
-				if start, end, ok := e.Buf().FindPrevIgnoreCase(query, e.View().Cursor); ok {
-					e.find.Match = true
-					e.find.MatchStart = start
-					e.find.MatchEnd = end
-					e.View().Cursor = start
-					e.clearSelect()
-				}
-			} else {
-				if start, end, ok := e.Buf().FindPrev(query, e.View().Cursor); ok {
-					e.find.Match = true
-					e.find.MatchStart = start
-					e.find.MatchEnd = end
-					e.View().Cursor = start
-					e.clearSelect()
-				}
-			}
-			return nil
-		}
-
-		if ignoreCase {
-			start, end, ok := e.Buf().FindNextIgnoreCase(query, e.View().Cursor)
-			if ok {
-				e.find.Match = true
-				e.find.MatchStart = start
-				e.find.MatchEnd = end
-				e.View().Cursor = end
-				e.clearSelect()
-			}
-		} else {
-			start, end, ok := e.Buf().FindNext(query, e.View().Cursor)
-			if ok {
-				e.find.Match = true
-				e.find.MatchStart = start
-				e.find.MatchEnd = end
-				e.View().Cursor = end
-				e.clearSelect()
-			}
-		}
+		backward := ev.Mod&kero.ModShift != 0
+		e.findMatch(e.View().Cursor, backward)
 		return nil
 	}
 
 	e.find.Match = false
 	e.find.Input.Update(ev)
-	// this tidy editor hasn't implemented Go Back/Forward,
-	// don't jump to the first match on typing
 	return nil
 }
 
@@ -1683,32 +1648,69 @@ func (e *Editor) drawFind(f *kero.Frame, rect kero.Rect, style kero.Style) {
 	}
 }
 
-func (e *Editor) skipFindMatch() {
+func (e *Editor) findMatch(from Position, backward bool) bool {
 	query := e.find.Input.String()
 	if query == "" {
-		return
-	}
-	from := e.View().Cursor
-	if e.find.Match {
-		from = e.find.MatchEnd
+		e.find.Match = false
+		return false
 	}
 	ignoreCase := findQueryIgnoreCase(query)
 	var start, end Position
 	var ok bool
-	if ignoreCase {
-		start, end, ok = e.Buf().FindNextIgnoreCase(query, from)
+	if backward {
+		if ignoreCase {
+			start, end, ok = e.Buf().FindPrevIgnoreCase(query, from)
+		} else {
+			start, end, ok = e.Buf().FindPrev(query, from)
+		}
 	} else {
-		start, end, ok = e.Buf().FindNext(query, from)
+		if ignoreCase {
+			start, end, ok = e.Buf().FindNextIgnoreCase(query, from)
+		} else {
+			start, end, ok = e.Buf().FindNext(query, from)
+		}
 	}
 	if !ok {
 		e.find.Match = false
-		return
+		return false
 	}
 	e.find.Match = true
 	e.find.MatchStart = start
 	e.find.MatchEnd = end
 	e.View().Cursor = end
+	if backward {
+		e.View().Cursor = start
+	}
 	e.clearSelect()
+	return true
+}
+
+func (e *Editor) skipFindMatch() {
+	e.findMatch(e.View().Cursor, false)
+}
+
+func (e *Editor) isMatchValid() bool {
+	if !e.find.Match {
+		return false
+	}
+	query := e.find.Input.String()
+	if query == "" {
+		return false
+	}
+	buf := e.Buf()
+	start := e.find.MatchStart
+	end := e.find.MatchEnd
+	if start != buf.Clamp(start) || end != buf.Clamp(end) {
+		return false
+	}
+	if start.Row > end.Row || (start.Row == end.Row && start.Col > end.Col) {
+		return false
+	}
+	text := buf.TextRange(start, end)
+	if findQueryIgnoreCase(query) {
+		return strings.EqualFold(text, query)
+	}
+	return text == query
 }
 
 func (e *Editor) replaceCurrent() error {
@@ -1716,22 +1718,22 @@ func (e *Editor) replaceCurrent() error {
 	if query == "" {
 		return nil
 	}
-	if !e.find.Match {
-		e.skipFindMatch()
-	}
-	if !e.find.Match {
-		return nil
+	if !e.isMatchValid() {
+		from := e.View().Cursor
+		if e.hasSelect() {
+			from, _ = orderPos(e.View().SelAnchor, e.View().Cursor)
+		}
+		if !e.findMatch(from, false) {
+			return nil
+		}
 	}
 
 	replacedEnd := e.Buf().ReplaceRange(e.find.MatchStart, e.find.MatchEnd, e.find.ReplaceInput.String())
 	e.markDirty()
 	e.View().Cursor = replacedEnd
 	e.find.Match = false
-	if e.find.ReplaceInput.String() == query && replacedEnd.Col < e.Buf().LineEnd(replacedEnd).Col {
-		replacedEnd.Col++
-		e.View().Cursor = replacedEnd
-	}
-	e.skipFindMatch()
+
+	e.findMatch(replacedEnd, false)
 	return nil
 }
 

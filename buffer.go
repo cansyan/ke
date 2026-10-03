@@ -83,14 +83,7 @@ func (b *Buffer) insert(p Position, text string) Position {
 }
 
 func (b *Buffer) ReplaceRange(start, end Position, newText string) Position {
-	// Boundary safety checks
-	if start.Row < 0 || start.Row >= len(b.Lines) {
-		return start
-	}
-	if end.Row >= len(b.Lines) {
-		end.Row = len(b.Lines) - 1
-		end.Col = len(b.Lines[end.Row])
-	}
+	start, end = orderPos(b.Clamp(start), b.Clamp(end))
 	b.recordEdit(start, end, newText)
 	return b.replaceRange(start, end, newText)
 }
@@ -107,7 +100,7 @@ func (b *Buffer) replaceRange(start, end Position, newText string) Position {
 	// 3. inline replace, return early
 	if start.Row == end.Row && len(newLines) == 1 {
 		b.Lines[start.Row] = newLines[0]
-		return Position{Row: start.Row, Col: start.Col + len([]rune(newText))}
+		return Position{Row: start.Row, Col: start.Col + len(newText)}
 	}
 
 	// 4. Splice newLines into b.Lines slice, replacing range [startLine : endLine+1]
@@ -310,7 +303,8 @@ func (b *Buffer) findNext(query string, from Position, ignoreCase bool) (start, 
 			targetLine = line[searchFromCol:]
 		} else if row == startRow {
 			// come back to beginning , search only before 'from.Col'
-			targetLine = line[searchFromCol:from.Col]
+			searchToCol := min(max(from.Col, 0), len(line))
+			targetLine = line[searchFromCol:searchToCol]
 		} else {
 			targetLine = line
 		}
@@ -393,8 +387,8 @@ func (b *Buffer) findPrev(query string, from Position, ignoreCase bool) (start, 
 			targetLine = line[:searchToCol]
 		} else if row == startRow {
 			// come back to beginning , search only AFTER from.Col
-			targetLine = line[from.Col:]
-			searchFromCol = from.Col
+			searchFromCol = min(max(from.Col, 0), len(line))
+			targetLine = line[searchFromCol:]
 		} else {
 			targetLine = line
 		}

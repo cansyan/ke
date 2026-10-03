@@ -323,6 +323,73 @@ func TestReplaceAll(t *testing.T) {
 	}
 }
 
+func TestReplaceCurrentStaleMatch(t *testing.T) {
+	buf := NewBuffer("", []byte("a"))
+	v := &View{Buf: buf}
+	v.Cursor = Position{Row: 0, Col: 0}
+	ed := &Editor{
+		views: []*View{v},
+	}
+	ed.startFind()
+	ed.find.Input.SetText("longtext")
+	ed.find.Replacing = true
+	ed.find.ReplaceInput.SetText("sub")
+	// Simulate stale match info pointing past buffer line end
+	ed.find.Match = true
+	ed.find.MatchStart = Position{Row: 0, Col: 0}
+	ed.find.MatchEnd = Position{Row: 0, Col: 8}
+
+	// updateFind Enter should re-verify match, skip/fail safely without panic
+	err := ed.updateFind(kero.KeyEvent{Key: kero.KeyEnter})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestReplaceCurrentSelectedWord(t *testing.T) {
+	buf := NewBuffer("", []byte("hello world hello"))
+	v := &View{Buf: buf}
+	v.Cursor = Position{Row: 0, Col: 0}
+	ed := &Editor{
+		views: []*View{v},
+	}
+	// Select "hello"
+	if start, end := buf.WordBounds(v.Cursor); start != end {
+		v.Selecting = true
+		v.SelAnchor = start
+		v.Cursor = end
+	}
+	if !v.Selecting || string(buf.TextRange(v.SelAnchor, v.Cursor)) != "hello" {
+		t.Fatalf("expected 'hello' selected, got %q", buf.TextRange(v.SelAnchor, v.Cursor))
+	}
+
+	// Press Ctrl+F -> startFind pre-fills "hello" and marks match
+	ed.startFind()
+	if ed.find.Input.String() != "hello" {
+		t.Fatalf("expected find input 'hello', got %q", ed.find.Input.String())
+	}
+
+	// Press Ctrl+R -> enable replace, set replacement to "hi"
+	ed.updateFind(kero.KeyEvent{Key: kero.KeyRune, Rune: 'r', Mod: kero.ModCtrl})
+	ed.find.ReplaceInput.SetText("hi")
+
+	// Press Enter to replace selected word
+	err := ed.updateFind(kero.KeyEvent{Key: kero.KeyEnter})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// First word should be replaced with "hi"
+	if got := string(buf.Lines[0]); got != "hi world hello" {
+		t.Fatalf("after replace selected word = %q, want %q", got, "hi world hello")
+	}
+
+	// Next match should be found at the second "hello"
+	if !ed.find.Match || ed.find.MatchStart.Col != 9 {
+		t.Fatalf("expected next match at col 9, got %+v", ed.find.MatchStart)
+	}
+}
+
 func TestDrawCompletion_SmartPosition(t *testing.T) {
 	lines := make([]byte, 0)
 	for i := range 30 {
