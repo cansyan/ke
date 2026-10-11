@@ -6,40 +6,65 @@ import (
 	"github.com/cansyan/kero"
 )
 
-var (
-	Theme = Dark
-	Dark  = map[string]map[string]string{
-		"text":      {"fg": "#D8DEE9", "bg": "#292A2F"}, // white, dark
-		"cursor":    {"fg": "#1E1E1E", "bg": "#fac863"}, // dark, orange
-		"status":    {"fg": "#292A2F", "bg": "#D8DEE9"}, // dark, white
-		"search":    {"fg": "#000000", "bg": "#E5C07B"}, // dark, yellow
-		"selection": {"bg": "#424453"},                  // blue
+type Theme struct {
+	// UI
+	Foreground  string
+	Background  string
+	Cursor      string
+	CursorBG    string
+	Status      string
+	StatusBG    string
+	Search      string
+	SearchBG    string
+	SelectionBG string
 
-		// syntax highlight
-		"keyword": {"fg": "#c594c5"}, // soft Purple
-		"type":    {"fg": "#6598CA"}, // blue
-		"string":  {"fg": "#99c794"}, // green
-		"comment": {"fg": "#a7adba"}, // blue
-		"number":  {"fg": "#fac863"}, // orange
-		"builtin": {"fg": "#F97B58"}, // red
-	}
+	// syntax highlight
+	Keyword string
+	Type    string
+	String  string
+	Comment string
+	Number  string
+	Builtin string
+}
 
-	Mariana = map[string]map[string]string{
-		"text":      {"fg": "#D8DEE9", "bg": "#303841"}, // white, blue
-		"cursor":    {"fg": "#000000", "bg": "#fac863"}, // black, orange
-		"status":    {"fg": "#303841", "bg": "#D8DEE9"}, // blue, white
-		"search":    {"fg": "#000000", "bg": "#E5C07B"}, // dark, yellow
-		"selection": {"bg": "#4e5a65"},                  // blue
+var themes = map[string]Theme{
+	"dark": {
+		Foreground:  "#D8DEE9",
+		Background:  "#292A2F",
+		Cursor:      "#1E1E1E",
+		CursorBG:    "#fac863",
+		Status:      "#292A2F",
+		StatusBG:    "#D8DEE9",
+		Search:      "#000000",
+		SearchBG:    "#E5C07B",
+		SelectionBG: "#424453",
+		Keyword:     "#c594c5", // soft Purple
+		Type:        "#6598CA", // blue
+		String:      "#99c794", // green
+		Comment:     "#a7adba", // blue
+		Number:      "#fac863", // orange
+		Builtin:     "#F97B58", // red
+	},
+	"mariana": {
+		Foreground:  "#D8DEE9",
+		Background:  "#303841",
+		Cursor:      "#000000",
+		CursorBG:    "#fac863",
+		Status:      "#303841",
+		StatusBG:    "#D8DEE9",
+		Search:      "#000000",
+		SearchBG:    "#E5C07B",
+		SelectionBG: "#4e5a65",
+		Keyword:     "#c594c5", // soft Purple
+		Type:        "#6598CA", // blue
+		String:      "#99c794", // green
+		Comment:     "#a7adba", // blue
+		Number:      "#fac863", // orange
+		Builtin:     "#F97B58", // red
+	},
+}
 
-		// syntax highlight
-		"keyword": {"fg": "#c594c5"}, // soft Purple
-		"type":    {"fg": "#6598CA"}, // blue
-		"string":  {"fg": "#99c794"}, // green
-		"comment": {"fg": "#a7adba"}, // blue
-		"number":  {"fg": "#fac863"}, // orange
-		"builtin": {"fg": "#F97B58"}, // red
-	}
-)
+var theme = themes["dark"]
 
 type TokenType int
 
@@ -61,24 +86,24 @@ type HLToken struct {
 }
 
 // HighlightStyle returns the highlight style for the given token type.
-func HighlightStyle(t TokenType) kero.Style {
+func HighlightStyle(t TokenType, theme Theme) kero.Style {
 	switch t {
 	case TokKeyword:
-		return kero.Style{Fg: kero.ColorHex(Theme["keyword"]["fg"])}.Italic()
+		return kero.Style{Fg: kero.ColorHex(theme.Keyword)}.Italic()
 	case TokType:
-		return kero.Style{Fg: kero.ColorHex(Theme["type"]["fg"])}
+		return kero.Style{Fg: kero.ColorHex(theme.Type)}
 	case TokString:
-		return kero.Style{Fg: kero.ColorHex(Theme["string"]["fg"])}
+		return kero.Style{Fg: kero.ColorHex(theme.String)}
 	case TokComment:
-		return kero.Style{Fg: kero.ColorHex(Theme["comment"]["fg"])}
+		return kero.Style{Fg: kero.ColorHex(theme.Comment)}
 	case TokNumber:
-		return kero.Style{Fg: kero.ColorHex(Theme["number"]["fg"])}
+		return kero.Style{Fg: kero.ColorHex(theme.Number)}
 	case TokBuiltin:
-		return kero.Style{Fg: kero.ColorHex(Theme["builtin"]["fg"])}.Italic()
+		return kero.Style{Fg: kero.ColorHex(theme.Builtin)}.Italic()
 	default:
 		return kero.Style{
-			Fg: kero.ColorHex(Theme["text"]["fg"]),
-			Bg: kero.ColorHex(Theme["text"]["bg"]),
+			Fg: kero.ColorHex(theme.Foreground),
+			Bg: kero.ColorHex(theme.Background),
 		}
 	}
 }

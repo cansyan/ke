@@ -1001,19 +1001,19 @@ func LayoutPalette(totalWidth, totalHeight, paletteHeight int) kero.Rect {
 
 func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 	textStyle := kero.Style{
-		Fg: kero.ColorHex(Theme["text"]["fg"]),
-		Bg: kero.ColorHex(Theme["text"]["bg"]),
+		Fg: kero.ColorHex(theme.Foreground),
+		Bg: kero.ColorHex(theme.Background),
 	}
 	reverse := kero.Style{Fg: textStyle.Bg, Bg: textStyle.Fg}
-	statusStyle := kero.Style{Fg: kero.ColorHex(Theme["status"]["fg"]), Bg: kero.ColorHex(Theme["status"]["bg"])}
+	statusStyle := kero.Style{Fg: kero.ColorHex(theme.Status), Bg: kero.ColorHex(theme.StatusBG)}
 	cursorStyle := kero.Style{
-		Fg: kero.ColorHex(Theme["cursor"]["fg"]),
-		Bg: kero.ColorHex(Theme["cursor"]["bg"]),
+		Fg: kero.ColorHex(theme.Cursor),
+		Bg: kero.ColorHex(theme.CursorBG),
 	}
-	selectionBG := kero.ColorHex(Theme["selection"]["bg"])
+	selectionBG := kero.ColorHex(theme.SelectionBG)
 	searchMatch := kero.Style{
-		Fg:   kero.ColorHex(Theme["search"]["fg"]),
-		Bg:   kero.ColorHex(Theme["search"]["bg"]),
+		Fg:   kero.ColorHex(theme.Search),
+		Bg:   kero.ColorHex(theme.SearchBG),
 		Attr: kero.AttrBold,
 	}
 	messageStyle := textStyle
@@ -1137,7 +1137,7 @@ func (e *Editor) Draw(ctx *kero.Context, f *kero.Frame) {
 					if byteIdx < t.StartCol || byteIdx >= t.EndCol {
 						continue
 					}
-					charStyle = HighlightStyle(t.Type).Background(charStyle.Bg)
+					charStyle = HighlightStyle(t.Type, theme).Background(charStyle.Bg)
 
 					// underline the same appearance
 					if !isWordChar(r) || t.Type == TokKeyword || t.Type == TokComment {
@@ -2388,10 +2388,10 @@ func (p *Palette) commandItems(_ *Editor, query string) []PaletteItem {
 	}{
 		// use readable name for cmd, easy to search
 		{"color theme: Dark", "", func(e *Editor) {
-			Theme = Dark
+			theme = themes["dark"]
 		}},
 		{"color theme: Mariana", "", func(e *Editor) {
-			Theme = Mariana
+			theme = themes["mariana"]
 		}},
 		{"jump back", "ctrl+-", func(e *Editor) {
 			e.JumpBack()
