@@ -21,14 +21,27 @@ func TestTextInputUpdate(t *testing.T) {
 	}
 }
 
-func TestTextInputDrawCursorAtEnd(t *testing.T) {
+func TestTextInputDrawWideCharacters(t *testing.T) {
 	var input TextInput
-	input.SetText("hi")
-	f := kero.NewFrame(4, 1)
+	input.SetText("世界")
+	f := kero.NewFrame(6, 1)
 
-	input.Draw(&f, kero.Rect{X: 0, Y: 0, W: 4, H: 1}, kero.NewStyle())
+	input.Draw(&f, kero.Rect{X: 0, Y: 0, W: 6, H: 1}, kero.NewStyle())
 
-	cell := f.Cell(2, 0)
+	if got := f.Cell(0, 0).Ch; got != '世' {
+		t.Fatalf("cell(0,0) = %q, want '世'", got)
+	}
+	if got := f.Cell(1, 0).Ch; got != kero.Continuation {
+		t.Fatalf("cell(1,0) = %v, want Continuation", got)
+	}
+	if got := f.Cell(2, 0).Ch; got != '界' {
+		t.Fatalf("cell(2,0) = %q, want '界'", got)
+	}
+	if got := f.Cell(3, 0).Ch; got != kero.Continuation {
+		t.Fatalf("cell(3,0) = %v, want Continuation", got)
+	}
+	// Cursor at end of "世界" should be at visual column 4
+	cell := f.Cell(4, 0)
 	if cell.Ch != ' ' {
 		t.Fatalf("cursor cell = %q, want space", cell.Ch)
 	}

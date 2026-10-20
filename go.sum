@@ -1,6 +1,6 @@
-github.com/cansyan/kero v0.0.0-20261002025018-90258684aa2e h1:ygx1LT7S/GAQbIwT4jNc268C1FYqpz0FRKgxS/15NV0=
-github.com/cansyan/kero v0.0.0-20261002025018-90258684aa2e/go.mod h1:gfZBG/U8QMGdJ3VtA0Y2X2CKH5j0b0nhYK95u1NoGBA=
+github.com/cansyan/kero v0.0.0-20261020093845-3aff1feec74d h1:/lISF6KdtvZGGO5uUwFGUsl9nxzzCuiwFpMLcM87g/Q=
+github.com/cansyan/kero v0.0.0-20261020093845-3aff1feec74d/go.mod h1:mKRuBgQlT9b3dqw4FEC2eFoq497BNQwPkAE2s3OlfL8=
 github.com/clipperhouse/uax29/v2 v2.2.0 h1:ChwIKnQN3kcZteTXMgb1wztSgaU+ZemkgWdohwgs8tY=
 github.com/clipperhouse/uax29/v2 v2.2.0/go.mod h1:EFJ2TJMRUaplDxHKj1qAEhCtQPW2tJSwu5BF98AuoVM=
-github.com/mattn/go-runewidth v0.0.28 h1:rPyg2ybwEKPebvpzVWe1gKBkH8EQFkxO4Y0hjBeLaBU=
-github.com/mattn/go-runewidth v0.0.28/go.mod h1:3qAiGCV4Koz/yuveO58qUefmUTRm8r0IGEXZ9jeHp/8=
+github.com/mattn/go-runewidth v0.0.31 h1:1oCV4ReTlosDBc6rYRw5cL8S/4y8iv5oRl4SJ5IBgwo=
+github.com/mattn/go-runewidth v0.0.31/go.mod h1:3qAiGCV4Koz/yuveO58qUefmUTRm8r0IGEXZ9jeHp/8=

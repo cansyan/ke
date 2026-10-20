@@ -4,6 +4,7 @@ import (
 	"slices"
 
 	"github.com/cansyan/kero"
+	"github.com/mattn/go-runewidth"
 )
 
 // TextInput is a small editable single-line text widget.
@@ -111,11 +112,17 @@ func (t TextInput) Draw(f *kero.Frame, r kero.Rect, s kero.Style) {
 	cursorStyle := toggleReverse(s)
 
 	if t.SelectAll && len(t.runes) > 0 {
-		for i, ch := range t.runes {
-			x := r.X + i
-			if x < r.Right() {
-				f.Set(x, r.Y, ch, s.Reverse())
+		x := r.X
+		for _, ch := range t.runes {
+			if x >= r.Right() {
+				break
 			}
+			f.Set(x, r.Y, ch, s.Reverse())
+			w := runewidth.RuneWidth(ch)
+			if w <= 0 {
+				w = 1
+			}
+			x += w
 		}
 		return
 	}
@@ -129,33 +136,47 @@ func (t TextInput) Draw(f *kero.Frame, r kero.Rect, s kero.Style) {
 
 	// Render placeholder when value is empty
 	if len(t.runes) == 0 && t.Placeholder != "" {
+		x := r.X
 		for i, ch := range []rune(t.Placeholder) {
-			if i == 0 {
-				f.Set(r.X+i, r.Y, ch, cursorStyle)
-			} else {
-				f.Set(r.X+i, r.Y, ch, s.Dim())
+			if x >= r.Right() {
+				break
 			}
+			st := s.Dim()
+			if i == 0 {
+				st = cursorStyle
+			}
+			f.Set(x, r.Y, ch, st)
+			w := runewidth.RuneWidth(ch)
+			if w <= 0 {
+				w = 1
+			}
+			x += w
 		}
 		return
 	}
 
 	// Render characters
+	x := r.X
 	for i, ch := range t.runes {
-		x := r.X + i
 		if x >= r.Right() {
 			break
 		}
 
+		st := s
 		if i == t.Cursor {
-			f.Set(x, r.Y, ch, cursorStyle)
-		} else {
-			f.Set(x, r.Y, ch, s)
+			st = cursorStyle
 		}
+		f.Set(x, r.Y, ch, st)
+
+		w := runewidth.RuneWidth(ch)
+		if w <= 0 {
+			w = 1
+		}
+		x += w
 	}
 
 	// Render trailing cursor when at end of line
 	if t.Cursor == len(t.runes) {
-		x := r.X + t.Cursor
 		if x < r.Right() {
 			f.Set(x, r.Y, ' ', cursorStyle)
 		}
