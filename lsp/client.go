@@ -102,7 +102,7 @@ func StartClient(goplsPath string, onDiagnostics func(string, []Diagnostic)) (*C
 		OnDiagnostics: onDiagnostics,
 	}
 
-	go c.readLoop(bufio.NewReader(stdout))
+	go c.readLoop(stdout)
 	return c, nil
 }
 
