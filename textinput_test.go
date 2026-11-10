@@ -16,8 +16,8 @@ func TestTextInputUpdate(t *testing.T) {
 	if input.String() != "aXb" {
 		t.Fatalf("Value = %q, want aXb", input.String())
 	}
-	if input.Cursor != 2 {
-		t.Fatalf("Cursor = %d, want 2", input.Cursor)
+	if input.cursor != 2 {
+		t.Fatalf("Cursor = %d, want 2", input.cursor)
 	}
 }
 
@@ -52,15 +52,16 @@ func TestTextInputDrawWideCharacters(t *testing.T) {
 
 func TestTextInputSelectAll(t *testing.T) {
 	var input TextInput
-	input.SetTextAndSelectAll("abcd")
+	input.SetText("abcd")
+	input.SelectAll = true
 
 	input.Update(kero.KeyEvent{Key: kero.KeyRune, Rune: 'X'})
 
 	if input.String() != "X" {
 		t.Fatalf("Value = %q, want X", input.String())
 	}
-	if input.Cursor != 1 {
-		t.Fatalf("Cursor = %d, want 1", input.Cursor)
+	if input.cursor != 1 {
+		t.Fatalf("Cursor = %d, want 1", input.cursor)
 	}
 	if input.SelectAll != false {
 		t.Fatalf("SelectAll = %v, want false", input.SelectAll)

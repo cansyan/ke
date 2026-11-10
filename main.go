@@ -1562,14 +1562,16 @@ func (e *Editor) startFind() {
 	if e.hasSelect() {
 		start, end := orderPos(e.View().SelAnchor, e.View().Cursor)
 		query := e.Buf().TextRange(start, end)
-		e.find.Input.SetTextAndSelectAll(query)
+		e.find.Input.SetText(query)
+		e.find.Input.SelectAll = true
 		e.find.Match = true
 		e.find.MatchStart = start
 		e.find.MatchEnd = end
 		return
 	}
 	if e.find.Input.String() != "" {
-		e.find.Input.SetTextAndSelectAll(e.find.Input.String())
+		e.find.Input.SetText(e.find.Input.String())
+		e.find.Input.SelectAll = true
 	}
 }
 
@@ -2933,7 +2935,8 @@ func (e *Editor) startRename() {
 	e.renaming = true
 	start, end := e.Buf().WordBounds(e.View().Cursor)
 	symbol := e.Buf().TextRange(start, end)
-	e.renameInput.SetTextAndSelectAll(symbol)
+	e.renameInput.SetText(symbol)
+	e.renameInput.SelectAll = true
 }
 
 func (e *Editor) updateRename(ev kero.KeyEvent) {
